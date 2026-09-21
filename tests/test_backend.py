@@ -168,6 +168,7 @@ class RcloneTests(unittest.TestCase):
         ok, detail = rclone.update_remote("media", {
             "url": "https://new.example.com",
             "pass": "",
+            "client_secret": "   ",
             "token": "new-token",
             "untrusted": "should be ignored",
         })

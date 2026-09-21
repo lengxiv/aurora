@@ -381,7 +381,7 @@ class RcloneProvider:
             if key not in _RCLONE_PARAM_KEYS:
                 continue
             value = str(value)[:512]
-            if key in _RCLONE_SECRET_KEYS and not value:
+            if key in _RCLONE_SECRET_KEYS and not value.strip():
                 continue
             safe[key] = value
         if not safe:
