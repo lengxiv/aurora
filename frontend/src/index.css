@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #05060a;
+  --color-ink-2: #0b0d14;
+  --color-line: rgba(255, 255, 255, 0.07);
+  --color-fg: #e7ebf2;
+  --color-dim: #8b93a7;
+  --color-aurora-1: #67e8d9;
+  --color-aurora-2: #a78bfa;
+  --color-aurora-3: #fb7185;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: "Inter", "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-weight: 500;          /* 全局中等字重：正文/标签/按钮统一更清晰 */
+  background: var(--color-ink);
+  color: var(--color-fg);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+button, input, textarea { min-width: 0; }
+
+/* 隐藏滚动条但保留滚动（移动端顶栏导航用） */
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+/* fixed aurora sheen backdrop */
+.aurora-bg::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(52rem 38rem at 12% -8%, rgba(103, 232, 217, 0.16), transparent 60%),
+    radial-gradient(44rem 34rem at 88% 12%, rgba(167, 139, 250, 0.15), transparent 60%),
+    radial-gradient(40rem 40rem at 60% 100%, rgba(251, 113, 133, 0.09), transparent 60%);
+  animation: aurora 22s ease-in-out infinite alternate;
+}
+.aurora-bg::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(30rem 30rem at 50% 0%, black, transparent 75%);
+}
+@keyframes aurora {
+  from { opacity: 0.7; transform: translate3d(0,0,0) scale(1); }
+  to   { opacity: 1;   transform: translate3d(0,-2%,0) scale(1.04); }
+}
+
+/* glass surface */
+.panel {
+  background: rgba(255,255,255,0.028);
+  border: 1px solid var(--color-line);
+  border-radius: 0.9rem;
+  backdrop-filter: blur(6px);
+}
+.panel-hover { transition: border-color .25s, background .25s, transform .25s; }
+.panel-hover:hover { border-color: rgba(167,139,250,0.35); background: rgba(255,255,255,0.045); }
+
+/* tabular numerics */
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* gradient text + bar */
+.grad-txt {
+  background: linear-gradient(92deg, var(--color-aurora-1), var(--color-aurora-2) 55%, var(--color-aurora-3));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.grad-bar {
+  background: linear-gradient(90deg, var(--color-aurora-1), var(--color-aurora-2) 55%, var(--color-aurora-3));
+}
+
+/* live pulse dot */
+.live-dot { position: relative; width: 0.5rem; height: 0.5rem; border-radius: 9999px; }
+.live-dot::after {
+  content: ""; position: absolute; inset: -0.3rem; border-radius: 9999px;
+  border: 1px solid currentColor; animation: ping 2.2s ease-out infinite;
+}
+@keyframes ping { 0% { transform: scale(0.4); opacity: 0.8; } 100% { transform: scale(1.4); opacity: 0; } }
+
+/* card enter */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.card-in { animation: cardIn 0.32s ease both; }
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.overlay-in { animation: fadeIn 0.18s ease both; }
+
+/* skeleton shimmer */
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.11) 50%, rgba(255,255,255,0.04) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+}
+
+/* modal backdrop */
+.overlay-in { animation: fadeIn 0.18s ease both; }
+
+/* thin scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* focus ring a11y */
+a:focus-visible, button:focus-visible { outline: 2px solid var(--color-aurora-2); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .aurora-bg::before, .live-dot::after, .skeleton, .card-in, .overlay-in { animation: none !important; }
+}

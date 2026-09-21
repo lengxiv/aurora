@@ -1,0 +1,30 @@
+services:
+  qbittorrent:
+    image: linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Shanghai
+      WEBUI_PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+    volumes:
+      - ${AURORA_ROOT:-/opt/aurora}/qbit/config:/config
+      - ${AURORA_ROOT:-/opt/aurora}/qbit/downloads:/downloads
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:8096:8096"
+    volumes:
+      - ${AURORA_ROOT:-/opt/aurora}/jellyfin/config:/config
+      - ${AURORA_ROOT:-/opt/aurora}/jellyfin/cache:/cache
+      - ${AURORA_ROOT:-/opt/aurora}/qbit/downloads:/media:ro

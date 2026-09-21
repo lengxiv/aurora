@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node / frontend build output
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+backend/static/*
+!backend/static/
+!backend/static/.gitkeep
+
+# Runtime state and credentials
+backend/.auth
+backend/.secret
+backend/data/*
+!backend/data/
+!backend/data/.gitkeep
+.env
+.env.*
+!.env.example
+
+# Media service state and downloads
+qbit/config/
+qbit/downloads/
+jellyfin/config/
+jellyfin/cache/
+
+# Local logs, databases, caches, and backups
+*.log
+*.sqlite
+*.sqlite3
+*.db
+backup/
+backups/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Private deployment material
+*.pem
+*.key
+*.pfx
