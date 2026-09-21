@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
 sys.path.insert(0, str(BACKEND))
@@ -86,6 +87,27 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(len(result["tg"]["tokens"]), 2)
             self.assertEqual(len(result["tg"]["tokens"][0]["name"]), 20)
         providers._SETTINGS_FILE = old
+
+
+class TorrentUploadTests(unittest.TestCase):
+    def test_qbit_add_file_posts_torrent_multipart(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.return_value.status_code = 200
+        qbit._sess = session
+
+        self.assertTrue(qbit.add_file("sample.torrent", b"torrent-data"))
+        call = session.post.call_args
+        self.assertEqual(call.kwargs["files"]["torrents"][0], "sample.torrent")
+        self.assertEqual(call.kwargs["files"]["torrents"][1], b"torrent-data")
+
+    def test_qbit_add_file_rejects_non_torrent(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        qbit._sess = session
+
+        self.assertFalse(qbit.add_file("sample.txt", b"data"))
+        session.post.assert_not_called()
 
 
 if __name__ == "__main__":

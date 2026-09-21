@@ -458,6 +458,21 @@ class QbittorrentProvider:
         except Exception:
             return False
 
+    def add_file(self, filename: str, content: bytes) -> bool:
+        """Forward one .torrent file to qBittorrent's multipart upload endpoint."""
+        try:
+            if not filename.lower().endswith(".torrent") or not content:
+                return False
+            s = self._ensure()
+            r = s.post(
+                f"{self.base}/api/v2/torrents/add",
+                files={"torrents": (filename, content, "application/x-bittorrent")},
+                timeout=15,
+            )
+            return r.status_code in (200, 201)
+        except Exception:
+            return False
+
     def action(self, hash_, action):
         try:
             # qBittorrent 5.x removed pause/resume -> use stop/start

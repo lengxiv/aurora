@@ -29,6 +29,7 @@
 - 磁力调度表：任务列表、进度、速率、S/L；状态中文显示
 - **磁力操作**：单条（暂停/续传/删除）+ **批量多选**（全选/多选 → 批量暂停/续传/删除）
 - **添加磁力**弹窗（真实提交 qBittorrent）
+- **上传种子文件**（管理台选择 `.torrent` 文件，单文件最大 20 MB，真实提交 qBittorrent）
 - 磁力实时来源徽标（中文：挂载/磁力/播放/磁盘/带宽 · 真实/未接入）
 - 搜索过滤磁力队列
 
@@ -81,6 +82,7 @@
 - `/api/auth/sessions` `/api/auth/sessions/revoke` `/api/auth/password`
 - `/api/metrics` `/api/sources` `/api/info` `/api/logs`
 - `/api/torrents/add` `/api/torrents/{action}` `/api/torrents/batch` `/api/torrents/peers?hash=`（对等方明细）
+- `/api/torrents/upload`（上传 `.torrent` 文件）
 - `/api/media` `/api/media/stream` `/api/media/delete` `/api/media/rename` `/api/media/move`
 - `/api/media/trash` `/api/media/trash/restore` `/api/media/trash/purge`
 - `/api/media/dirs`（目录列表） `/api/media/mkdir`（新建目录） `/api/media/rmdir`（删空目录）

@@ -163,6 +163,21 @@ export async function addTorrent(magnet: string) {
   }
 }
 
+export async function addTorrentFile(file: File) {
+  try {
+    const body = new FormData()
+    body.append('file', file, file.name)
+    const r = await fetch('/api/torrents/upload', {
+      method: 'POST', credentials: 'include', body,
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, mode: '', detail: '' } }
+    const { data: d, detail } = await responseDetail(r, '上传失败')
+    return { ok: r.ok && !!d?.ok, mode: (d && d.mode) || '', detail }
+  } catch {
+    return { ok: false, mode: '', detail: '网络请求失败' }
+  }
+}
+
 export async function fetchInfo() {
   try {
     const r = await fetch('/api/info', { credentials: 'include' })

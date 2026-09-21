@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -289,6 +289,9 @@ class AddMagnet(BaseModel):
     magnet: str
 
 
+_MAX_TORRENT_FILE = 20 * 1024 * 1024
+
+
 @app.post("/api/torrents/add")
 def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
     if not body.magnet.strip().startswith("magnet:"):
@@ -298,6 +301,26 @@ def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
     if not providers._qbit.add(body.magnet):
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该磁力（链接可能已存在或无效）")
     return {"ok": True, "mode": "qbittorrent"}
+
+
+@app.post("/api/torrents/upload")
+async def upload_torrent(file: UploadFile = File(...), _user: str = Depends(require_auth)):
+    name = Path(file.filename or "").name
+    if not name or name == ".torrent" or not name.lower().endswith(".torrent"):
+        raise HTTPException(status_code=400, detail="仅支持 .torrent 文件")
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法上传种子")
+    try:
+        content = await file.read(_MAX_TORRENT_FILE + 1)
+    finally:
+        await file.close()
+    if not content:
+        raise HTTPException(status_code=400, detail="种子文件为空")
+    if len(content) > _MAX_TORRENT_FILE:
+        raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
+    if not providers._qbit.add_file(name, content):
+        raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
+    return {"ok": True, "mode": "qbittorrent", "name": name}
 
 
 class BatchAction(BaseModel):

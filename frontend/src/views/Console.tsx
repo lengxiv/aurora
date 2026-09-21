@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
-import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, X, Play, Pause, Trash2, Search } from 'lucide-react'
-import { useMetrics, addTorrent, torrentAction, batchAction, type Torrent, type MountStatus } from '../lib/api'
+import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, X, Play, Pause, Trash2, Search } from 'lucide-react'
+import { useMetrics, addTorrent, addTorrentFile, torrentAction, batchAction, type Torrent, type MountStatus } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -22,9 +22,12 @@ export default function ConsoleView() {
   const { data, sources } = useMetrics()
   const toast = useToast()
   const [open, setOpen] = useState(false)
+  const [addMode, setAddMode] = useState<'magnet' | 'file'>('magnet')
   const [magnet, setMagnet] = useState('')
+  const [torrentFile, setTorrentFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
+  const [msgBad, setMsgBad] = useState(false)
   const [q, setQ] = useState('')
   const [sel, setSel] = useState<Set<string>>(new Set())
   const totalReads = data.mounts.reduce((a, m) => a + (m.reads || 0), 0)
@@ -37,12 +40,52 @@ export default function ConsoleView() {
     ? (data.mounts.every((m) => m.driver === 'local') ? fmtBytes(totalReads) + '/s' : `${totalReads}`)
     : '—'
 
+  const closeAdd = () => {
+    if (busy) return
+    setOpen(false)
+    setAddMode('magnet')
+    setMagnet('')
+    setTorrentFile(null)
+    setMsg('')
+    setMsgBad(false)
+  }
+
+  const chooseMode = (mode: 'magnet' | 'file') => {
+    setAddMode(mode)
+    setMsg('')
+    setMsgBad(false)
+  }
+
+  const selectTorrentFile = (file?: File) => {
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.torrent')) {
+      setTorrentFile(null)
+      setMsgBad(true)
+      setMsg('请选择 .torrent 文件')
+      return
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setTorrentFile(null)
+      setMsgBad(true)
+      setMsg('种子文件不能超过 20 MB')
+      return
+    }
+    setTorrentFile(file)
+    setMsg('')
+    setMsgBad(false)
+  }
+
   const submit = async () => {
-    if (!magnet.trim()) return
-    setBusy(true); setMsg('')
-    const r = await addTorrent(magnet.trim())
+    if (addMode === 'magnet' && !magnet.trim()) return
+    if (addMode === 'file' && !torrentFile) return
+    setBusy(true); setMsg(''); setMsgBad(false)
+    const r = addMode === 'magnet' ? await addTorrent(magnet.trim()) : await addTorrentFile(torrentFile!)
     setMsg(r.ok ? (r.mode === 'qbittorrent' ? '已提交到 qBittorrent' : '已加入队列（演示）') : r.detail)
-    if (r.ok) setMagnet('')
+    setMsgBad(!r.ok)
+    if (r.ok) {
+      setMagnet('')
+      setTorrentFile(null)
+    }
     setBusy(false)
   }
 
@@ -75,7 +118,7 @@ export default function ConsoleView() {
         <div className="flex flex-col items-end gap-2">
           <SourceBadge sources={sources} />
           <button onClick={() => setOpen(true)} className="panel panel-hover flex items-center gap-2 px-4 py-2 text-sm text-fg">
-            <Plus size={16} /> 添加磁力
+            <Plus size={16} /> 添加任务
           </button>
         </div>
       </header>
@@ -156,7 +199,7 @@ export default function ConsoleView() {
                 className="w-36 rounded-lg border border-line bg-white/4 py-1.5 pl-7 pr-2 text-xs text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none sm:w-48" />
             </div>
             <button onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8">
-              <Magnet size={13} /> 新增
+              <Plus size={13} /> 新增
             </button>
           </div>
         </div>
@@ -233,19 +276,38 @@ export default function ConsoleView() {
       </section>
 
       {open && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setOpen(false)}>
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm" onClick={closeAdd}>
           <div className="panel w-full max-w-lg px-6 py-5" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
-              <span className="flex items-center gap-2 text-sm font-medium"><Magnet size={16} className="text-aurora-1" /> 添加磁力</span>
-              <button onClick={() => setOpen(false)} className="text-dim hover:text-fg"><X size={16} /></button>
+              <span className="flex items-center gap-2 text-sm font-medium">{addMode === 'magnet' ? <Magnet size={16} className="text-aurora-1" /> : <FileUp size={16} className="text-aurora-1" />} 添加任务</span>
+              <button onClick={closeAdd} disabled={busy} aria-label="关闭" title="关闭" className="text-dim hover:text-fg disabled:opacity-40"><X size={16} /></button>
             </div>
-            <textarea value={magnet} onChange={(e) => setMagnet(e.target.value)} rows={3}
-              placeholder="magnet:?xt=urn:btih:…"
-              className="mt-4 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" />
-            {msg && <div className="mt-3 text-xs text-aurora-1">{msg}</div>}
+            <div role="tablist" aria-label="添加方式" className="mt-4 grid grid-cols-2 gap-1 rounded-lg border border-line bg-white/4 p-1">
+              <button type="button" role="tab" aria-selected={addMode === 'magnet'} onClick={() => chooseMode('magnet')} className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs transition-colors ${addMode === 'magnet' ? 'bg-white/10 text-fg' : 'text-dim hover:text-fg'}`}>
+                <Magnet size={13} /> 磁力链接
+              </button>
+              <button type="button" role="tab" aria-selected={addMode === 'file'} onClick={() => chooseMode('file')} className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs transition-colors ${addMode === 'file' ? 'bg-white/10 text-fg' : 'text-dim hover:text-fg'}`}>
+                <FileUp size={13} /> 种子文件
+              </button>
+            </div>
+            {addMode === 'magnet' ? (
+              <textarea value={magnet} onChange={(e) => setMagnet(e.target.value)} rows={3}
+                placeholder="magnet:?xt=urn:btih:…"
+                className="mt-3 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" />
+            ) : (
+              <div className="mt-3">
+                <input id="torrent-file" type="file" accept=".torrent,application/x-bittorrent" className="sr-only" onChange={(e) => selectTorrentFile(e.target.files?.[0])} />
+                <label htmlFor="torrent-file" className="flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-line bg-white/3 px-4 py-8 text-center transition-colors hover:border-aurora-2/50 hover:bg-white/5">
+                  <FileUp size={22} className="text-aurora-1" />
+                  <span className="mt-2 text-sm text-fg">{torrentFile ? torrentFile.name : '选择 .torrent 文件'}</span>
+                  <span className="mt-1 text-xs text-dim">单个文件，最大 20 MB</span>
+                </label>
+              </div>
+            )}
+            {msg && <div className={`mt-3 text-xs ${msgBad ? 'text-rose-300' : 'text-aurora-1'}`}>{msg}</div>}
             <div className="mt-4 flex justify-end gap-3">
-              <button onClick={() => setOpen(false)} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg">取消</button>
-              <button onClick={submit} disabled={busy || !magnet.trim()} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
+              <button onClick={closeAdd} disabled={busy} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg disabled:opacity-40">取消</button>
+              <button onClick={submit} disabled={busy || (addMode === 'magnet' ? !magnet.trim() : !torrentFile)} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
             </div>
           </div>
         </div>
