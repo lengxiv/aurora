@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { Cloud, Plus, Trash2, ExternalLink, X, RefreshCw, Eye, EyeOff } from 'lucide-react'
-import { fetchRcloneRemotes, testRcloneRemote, createRcloneRemote, deleteRcloneRemote, type RcloneRemote } from '../lib/api'
+import { Cloud, Plus, Trash2, ExternalLink, X, RefreshCw, Eye, EyeOff, Pencil } from 'lucide-react'
+import { fetchRcloneRemotes, testRcloneRemote, fetchRcloneRemote, updateRcloneRemote, createRcloneRemote, deleteRcloneRemote, type RcloneRemote } from '../lib/api'
 import { EmptyState } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -45,10 +45,13 @@ export default function NetdiskView() {
   const [rc, setRc] = useState<{ online: boolean; remotes: RcloneRemote[] } | null>(null)
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
+  const [editName, setEditName] = useState<string | null>(null)
   const [name, setName] = useState('')
   const [type, setType] = useState('webdav')
   const [params, setParams] = useState<Record<string, string>>({})
   const [showPw, setShowPw] = useState<Set<string>>(new Set())
+  const [secretFields, setSecretFields] = useState<Set<string>>(new Set())
+  const originalParams = useRef<Record<string, string>>({})
   const [testing, setTesting] = useState<string | null>(null)
   const nameRef = useRef<HTMLInputElement>(null)
 
@@ -61,16 +64,77 @@ export default function NetdiskView() {
   }, [open])
 
   const togglePw = (k: string) => {
-    setShowPw((s) => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n })
+    setShowPw((s) => {
+      const n = new Set(s)
+      if (n.has(k)) n.delete(k)
+      else n.add(k)
+      return n
+    })
+  }
+
+  const openCreate = () => {
+    setEditName(null)
+    setName('')
+    setType('webdav')
+    setParams({})
+    setShowPw(new Set())
+    setSecretFields(new Set())
+    originalParams.current = {}
+    setOpen(true)
+  }
+
+  const openEdit = async (n: string) => {
+    setBusy(true)
+    const config = await fetchRcloneRemote(n)
+    setBusy(false)
+    if (!config) { toast(`读取 ${n} 配置失败`, 'bad'); return }
+    if (!rcTypes[config.type]) {
+      toast(`类型 ${config.type} 请在高级配置中修改`, 'bad')
+      return
+    }
+    setEditName(n)
+    setName(n)
+    setType(config.type)
+    setParams(config.params)
+    setShowPw(new Set())
+    setSecretFields(new Set(config.secretFields))
+    originalParams.current = config.params
+    setOpen(true)
+  }
+
+  const closeForm = () => {
+    setOpen(false)
+    setEditName(null)
+    setName('')
+    setParams({})
+    setShowPw(new Set())
+    setSecretFields(new Set())
+    originalParams.current = {}
   }
 
   const submit = async () => {
     const n = name.trim()
     if (!n) { toast('请输入网盘名称', 'bad'); return }
     if (!rcTypes[type]) { toast('未知类型', 'bad'); return }
+    if (editName) {
+      const keys = new Set([...Object.keys(originalParams.current), ...Object.keys(params)])
+      const changed = [...keys].some((key) => {
+        if (secretFields.has(key) && !(params[key] || '').trim()) return false
+        return (params[key] ?? '') !== (originalParams.current[key] ?? '')
+      })
+      if (!changed) {
+        toast('配置未修改', 'ok')
+        closeForm()
+        return
+      }
+      const r = await updateRcloneRemote(editName, params)
+      toast(r.ok ? `已保存 ${editName}` : `保存失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+      if (r.ok) { closeForm(); reload() }
+      return
+    }
     const r = await createRcloneRemote(n, type, params)
     toast(r.ok ? `已创建 ${n}` : `创建失败：${r.detail}`, r.ok ? 'ok' : 'bad')
-    if (r.ok) { setOpen(false); setName(''); setParams({}); setShowPw(new Set()); reload() }
+    if (r.ok) { closeForm(); reload() }
   }
   const test = async (n: string) => {
     setTesting(n)
@@ -113,7 +177,7 @@ export default function NetdiskView() {
             className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-2 text-xs text-dim hover:text-fg">
             <ExternalLink size={13} /> 高级配置 · OAuth 授权
           </a>
-          <button onClick={() => setOpen(true)} disabled={!rc?.online}
+          <button onClick={openCreate} disabled={!rc?.online}
             className="inline-flex items-center gap-1.5 rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">
             <Plus size={15} /> 添加网盘
           </button>
@@ -138,11 +202,15 @@ export default function NetdiskView() {
                   <div className="mt-0.5 text-[11px] text-teal-300">已连接 · 自动挂载</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  <button title="测试连接" aria-label="测试连接" onClick={() => test(r.name)} disabled={testing !== null}
+                  <button title="测试连接" aria-label="测试连接" onClick={() => test(r.name)} disabled={testing !== null || busy}
                     className="grid h-8 w-8 place-items-center rounded-md border border-line text-dim transition-colors hover:border-aurora-2/40 hover:text-aurora-1 disabled:opacity-40">
                     <RefreshCw size={14} className={testing === r.name ? 'animate-spin' : ''} />
                   </button>
-                  <button title="删除" aria-label="删除" onClick={() => del(r.name)} disabled={testing !== null}
+                  <button title="修改配置" aria-label="修改配置" onClick={() => openEdit(r.name)} disabled={testing !== null || busy}
+                    className="grid h-8 w-8 place-items-center rounded-md border border-line text-dim transition-colors hover:border-aurora-2/40 hover:text-aurora-1 disabled:opacity-40">
+                    <Pencil size={14} />
+                  </button>
+                  <button title="删除" aria-label="删除" onClick={() => del(r.name)} disabled={testing !== null || busy}
                     className="grid h-8 w-8 place-items-center rounded-md border border-line text-dim transition-colors hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40">
                     <Trash2 size={14} />
                   </button>
@@ -157,19 +225,19 @@ export default function NetdiskView() {
       </main>
 
       {open && (
-        <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 backdrop-blur-sm" onClick={() => setOpen(false)}>
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 backdrop-blur-sm" onClick={closeForm}>
           <div className="flex min-h-full items-center justify-center p-4">
             <div className="panel w-full max-w-md px-6 py-5" onClick={(e) => e.stopPropagation()} onKeyDown={onKey}>
               <div className="flex items-center justify-between">
-                <span className="flex items-center gap-2 text-sm font-medium"><Cloud size={16} className="text-aurora-1" /> 添加网盘</span>
-                <button onClick={() => setOpen(false)} className="text-dim hover:text-fg"><X size={16} /></button>
+                <span className="flex items-center gap-2 text-sm font-medium"><Cloud size={16} className="text-aurora-1" /> {editName ? '修改网盘' : '添加网盘'}</span>
+                <button onClick={closeForm} aria-label="关闭" title="关闭" className="text-dim hover:text-fg"><X size={16} /></button>
               </div>
 
             <div className="mt-4 grid gap-4">
               {/* 名称 */}
               <div>
                 <label className="block text-[11px] uppercase tracking-[0.2em] text-dim">名称</label>
-                <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} placeholder="如 aliyun / gd / r2"
+                <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} disabled={!!editName} placeholder="如 aliyun / gd / r2"
                   className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" />
               </div>
 
@@ -185,7 +253,8 @@ export default function NetdiskView() {
                           : 'border-line bg-white/4 text-dim hover:border-line/60 hover:text-fg'
                       }`}>
                       <input type="radio" name="rc-type" value={k} checked={type === k}
-                        onChange={() => { setType(k); setParams({}); setShowPw(new Set()) }}
+                        disabled={!!editName}
+                        onChange={() => { setType(k); setParams({}); setShowPw(new Set()); setSecretFields(new Set()) }}
                         className="sr-only" />
                       <span className={`h-3 w-3 shrink-0 rounded-full border-2 ${
                         type === k ? 'border-aurora-2 bg-aurora-2' : 'border-dim/40'
@@ -212,8 +281,8 @@ export default function NetdiskView() {
                           <input type={isPw ? 'password' : 'text'}
                             value={params[f.k] ?? ''}
                             onChange={(e) => setParams((m) => ({ ...m, [f.k]: e.target.value }))}
-                            placeholder={f.ph}
-                            className="w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none"
+                            placeholder={editName && secretFields.has(f.k) ? '已保存，留空保持不变' : f.ph}
+                            className="w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60"
                             style={f.pw ? { paddingRight: '2.25rem' } : undefined} />
                           {f.pw && (
                             <button type="button" tabIndex={-1} onClick={() => togglePw(f.k)}
@@ -235,10 +304,10 @@ export default function NetdiskView() {
             </div>
 
             <div className="mt-5 flex justify-end gap-3">
-              <button onClick={() => setOpen(false)}
+              <button onClick={closeForm}
                 className="rounded-lg border border-line bg-white/4 px-4 py-2.5 text-sm text-dim hover:text-fg transition-colors">取消</button>
               <button onClick={submit} disabled={!name.trim()}
-                className="rounded-lg grad-bar px-4 py-2.5 text-sm font-medium text-ink disabled:opacity-40 transition-opacity">创建</button>
+                className="rounded-lg grad-bar px-4 py-2.5 text-sm font-medium text-ink disabled:opacity-40 transition-opacity">{editName ? '保存修改' : '创建'}</button>
             </div>
             </div>
           </div>

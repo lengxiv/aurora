@@ -328,6 +328,34 @@ export async function testRcloneRemote(name: string): Promise<{ ok: boolean; det
   } catch { return { ok: false, detail: '网络请求失败' } }
 }
 
+export interface RcloneConfig {
+  name: string
+  type: string
+  params: Record<string, string>
+  secretFields: string[]
+}
+
+export async function fetchRcloneRemote(name: string): Promise<RcloneConfig | null> {
+  try {
+    const r = await fetch(`/api/rclone/remotes/config?name=${encodeURIComponent(name)}`, { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return await r.json() as RcloneConfig
+  } catch { return null }
+}
+
+export async function updateRcloneRemote(name: string, params: Record<string, string>) {
+  try {
+    const r = await fetch('/api/rclone/remotes/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ name, params }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const d = await r.json().catch(() => null)
+    return { ok: r.ok && !!d?.ok, detail: (d && d.detail) || (r.ok ? '' : '更新失败') }
+  } catch { return { ok: false, detail: '网络请求失败' } }
+}
+
 export async function createRcloneRemote(name: string, type: string, params: Record<string, string>) {
   try {
     const r = await fetch('/api/rclone/remotes', {

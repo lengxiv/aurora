@@ -249,6 +249,14 @@ class SystemProvider:
 # ---------------------------------------------------------------------------
 # rclone (remote control)
 
+_RCLONE_PARAM_KEYS = frozenset({
+    "url", "vendor", "provider", "endpoint", "region", "user", "pass",
+    "access_key_id", "secret_access_key", "acl", "client_id", "client_secret",
+    "token", "refresh_token", "server", "share", "path", "root_folder_id",
+    "chunk_size", "upload_cutoff", "bucket",
+})
+_RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "token", "refresh_token"})
+
 _QBIT_STATES = {
     "downloading": "downloading", "stalledDL": "downloading", "forcedDL": "downloading",
     "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding", "stoppedUP": "seeding",
@@ -336,6 +344,63 @@ class RcloneProvider:
             detail = str(e).strip() or "远端无响应"
             return False, f"连接失败：{detail[:180]}", round((time.monotonic() - started) * 1000)
 
+    def get_remote(self, name: str) -> tuple[bool, dict, str]:
+        """Return editable non-secret fields and the names of stored secrets."""
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", name or ""):
+            return False, {}, "网盘名称无效"
+        try:
+            data = self._req(
+                "/config/get", timeout=5.0, method="POST",
+                data=f"name={urllib.parse.quote(name)}",
+            ) or {}
+            ftype = str(data.get("type", ""))
+            if not ftype:
+                return False, {}, "网盘配置不存在"
+            params = {}
+            secrets = []
+            for key, value in data.items():
+                if key not in _RCLONE_PARAM_KEYS:
+                    continue
+                if key in _RCLONE_SECRET_KEYS:
+                    if value:
+                        secrets.append(key)
+                elif isinstance(value, (str, int, float, bool)):
+                    params[key] = str(value)
+            return True, {"name": name, "type": ftype, "params": params, "secretFields": secrets}, ""
+        except Exception as e:
+            return False, {}, str(e).strip()[:180] or "读取网盘配置失败"
+
+    def update_remote(self, name: str, params: dict) -> tuple[bool, str]:
+        """Update non-empty fields while preserving omitted or blank secrets."""
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", name or ""):
+            return False, "网盘名称无效"
+        safe = {}
+        for key, value in (params or {}).items():
+            if key not in _RCLONE_PARAM_KEYS:
+                continue
+            value = str(value)[:512]
+            if key in _RCLONE_SECRET_KEYS and not value:
+                continue
+            safe[key] = value
+        if not safe:
+            return False, "没有需要更新的配置"
+        try:
+            import json as _json
+            self._req(
+                "/config/update", timeout=8.0, method="POST",
+                data=_json.dumps({
+                    "name": name,
+                    "parameters": safe,
+                    "opt": {"obscure": True, "noOutput": True, "nonInteractive": True},
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e).strip()[:180] or "更新网盘配置失败"
+
     def create_remote(self, name: str, ftype: str, params: dict) -> tuple[bool, str]:
         """rc config/create：name=名字&type=类型&参数。name 必须安全字符。"""
         import re as _re
@@ -351,11 +416,7 @@ class RcloneProvider:
         # 只透传白名单内的字符串参数，避免注入任意 rc 字段
         safe = {}
         for k, v in (params or {}).items():
-            if k in ("url", "vendor", "provider", "endpoint", "region", "user",
-                     "pass", "access_key_id", "secret_access_key", "acl",
-                     "client_id", "client_secret", "token", "refresh_token",
-                     "server", "share", "path", "root_folder_id", "chunk_size",
-                     "upload_cutoff", "bucket"):
+            if k in _RCLONE_PARAM_KEYS:
                 safe[k] = str(v)[:512]
         body["parameters"] = safe
         try:

@@ -136,6 +136,65 @@ class RcloneTests(unittest.TestCase):
         self.assertEqual(latency, 0)
         rclone._req.assert_not_called()
 
+    def test_remote_config_does_not_expose_secrets(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={
+            "type": "webdav",
+            "url": "https://dav.example.com",
+            "vendor": "nextcloud",
+            "user": "alice",
+            "pass": "super-secret",
+            "token": "opaque-token",
+            "untrusted": "should be ignored",
+        })
+
+        ok, config, detail = rclone.get_remote("media")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(config["params"], {
+            "url": "https://dav.example.com",
+            "vendor": "nextcloud",
+            "user": "alice",
+        })
+        self.assertEqual(set(config["secretFields"]), {"pass", "token"})
+        self.assertNotIn("super-secret", json.dumps(config))
+        self.assertNotIn("opaque-token", json.dumps(config))
+
+    def test_remote_update_filters_blank_secrets_and_unknown_fields(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={})
+
+        ok, detail = rclone.update_remote("media", {
+            "url": "https://new.example.com",
+            "pass": "",
+            "token": "new-token",
+            "untrusted": "should be ignored",
+        })
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        call = rclone._req.call_args
+        self.assertEqual(call.args[0], "/config/update")
+        payload = json.loads(call.kwargs["data"])
+        self.assertEqual(payload["name"], "media")
+        self.assertEqual(payload["parameters"], {
+            "url": "https://new.example.com",
+            "token": "new-token",
+        })
+        self.assertTrue(payload["opt"]["obscure"])
+        self.assertNotIn("pass", payload["parameters"])
+
+    def test_remote_update_rejects_empty_payload(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock()
+
+        ok, detail = rclone.update_remote("media", {"pass": ""})
+
+        self.assertFalse(ok)
+        self.assertEqual(detail, "没有需要更新的配置")
+        rclone._req.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

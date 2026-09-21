@@ -413,6 +413,31 @@ def rclone_test(body: RcloneTestBody, _user: str = Depends(require_auth)):
     return {"ok": ok, "name": body.name, "detail": detail, "latencyMs": latency}
 
 
+@app.get("/api/rclone/remotes/config")
+def rclone_config(name: str, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, config, detail = providers._rclone.get_remote(name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return config
+
+
+class RcloneUpdateBody(BaseModel):
+    name: str
+    params: dict = {}
+
+
+@app.post("/api/rclone/remotes/update")
+def rclone_update(body: RcloneUpdateBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, detail = providers._rclone.update_remote(body.name, body.params)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
 class RcloneCreateBody(BaseModel):
     name: str
     type: str
