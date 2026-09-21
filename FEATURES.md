@@ -106,6 +106,7 @@
 ## 网盘对接（2026-08-14 新增）
 - rclone v1.75 systemd `rclone-rcd`（:5572，rc 端点 /rclone，Basic Auth aurora）
 - **设置页「网盘对接」面板**：在线状态、remote 列表（类型+删除）、添加网盘弹窗（WebDAV/S3/阿里云盘/Google Drive/OneDrive 表单化创建）
+- **网盘连通性测试**：对每个 remote 读取根目录，返回连接结果和响应耗时
 - 高级配置入口 `/rclone/`（rclone WebGUI，OAuth 授权类网盘走这里）
-- 后端 `/api/rclone/remotes` GET 列表 / POST 创建 / POST delete（rc `config/create` 新签名 name+type+parameters JSON）
+- 后端 `/api/rclone/remotes` GET 列表 / POST 创建 / POST delete / POST test（rc `config/create` 新签名 name+type+parameters JSON）
 - 无 remote 自动回退本地盘；配 remote 后 ≤2s 自动切 rclone 真实（挂载卡/监控大屏/来源徽标）

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -108,6 +109,32 @@ class TorrentUploadTests(unittest.TestCase):
 
         self.assertFalse(qbit.add_file("sample.txt", b"data"))
         session.post.assert_not_called()
+
+
+class RcloneTests(unittest.TestCase):
+    def test_remote_test_reads_root(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"list": []})
+
+        ok, detail, latency = rclone.test_remote("media")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "根目录读取成功")
+        self.assertGreaterEqual(latency, 0)
+        call = rclone._req.call_args
+        self.assertEqual(call.args[0], "/operations/list")
+        self.assertEqual(json.loads(call.kwargs["data"]), {"fs": "media:", "remote": ""})
+
+    def test_remote_test_rejects_invalid_name(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock()
+
+        ok, detail, latency = rclone.test_remote("../media")
+
+        self.assertFalse(ok)
+        self.assertEqual(detail, "网盘名称无效")
+        self.assertEqual(latency, 0)
+        rclone._req.assert_not_called()
 
 
 if __name__ == "__main__":

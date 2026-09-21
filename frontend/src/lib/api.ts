@@ -316,6 +316,18 @@ export async function fetchRcloneRemotes(): Promise<{ online: boolean; remotes: 
   } catch { return null }
 }
 
+export async function testRcloneRemote(name: string): Promise<{ ok: boolean; detail: string; latencyMs?: number }> {
+  try {
+    const r = await fetch('/api/rclone/remotes/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ name }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const d = await r.json().catch(() => null)
+    return { ok: r.ok && !!d?.ok, detail: (d && d.detail) || (r.ok ? '测试失败' : '测试请求失败'), latencyMs: d?.latencyMs }
+  } catch { return { ok: false, detail: '网络请求失败' } }
+}
+
 export async function createRcloneRemote(name: string, type: string, params: Record<string, string>) {
   try {
     const r = await fetch('/api/rclone/remotes', {

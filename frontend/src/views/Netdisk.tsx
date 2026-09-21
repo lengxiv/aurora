@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Cloud, Plus, Trash2, ExternalLink, X, RefreshCw, Eye, EyeOff } from 'lucide-react'
-import { fetchRcloneRemotes, createRcloneRemote, deleteRcloneRemote, type RcloneRemote } from '../lib/api'
+import { fetchRcloneRemotes, testRcloneRemote, createRcloneRemote, deleteRcloneRemote, type RcloneRemote } from '../lib/api'
 import { EmptyState } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -49,6 +49,7 @@ export default function NetdiskView() {
   const [type, setType] = useState('webdav')
   const [params, setParams] = useState<Record<string, string>>({})
   const [showPw, setShowPw] = useState<Set<string>>(new Set())
+  const [testing, setTesting] = useState<string | null>(null)
   const nameRef = useRef<HTMLInputElement>(null)
 
   const reload = () => { setBusy(true); fetchRcloneRemotes().then((d) => { setRc(d); setBusy(false) }) }
@@ -69,7 +70,14 @@ export default function NetdiskView() {
     if (!rcTypes[type]) { toast('未知类型', 'bad'); return }
     const r = await createRcloneRemote(n, type, params)
     toast(r.ok ? `已创建 ${n}` : `创建失败：${r.detail}`, r.ok ? 'ok' : 'bad')
-    if (r.ok) { setOpen(false); setName(''); setParams({}); setShowPw(new Set()) }
+    if (r.ok) { setOpen(false); setName(''); setParams({}); setShowPw(new Set()); reload() }
+  }
+  const test = async (n: string) => {
+    setTesting(n)
+    const r = await testRcloneRemote(n)
+    const suffix = r.ok && r.latencyMs !== undefined ? ` · ${r.latencyMs} ms` : ''
+    toast(r.ok ? `连接成功${suffix}` : `连接失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+    setTesting(null)
   }
   const del = async (n: string) => {
     if (!window.confirm(`删除网盘「${n}」？`)) return
@@ -129,10 +137,16 @@ export default function NetdiskView() {
                   <div className="num text-[11px] text-dim">{r.type || '未知类型'}</div>
                   <div className="mt-0.5 text-[11px] text-teal-300">已连接 · 自动挂载</div>
                 </div>
-                <button title="删除" onClick={() => del(r.name)}
-                  className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-dim transition-colors hover:border-rose-400/40 hover:text-rose-300">
-                  <Trash2 size={14} />
-                </button>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button title="测试连接" aria-label="测试连接" onClick={() => test(r.name)} disabled={testing !== null}
+                    className="grid h-8 w-8 place-items-center rounded-md border border-line text-dim transition-colors hover:border-aurora-2/40 hover:text-aurora-1 disabled:opacity-40">
+                    <RefreshCw size={14} className={testing === r.name ? 'animate-spin' : ''} />
+                  </button>
+                  <button title="删除" aria-label="删除" onClick={() => del(r.name)} disabled={testing !== null}
+                    className="grid h-8 w-8 place-items-center rounded-md border border-line text-dim transition-colors hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>

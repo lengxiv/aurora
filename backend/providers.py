@@ -316,6 +316,26 @@ class RcloneProvider:
             out.append({"name": r, "type": typ})
         return out
 
+    def test_remote(self, name: str) -> tuple[bool, str, int]:
+        """Read the remote root to verify credentials and connectivity."""
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", name or ""):
+            return False, "网盘名称无效", 0
+        started = time.monotonic()
+        try:
+            import json as _json
+            self._req(
+                "/operations/list",
+                timeout=8.0,
+                method="POST",
+                data=_json.dumps({"fs": f"{name}:", "remote": ""}),
+                headers={"Content-Type": "application/json"},
+            )
+            return True, "根目录读取成功", round((time.monotonic() - started) * 1000)
+        except Exception as e:
+            detail = str(e).strip() or "远端无响应"
+            return False, f"连接失败：{detail[:180]}", round((time.monotonic() - started) * 1000)
+
     def create_remote(self, name: str, ftype: str, params: dict) -> tuple[bool, str]:
         """rc config/create：name=名字&type=类型&参数。name 必须安全字符。"""
         import re as _re
