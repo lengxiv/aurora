@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup Aurora configuration and metadata
+
+[Service]
+Type=oneshot
+Environment=AURORA_ROOT=/opt/aurora
+Environment=AURORA_STATE_DIR=/var/lib/aurora
+Environment=AURORA_DATA_DIR=/var/lib/aurora/data
+Environment=AURORA_BACKUP_ROOT=/var/backups/aurora
+Environment=AURORA_NGINX_CONF=/etc/nginx/sites-enabled/aurora.conf
+ExecStart=/opt/aurora/scripts/backup.sh

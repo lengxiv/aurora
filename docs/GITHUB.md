@@ -36,7 +36,7 @@ git add .
 git status --short
 git diff --cached --check
 git commit -m "Initial public release"
-git remote add origin git@github.com:YOUR_ACCOUNT/aurora-media-hub.git
+git remote add origin git@github.com:lengxiv/aurora.git
 git push -u origin main
 ```
 

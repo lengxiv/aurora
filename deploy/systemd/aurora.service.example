@@ -28,7 +28,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/aurora /srv/aurora/media
+ReadWritePaths=/var/lib/aurora /srv/aurora/media /opt/aurora/qbit/downloads
 
 [Install]
 WantedBy=multi-user.target

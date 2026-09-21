@@ -26,7 +26,7 @@ set -- \
   "$project_root/scripts" \
   "$project_root/tests" \
   "$project_root/qbit/config" \
-  "$project_root/jellyfin/config/config" \
+  "$project_root/jellyfin/config" \
   /etc/systemd/system/aurora.service \
   /etc/systemd/system/aurora.service.d \
   /etc/systemd/system/aurora-backup.service \
