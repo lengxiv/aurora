@@ -1,6 +1,6 @@
 # Aurora · Media Hub
 
-一个独立的全栈可视化项目（新项目，非冷曦导航），把「网盘中转 + 磁力调度 + 流媒体播放 + 实时监控」整合成一体，含多个可视化界面：
+一个独立的全栈可视化项目，把「网盘中转 + 磁力调度 + 流媒体播放 + 实时监控」整合成一体，含多个可视化界面：
 
 这是一个可自托管项目。源码仓库不包含账号、token、媒体库、下载内容或服务运行数据；部署配置请参考 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)，发布到 GitHub 请先阅读 [`docs/GITHUB.md`](docs/GITHUB.md) 和 [`docs/SECURITY.md`](docs/SECURITY.md)。
 
