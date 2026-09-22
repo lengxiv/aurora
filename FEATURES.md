@@ -107,7 +107,7 @@
 - rclone v1.75 systemd `rclone-rcd`（:5572，rc 端点 /rclone，Basic Auth aurora）
 - **设置页「网盘对接」面板**：在线状态、remote 列表（类型+修改+删除）、添加网盘弹窗（WebDAV/S3/阿里云盘/Google Drive/OneDrive 表单化创建）；已接入网盘支持修改名称和配置，敏感字段留空保持原值
 - **网盘连通性测试**：对每个 remote 读取根目录，返回连接结果和响应耗时
-- **网盘文件管理与传输中心**：远程目录浏览、面包屑导航、多选、当前目录搜索与排序、上传到当前目录、本地下载、remote 间复制/移动、重命名、递归删除、新建目录；传输使用 rclone 异步任务，实时显示进度/速度，支持取消、失败/取消重试和清理历史任务
+- **网盘文件管理与传输中心**：远程目录浏览、面包屑导航、多选、当前目录搜索与排序、上传到当前目录、本地下载、remote 间复制/移动、重命名、递归删除、新建目录；上传实时显示本地读取/提交进度，随后切换为网盘侧 rclone 进度/速度；支持取消、失败/取消重试和清理历史任务
 - 高级配置入口 `/rclone/`（rclone WebGUI，OAuth 授权类网盘走这里）
 - 后端 `/api/rclone/remotes` GET 列表 / POST 创建 / POST delete / POST test；`GET /api/rclone/remotes/config` 读取脱敏配置，`POST /api/rclone/remotes/update` 修改配置（rc `config/create` / `config/update` 使用 name+parameters JSON）
 - 文件 API：`GET /api/rclone/files`、`POST /api/rclone/files/mkdir|rename|delete`、`POST /api/rclone/transfers/upload|download|copy`、`GET /api/rclone/transfers`、`POST /api/rclone/transfers/cancel|retry|clear`

@@ -402,6 +402,7 @@ export interface RcloneTransfer {
   created: number
   finished: number
   retryable?: boolean
+  phase?: 'staging' | 'transferring'
 }
 
 async function rcloneMutation(url: string, body: unknown) {
@@ -448,17 +449,51 @@ export async function downloadRcloneFile(name: string, path: string, destination
   return rcloneMutation('/api/rclone/transfers/download', { name, path, destination, is_dir: isDir })
 }
 
-export async function uploadRcloneFile(name: string, path: string, file: File) {
-  try {
+export async function uploadRcloneFile(
+  name: string,
+  path: string,
+  file: File,
+  onProgress?: (loaded: number, total: number) => void,
+) {
+  return new Promise<{ ok: boolean; detail: string; job: RcloneTransfer | null }>((resolve) => {
     const body = new FormData()
     body.append('name', name)
     body.append('path', path)
     body.append('file', file, file.name)
-    const r = await fetch('/api/rclone/transfers/upload', { method: 'POST', credentials: 'include', body })
-    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '', job: null } }
-    const { data, detail } = await responseDetail(r, '上传失败')
-    return { ok: r.ok && !!data?.ok, detail, job: data?.job as RcloneTransfer | null }
-  } catch { return { ok: false, detail: '网络请求失败', job: null } }
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/rclone/transfers/upload')
+    xhr.withCredentials = true
+    xhr.upload.onprogress = (event) => {
+      const total = file.size
+      if (!total) return
+      const loaded = event.lengthComputable && event.total > 0
+        ? Math.round(total * Math.min(1, event.loaded / event.total))
+        : Math.min(total, event.loaded)
+      onProgress?.(loaded, total)
+    }
+    xhr.onload = () => {
+      type UploadResponse = { ok?: boolean; detail?: string; job?: RcloneTransfer }
+      let data: UploadResponse | null = null
+      try { data = JSON.parse(xhr.responseText) as UploadResponse } catch { /* handled by fallback below */ }
+      if (xhr.status === 401) {
+        window.dispatchEvent(new Event('aurora:unauth'))
+        resolve({ ok: false, detail: '', job: null })
+        return
+      }
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300 && !!data?.ok,
+        detail: data?.detail || (xhr.status >= 200 && xhr.status < 300 ? '上传失败' : '上传失败'),
+        job: data?.job || null,
+      })
+    }
+    xhr.onerror = () => resolve({ ok: false, detail: '网络请求失败', job: null })
+    xhr.onabort = () => resolve({ ok: false, detail: '上传已取消', job: null })
+    try {
+      xhr.send(body)
+    } catch {
+      resolve({ ok: false, detail: '网络请求失败', job: null })
+    }
+  })
 }
 
 export async function fetchRcloneTransfers(): Promise<RcloneTransfer[]> {

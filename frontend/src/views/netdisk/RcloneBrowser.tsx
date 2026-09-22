@@ -51,7 +51,11 @@ function fmtDate(value: string) {
 }
 
 function transferStatus(job: RcloneTransfer) {
-  if (job.status === 'running') return job.progress === null ? '处理中' : `${Math.round(job.progress * 100)}%`
+  if (job.status === 'running') {
+    if (job.phase === 'staging') return `读取 ${Math.round((job.progress || 0) * 100)}%`
+    if (job.action === 'upload') return job.progress === null ? '网盘处理中' : `网盘 ${Math.round(job.progress * 100)}%`
+    return job.progress === null ? '处理中' : `${Math.round(job.progress * 100)}%`
+  }
   if (job.status === 'done') return '完成'
   if (job.status === 'canceled') return '已取消'
   return job.detail || '失败'
@@ -72,6 +76,7 @@ export default function RcloneBrowser({ remotes }: Props) {
   const [query, setQuery] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('name')
   const [sortAsc, setSortAsc] = useState(true)
+  const [localUploads, setLocalUploads] = useState<RcloneTransfer[]>([])
   const previousJobs = useRef<Record<string, RcloneTransfer['status']>>({})
 
   useEffect(() => {
@@ -117,7 +122,8 @@ export default function RcloneBrowser({ remotes }: Props) {
     return () => { on = false; clearInterval(id) }
   }, [load])
 
-  const activeTransfers = transfers.filter((job) => job.status === 'running')
+  const displayTransfers = useMemo(() => [...localUploads, ...transfers].sort((left, right) => right.created - left.created), [localUploads, transfers])
+  const activeTransfers = displayTransfers.filter((job) => job.status === 'running')
   const crumbs = useMemo(() => path.split('/').filter(Boolean), [path])
   const visibleItems = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase()
@@ -136,7 +142,7 @@ export default function RcloneBrowser({ remotes }: Props) {
   }, [items, query, sortAsc, sortKey])
   const allSelected = visibleItems.length > 0 && visibleItems.every((item) => selected.has(item.path))
   const selectedItems = items.filter((item) => selected.has(item.path))
-  const finishedTransfers = transfers.filter((job) => job.status !== 'running')
+  const finishedTransfers = displayTransfers.filter((job) => job.status !== 'running')
 
   const toggle = (item: RcloneEntry) => {
     setSelected((current) => {
@@ -216,7 +222,10 @@ export default function RcloneBrowser({ remotes }: Props) {
 
   const clearTransfers = async () => {
     const result = await clearRcloneTransfers()
-    if (result.ok) setTransfers((current) => current.filter((job) => job.status === 'running'))
+    if (result.ok) {
+      setTransfers((current) => current.filter((job) => job.status === 'running'))
+      setLocalUploads((current) => current.filter((job) => job.status === 'running'))
+    }
     toast(result.ok ? '已清理结束任务' : `清理失败：${result.detail}`, result.ok ? 'ok' : 'bad')
   }
 
@@ -224,11 +233,39 @@ export default function RcloneBrowser({ remotes }: Props) {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
     if (!files.length) return
+    setShowTransfers(true)
     const results = []
-    for (const file of files) results.push(await uploadRcloneFile(remote, path, file))
+    for (const file of files) {
+      const localId = `staging-${Date.now()}-${Math.random().toString(16).slice(2)}`
+      const started = performance.now()
+      setLocalUploads((current) => [{
+        id: localId, action: 'upload', label: `上传 ${remote}:${joinPath(path, file.name)}`,
+        status: 'running', progress: 0, bytes: 0, total: file.size, speed: 0,
+        detail: '', created: Math.floor(Date.now() / 1000), finished: 0,
+        retryable: false, phase: 'staging',
+      }, ...current])
+      const result = await uploadRcloneFile(remote, path, file, (loaded, total) => {
+        const elapsed = Math.max(0.1, (performance.now() - started) / 1000)
+        setLocalUploads((current) => current.map((job) => job.id === localId ? {
+          ...job, bytes: loaded, total, progress: total ? loaded / total : 0,
+          speed: Math.round(loaded / elapsed), phase: 'staging',
+        } : job))
+      })
+      results.push(result)
+      setLocalUploads((current) => current.filter((job) => job.id !== localId))
+      if (result.job) {
+        setTransfers((current) => [result.job as RcloneTransfer, ...current.filter((job) => job.id !== result.job?.id)])
+      } else if (!result.ok) {
+        setLocalUploads((current) => [{
+          id: localId, action: 'upload', label: `上传 ${remote}:${joinPath(path, file.name)}`,
+          status: 'error', progress: 0, bytes: 0, total: file.size, speed: 0,
+          detail: result.detail, created: Math.floor(Date.now() / 1000), finished: Math.floor(Date.now() / 1000),
+          retryable: false,
+        }, ...current])
+      }
+    }
     const success = results.filter((result) => result.ok).length
     toast(success === files.length ? `已提交 ${success} 个上传任务` : `已提交 ${success}/${files.length} 个上传任务`, success ? 'ok' : 'bad')
-    setShowTransfers(true)
   }
 
   const browse = (next: string) => {
@@ -301,12 +338,12 @@ export default function RcloneBrowser({ remotes }: Props) {
 
         {showTransfers && (
           <div className="border-b border-line bg-black/10 px-4 py-3">
-            <div className="mb-2 flex items-center gap-3"><span className="text-xs font-medium text-fg">传输任务</span><span className="num mr-auto text-[10px] text-dim">最近 {transfers.length} 条</span>{finishedTransfers.length > 0 && <button onClick={clearTransfers} title="清理已结束任务" aria-label="清理已结束任务" className="inline-flex items-center gap-1 text-[10px] text-dim hover:text-fg"><Trash2 size={12} /> 清理</button>}</div>
-            {transfers.length === 0 ? <div className="py-3 text-center text-xs text-dim">暂无传输任务</div> : <div className="flex max-h-56 flex-col gap-2 overflow-y-auto">
-              {transfers.map((job) => (
+            <div className="mb-2 flex items-center gap-3"><span className="text-xs font-medium text-fg">传输任务</span><span className="num mr-auto text-[10px] text-dim">最近 {displayTransfers.length} 条</span>{finishedTransfers.length > 0 && <button onClick={clearTransfers} title="清理已结束任务" aria-label="清理已结束任务" className="inline-flex items-center gap-1 text-[10px] text-dim hover:text-fg"><Trash2 size={12} /> 清理</button>}</div>
+            {displayTransfers.length === 0 ? <div className="py-3 text-center text-xs text-dim">暂无传输任务</div> : <div className="flex max-h-56 flex-col gap-2 overflow-y-auto">
+              {displayTransfers.map((job) => (
                 <div key={job.id} className="rounded-lg border border-line bg-white/3 px-3 py-2">
-                  <div className="flex items-center gap-2 text-xs"><span className={`shrink-0 ${job.status === 'error' ? 'text-rose-300' : job.status === 'done' ? 'text-teal-300' : 'text-aurora-1'}`}>{job.status === 'running' ? <LoaderCircle size={13} className="animate-spin" /> : job.status === 'done' ? <Check size={13} /> : <span className="inline-block w-3 text-center">·</span>}</span><span className="min-w-0 flex-1 truncate text-fg">{job.label}</span><span className="num shrink-0 text-[10px] text-dim">{transferStatus(job)}</span>{job.status === 'running' && <button onClick={async () => { const result = await cancelRcloneTransfer(job.id); if (!result.ok) toast(result.detail, 'bad') }} title="取消任务" aria-label="取消任务" className="grid h-6 w-6 place-items-center text-dim hover:text-rose-300"><X size={12} /></button>}{(job.status === 'error' || job.status === 'canceled') && job.retryable && <button onClick={() => retry(job)} title="重试任务" aria-label="重试任务" className="grid h-6 w-6 place-items-center text-dim hover:text-fg"><RotateCcw size={12} /></button>}</div>
-                  {job.status === 'running' && <div className="mt-1.5 flex items-center gap-2"><div className="h-1 flex-1 overflow-hidden rounded-full bg-white/8"><div className="h-full rounded-full grad-bar transition-all" style={{ width: `${job.progress === null ? 18 : Math.max(2, job.progress * 100)}%` }} /></div><span className="num w-20 text-right text-[10px] text-dim">{fmtSpeed(job.speed)}</span></div>}
+                  <div className="flex items-center gap-2 text-xs"><span className={`shrink-0 ${job.status === 'error' ? 'text-rose-300' : job.status === 'done' ? 'text-teal-300' : 'text-aurora-1'}`}>{job.status === 'running' ? <LoaderCircle size={13} className="animate-spin" /> : job.status === 'done' ? <Check size={13} /> : <span className="inline-block w-3 text-center">·</span>}</span><span className="min-w-0 flex-1 truncate text-fg">{job.label}</span><span className="num shrink-0 text-[10px] text-dim">{transferStatus(job)}</span>{job.status === 'running' && job.phase !== 'staging' && <button onClick={async () => { const result = await cancelRcloneTransfer(job.id); if (!result.ok) toast(result.detail, 'bad') }} title="取消任务" aria-label="取消任务" className="grid h-6 w-6 place-items-center text-dim hover:text-rose-300"><X size={12} /></button>}{(job.status === 'error' || job.status === 'canceled') && job.retryable && <button onClick={() => retry(job)} title="重试任务" aria-label="重试任务" className="grid h-6 w-6 place-items-center text-dim hover:text-fg"><RotateCcw size={12} /></button>}</div>
+                  {job.status === 'running' && <div className="mt-1.5 flex items-center gap-2"><div className="h-1 flex-1 overflow-hidden rounded-full bg-white/8"><div className="h-full rounded-full grad-bar transition-all" style={{ width: `${job.progress === null ? 18 : Math.max(2, job.progress * 100)}%` }} /></div><span className="num w-32 truncate text-right text-[10px] text-dim">{job.phase === 'staging' && job.total ? `${fmtBytes(job.bytes)} / ${fmtBytes(job.total)} · ${fmtSpeed(job.speed)}` : fmtSpeed(job.speed)}</span></div>}
                   {job.status === 'error' && job.detail && <div className="mt-1 text-[10px] text-rose-300">{job.detail}</div>}
                 </div>
               ))}
