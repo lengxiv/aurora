@@ -6,7 +6,7 @@ import { useToast } from '../toast'
 
 const statusTone: Record<MountStatus, 'ok' | 'warn' | 'bad'> = { online: 'ok', degraded: 'warn', offline: 'bad' }
 const stateTone: Record<Torrent['state'], 'ok' | 'warn' | 'bad' | 'muted'> = {
-  downloading: 'ok', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
+  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
 }
 
 function RowBtn({ children, onClick, title, danger }: { children: ReactNode; onClick: () => void; title?: string; danger?: boolean }) {
@@ -262,7 +262,7 @@ export default function ConsoleView() {
                     <div className="flex justify-end gap-1">
                       {t.state === 'paused'
                         ? <RowBtn onClick={() => doAction(t.id, 'resume', '恢复')} title="继续"><Play size={12} /></RowBtn>
-                        : (t.state === 'downloading' || t.state === 'queued' || t.state === 'seeding')
+                        : (t.state === 'downloading' || t.state === 'stalled' || t.state === 'queued' || t.state === 'seeding')
                           ? <RowBtn onClick={() => doAction(t.id, 'pause', '暂停')} title="暂停"><Pause size={12} /></RowBtn>
                           : null}
                       <RowBtn danger onClick={() => doAction(t.id, 'remove', '删除')} title="删除"><Trash2 size={12} /></RowBtn>

@@ -100,7 +100,7 @@ export function EmptyState({ icon, title, hint }: { icon: ReactNode; title: stri
 }
 
 export const STATE_ZH: Record<string, string> = {
-  downloading: '下载中', seeding: '做种中', queued: '排队中', paused: '已暂停', error: '出错', done: '已完成', unknown: '未知',
+  downloading: '下载中', stalled: '下载停滞', seeding: '做种中', queued: '排队中', paused: '已暂停', error: '出错', done: '已完成', unknown: '未知',
   metaDL: '获取元数据', forcedDL: '强制下载', stalledUP: '做种待连', stalledDL: '下载待连', uploading: '上传中', checkingDL: '校验中', checkingUP: '校验中',
 }
 export const STATUS_ZH: Record<string, string> = { online: '在线', degraded: '降级', offline: '离线' }

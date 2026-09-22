@@ -21,7 +21,7 @@ export interface Mount {
 export interface Torrent {
   id: string
   name: string
-  state: 'downloading' | 'seeding' | 'queued' | 'error' | 'done' | 'paused'
+  state: 'downloading' | 'stalled' | 'seeding' | 'queued' | 'error' | 'done' | 'paused'
   progress: number
   speed: number
   sizeGb: number

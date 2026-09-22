@@ -91,7 +91,7 @@
 ## 部署
 - systemd `aurora.service`：开机自启、崩溃自动拉起、内存上限 512M
 - Aurora systemd 服务使用独立低权限用户、回环监听和系统级沙箱限制
-- qBittorrent / Jellyfin：由 `compose.yaml` 固化持久化挂载；WebUI/管理端口仅回环监听，6881 BT 端口公开
+- qBittorrent / Jellyfin：由 `compose.yaml` 固化持久化挂载；WebUI/管理端口仅回环监听，39876 BT 端口公开
 - Nginx 源站仅允许 localhost 和 Cloudflare 地址段，禁止通过服务器公网 IP 绕过 Cloudflare
 - `aurora-backup.timer` 每日备份配置与元数据，保留最近 14 份
 - 前端 Vite 构建后由 FastAPI 托管（单页应用回退）

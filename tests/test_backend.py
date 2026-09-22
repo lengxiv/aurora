@@ -111,6 +111,11 @@ class TorrentUploadTests(unittest.TestCase):
         session.post.assert_not_called()
 
 
+class TorrentStateTests(unittest.TestCase):
+    def test_stalled_download_is_distinguished_from_active_download(self):
+        self.assertEqual(providers._QBIT_STATES["stalledDL"], "stalled")
+
+
 class RcloneTests(unittest.TestCase):
     def test_remote_test_reads_root(self):
         rclone = providers.RcloneProvider()

@@ -4,7 +4,7 @@ import { useMetrics, fetchTorrentPeers, type TorrentPeers } from '../lib/api'
 import { StatCard, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, EmptyState, flagFor, countryZh } from '../components/ui'
 
 const stateTone: Record<string, 'ok' | 'warn' | 'bad' | 'muted'> = {
-  downloading: 'ok', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
+  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
 }
 
 export default function SeedingView() {

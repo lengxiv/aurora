@@ -59,7 +59,7 @@ cd /opt/aurora/backend
 
 ## 安全与恢复
 
-- Aurora、qBittorrent WebUI、Jellyfin 管理端口均只监听 `127.0.0.1`，公网请求经 Cloudflare 和 Nginx 进入；BT 对等端口 `6881` 保持公开。
+- Aurora、qBittorrent WebUI、Jellyfin 管理端口均只监听 `127.0.0.1`，公网请求经 Cloudflare 和 Nginx 进入；BT 对等端口 `39876` 保持公开。
 - 登录使用服务端会话，支持在设置页查看和撤销其他活动会话。修改密码要求验证当前密码，并使其他会话立即失效。
 - 媒资删除先移动到同磁盘隐藏目录 `.aurora-trash`；可在媒资库的「回收站」恢复或彻底删除，同名路径冲突时拒绝覆盖。
 - `aurora-backup.timer` 每日约 04:20 自动备份配置和元数据到 `/root/backup/aurora`，保留最近 14 份。下载内容和媒体文件不进入配置归档。

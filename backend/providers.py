@@ -258,7 +258,7 @@ _RCLONE_PARAM_KEYS = frozenset({
 _RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "token", "refresh_token"})
 
 _QBIT_STATES = {
-    "downloading": "downloading", "stalledDL": "downloading", "forcedDL": "downloading",
+    "downloading": "downloading", "stalledDL": "stalled", "forcedDL": "downloading",
     "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding", "stoppedUP": "seeding",
     "queuedDL": "queued", "queuedUP": "queued",
     "error": "error", "missingFiles": "error", "unknown": "error",
