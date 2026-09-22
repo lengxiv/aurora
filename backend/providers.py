@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -256,6 +258,37 @@ _RCLONE_PARAM_KEYS = frozenset({
     "chunk_size", "upload_cutoff", "bucket",
 })
 _RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "token", "refresh_token"})
+_RCLONE_TRANSFER_LIMIT = 100
+_RCLONE_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
+
+
+def _clean_rclone_path(path: str, allow_empty: bool = True) -> str:
+    """Normalize a remote-relative path without allowing traversal."""
+    raw = str(path or "").replace("\\", "/")
+    if "\x00" in raw or raw.startswith("/"):
+        raise ValueError("网盘路径无效")
+    parts = raw.split("/")
+    if any(part == ".." for part in parts):
+        raise ValueError("网盘路径无效")
+    clean = posixpath.normpath("/".join(part for part in parts if part not in ("", ".")))
+    if clean == ".":
+        clean = ""
+    if not allow_empty and not clean:
+        raise ValueError("网盘路径不能为空")
+    if len(clean) > 2048:
+        raise ValueError("网盘路径过长")
+    return clean
+
+
+def _join_rclone_path(parent: str, child: str) -> str:
+    child = str(child or "").replace("\\", "/")
+    if not child or "/" in child or child in (".", ".."):
+        raise ValueError("网盘文件名无效")
+    return _clean_rclone_path(posixpath.join(parent, child), allow_empty=False)
+
+
+def _rclone_fs(name: str, path: str = "") -> str:
+    return f"{name}:{path}" if path else f"{name}:"
 
 _QBIT_STATES = {
     "downloading": "downloading", "stalledDL": "stalled", "forcedDL": "downloading",
@@ -275,6 +308,8 @@ class RcloneProvider:
         self.base = os.environ.get("AURORA_RCLONE_RC", "http://127.0.0.1:5572").rstrip("/")
         # rc 启用 Basic Auth 时提供凭据（用户:密码，纯回环仍建议开，公网反代必须开）
         self.auth = os.environ.get("AURORA_RCLONE_RC_AUTH", "")
+        self._transfer_jobs: dict[str, dict] = {}
+        self._transfer_lock = threading.RLock()
 
     def _req(self, path, **kw):
         return _http(f"{self.base}{path}", auth=self.auth or None, **kw)
@@ -343,6 +378,312 @@ class RcloneProvider:
         except Exception as e:
             detail = str(e).strip() or "远端无响应"
             return False, f"连接失败：{detail[:180]}", round((time.monotonic() - started) * 1000)
+
+    def _validate_name_path(self, name: str, path: str = "", allow_empty: bool = True) -> tuple[str, str]:
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", name or ""):
+            raise ValueError("网盘名称无效")
+        return name, _clean_rclone_path(path, allow_empty=allow_empty)
+
+    def list_files(self, name: str, path: str = "") -> tuple[bool, list[dict], str]:
+        """List one remote directory without exposing backend-specific fields."""
+        try:
+            name, path = self._validate_name_path(name, path)
+            data = self._req(
+                "/operations/list", timeout=12.0, method="POST",
+                data=json.dumps({
+                    "fs": _rclone_fs(name),
+                    "remote": path,
+                    "opt": {"recurse": False, "noModTime": False, "noMimeType": False},
+                }),
+                headers={"Content-Type": "application/json"},
+            ) or {}
+            entries = []
+            for item in data.get("list") or []:
+                raw_name = str(item.get("Name") or posixpath.basename(str(item.get("Path") or "")))
+                if not raw_name or raw_name in (".", "..") or "/" in raw_name or "\\" in raw_name:
+                    continue
+                try:
+                    child_path = _join_rclone_path(path, raw_name)
+                except ValueError:
+                    continue
+                is_dir = bool(item.get("IsDir", False))
+                try:
+                    size = max(0, int(item.get("Size", 0) or 0))
+                except (TypeError, ValueError):
+                    size = 0
+                entries.append({
+                    "name": raw_name,
+                    "path": child_path,
+                    "isDir": is_dir,
+                    "size": size,
+                    "modTime": str(item.get("ModTime") or ""),
+                    "mimeType": str(item.get("MimeType") or ""),
+                })
+            entries.sort(key=lambda item: (not item["isDir"], item["name"].casefold()))
+            return True, entries, ""
+        except Exception as e:
+            return False, [], str(e).strip()[:180] or "读取网盘目录失败"
+
+    def _start_job(self, endpoint: str, payload: dict, *, action: str, label: str,
+                   total: int | None = None, cleanup: str = "") -> dict:
+        body = dict(payload)
+        body["_async"] = True
+        data = self._req(
+            endpoint, timeout=10.0, method="POST", data=json.dumps(body),
+            headers={"Content-Type": "application/json"},
+        ) or {}
+        remote_job = data.get("jobid")
+        if remote_job is None:
+            raise RuntimeError("rclone 未返回任务编号")
+        job = {
+            "id": uuid.uuid4().hex[:16],
+            "rcloneJobId": int(remote_job),
+            "action": action,
+            "label": label[:240],
+            "status": "running",
+            "progress": 0.0 if total else None,
+            "bytes": 0,
+            "total": total,
+            "speed": 0,
+            "detail": "",
+            "created": int(time.time()),
+            "finished": 0,
+            "cleanup": cleanup,
+        }
+        with self._transfer_lock:
+            self._transfer_jobs[job["id"]] = job
+        return self._public_transfer(job)
+
+    @staticmethod
+    def _public_transfer(job: dict) -> dict:
+        return {k: v for k, v in job.items() if k not in ("rcloneJobId", "cleanup")}
+
+    def _cleanup_transfer(self, job: dict) -> None:
+        path = job.get("cleanup") or ""
+        if not path:
+            return
+        try:
+            if os.path.isfile(path):
+                os.unlink(path)
+        except OSError:
+            pass
+        job["cleanup"] = ""
+
+    def _refresh_transfer(self, job: dict) -> None:
+        if job.get("status") in ("done", "error", "canceled"):
+            return
+        try:
+            status = self._req(
+                "/job/status", timeout=4.0, method="POST",
+                data=json.dumps({"jobid": job["rcloneJobId"]}),
+                headers={"Content-Type": "application/json"},
+            ) or {}
+        except Exception as e:
+            # A temporary status failure should not make an active transfer look failed.
+            job["detail"] = str(e).strip()[:180]
+            return
+        if status.get("finished"):
+            job["status"] = "done" if status.get("success") else "error"
+            job["detail"] = "" if status.get("success") else str(status.get("error") or "传输失败")[:180]
+            job["progress"] = 1.0 if job["status"] == "done" else job.get("progress")
+            job["finished"] = int(time.time())
+            self._cleanup_transfer(job)
+            return
+        try:
+            stats = self._req("/core/stats", timeout=3.0, method="POST") or {}
+            done = max(0, int(stats.get("bytes", 0) or 0))
+            total = stats.get("totalBytes")
+            if total:
+                job["total"] = max(int(total), int(job.get("total") or 0))
+            job["bytes"] = max(int(job.get("bytes") or 0), done)
+            job["speed"] = max(0, int(float(stats.get("speed", 0) or 0)))
+            if job.get("total"):
+                job["progress"] = min(1.0, job["bytes"] / job["total"])
+        except Exception:
+            pass
+
+    def transfers(self) -> list[dict]:
+        with self._transfer_lock:
+            jobs = list(self._transfer_jobs.values())
+        for job in jobs:
+            self._refresh_transfer(job)
+        with self._transfer_lock:
+            ordered = sorted(self._transfer_jobs.values(), key=lambda item: item["created"], reverse=True)
+            for job in ordered[_RCLONE_TRANSFER_LIMIT:]:
+                self._cleanup_transfer(job)
+                self._transfer_jobs.pop(job["id"], None)
+            return [self._public_transfer(job) for job in ordered[:_RCLONE_TRANSFER_LIMIT]]
+
+    def cancel_transfer(self, transfer_id: str) -> tuple[bool, str]:
+        with self._transfer_lock:
+            job = self._transfer_jobs.get(transfer_id)
+        if not job:
+            return False, "传输任务不存在"
+        if job.get("status") in ("done", "error", "canceled"):
+            return True, ""
+        try:
+            self._req(
+                "/job/stop", timeout=5.0, method="POST",
+                data=json.dumps({"jobid": job["rcloneJobId"]}),
+                headers={"Content-Type": "application/json"},
+            )
+            job["status"] = "canceled"
+            job["detail"] = "已取消"
+            job["finished"] = int(time.time())
+            self._cleanup_transfer(job)
+            return True, ""
+        except Exception as e:
+            return False, str(e).strip()[:180] or "取消传输失败"
+
+    def mkdir_remote(self, name: str, path: str) -> tuple[bool, str]:
+        try:
+            name, path = self._validate_name_path(name, path, allow_empty=False)
+            self._req(
+                "/operations/mkdir", timeout=12.0, method="POST",
+                data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                headers={"Content-Type": "application/json"},
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e).strip()[:180] or "新建目录失败"
+
+    def delete_remote_file(self, name: str, path: str, is_dir: bool) -> tuple[bool, dict | None, str]:
+        try:
+            name, path = self._validate_name_path(name, path, allow_empty=False)
+            if is_dir:
+                job = self._start_job(
+                    "/operations/purge", {"fs": _rclone_fs(name), "remote": path},
+                    action="delete", label=f"删除目录 {name}:{path}",
+                )
+                return True, job, ""
+            self._req(
+                "/operations/deletefile", timeout=12.0, method="POST",
+                data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                headers={"Content-Type": "application/json"},
+            )
+            return True, None, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "删除失败"
+
+    def rename_remote(self, name: str, path: str, new_name: str, is_dir: bool) -> tuple[bool, dict | None, str]:
+        try:
+            name, path = self._validate_name_path(name, path, allow_empty=False)
+            new_name = str(new_name or "").strip()
+            if not new_name or "/" in new_name or "\\" in new_name or new_name in (".", ".."):
+                return False, None, "新名称无效"
+            parent = posixpath.dirname(path)
+            destination = _join_rclone_path(parent, new_name)
+            if is_dir:
+                src_fs = _rclone_fs(name, path)
+                dst_fs = _rclone_fs(name, destination)
+                job = self._start_job(
+                    "/sync/move", {"srcFs": src_fs, "srcRemote": "", "dstFs": dst_fs, "dstRemote": ""},
+                    action="move", label=f"重命名 {name}:{path}",
+                )
+            else:
+                job = self._start_job(
+                    "/operations/movefile",
+                    {"srcFs": _rclone_fs(name), "srcRemote": path, "dstFs": _rclone_fs(name), "dstRemote": destination},
+                    action="move", label=f"重命名 {name}:{path}",
+                )
+            return True, job, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "重命名失败"
+
+    def copy_remote(self, source_name: str, source_path: str, destination_name: str,
+                    destination_path: str, is_dir: bool, action: str) -> tuple[bool, dict | None, str]:
+        try:
+            source_name, source_path = self._validate_name_path(source_name, source_path, allow_empty=False)
+            destination_name, destination_path = self._validate_name_path(destination_name, destination_path)
+            if action not in ("copy", "move"):
+                return False, None, "传输动作无效"
+            if is_dir:
+                endpoint = "/sync/copy" if action == "copy" else "/sync/move"
+                dirname = posixpath.basename(source_path)
+                target = _join_rclone_path(destination_path, dirname)
+                payload = {
+                    "srcFs": _rclone_fs(source_name, source_path), "srcRemote": "",
+                    "dstFs": _rclone_fs(destination_name, target), "dstRemote": "",
+                }
+            else:
+                endpoint = "/operations/copyfile" if action == "copy" else "/operations/movefile"
+                filename = posixpath.basename(source_path)
+                target = _join_rclone_path(destination_path, filename)
+                payload = {
+                    "srcFs": _rclone_fs(source_name), "srcRemote": source_path,
+                    "dstFs": _rclone_fs(destination_name), "dstRemote": target,
+                }
+            job = self._start_job(
+                endpoint, payload, action=action,
+                label=f"{action == 'copy' and '复制' or '移动'} {source_name}:{source_path}",
+            )
+            return True, job, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "传输失败"
+
+    def download_remote(self, name: str, path: str, destination: str, is_dir: bool) -> tuple[bool, dict | None, str]:
+        try:
+            name, path = self._validate_name_path(name, path, allow_empty=False)
+            destination = _clean_rclone_path(destination)
+            base = os.path.realpath(os.path.expanduser(os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")))
+            target = os.path.realpath(os.path.join(base, destination))
+            if target != base and not target.startswith(base + os.sep):
+                return False, None, "本地目标路径无效"
+            os.makedirs(target, exist_ok=True)
+            if is_dir:
+                src_fs = _rclone_fs(name, path)
+                payload = {"srcFs": src_fs, "srcRemote": "", "dstFs": target, "dstRemote": ""}
+                endpoint = "/sync/copy"
+                total = None
+            else:
+                filename = posixpath.basename(path)
+                payload = {
+                    "srcFs": _rclone_fs(name), "srcRemote": path,
+                    "dstFs": target, "dstRemote": filename,
+                }
+                endpoint = "/operations/copyfile"
+                total = None
+                try:
+                    stat = self._req(
+                        "/operations/stat", timeout=8.0, method="POST",
+                        data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                        headers={"Content-Type": "application/json"},
+                    ) or {}
+                    item = stat.get("item") or {}
+                    total = max(0, int(item.get("Size", 0) or 0)) or None
+                except Exception:
+                    pass
+            job = self._start_job(
+                endpoint, payload, action="download", label=f"下载 {name}:{path}", total=total,
+            )
+            return True, job, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "下载失败"
+
+    def upload_file(self, name: str, staging_path: str, filename: str,
+                    destination: str, total: int) -> tuple[bool, dict | None, str]:
+        try:
+            name, destination = self._validate_name_path(name, destination)
+            filename = str(filename or "").strip()
+            if not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
+                return False, None, "文件名无效"
+            if total <= 0 or total > _RCLONE_UPLOAD_LIMIT:
+                return False, None, "文件大小超出限制"
+            stage = os.path.realpath(staging_path)
+            data_dir = os.path.realpath(_DATA_DIR)
+            if not stage.startswith(data_dir + os.sep) or not os.path.isfile(stage):
+                return False, None, "上传文件暂存失败"
+            target = _join_rclone_path(destination, filename)
+            job = self._start_job(
+                "/operations/copyfile",
+                {"srcFs": os.path.dirname(stage), "srcRemote": os.path.basename(stage),
+                 "dstFs": _rclone_fs(name), "dstRemote": target},
+                action="upload", label=f"上传 {name}:{target}", total=total, cleanup=stage,
+            )
+            return True, job, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "上传失败"
 
     def get_remote(self, name: str) -> tuple[bool, dict, str]:
         """Return editable non-secret fields and the names of stored secrets."""

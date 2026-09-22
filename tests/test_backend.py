@@ -117,6 +117,84 @@ class TorrentStateTests(unittest.TestCase):
 
 
 class RcloneTests(unittest.TestCase):
+    def test_remote_file_listing_maps_entries_and_rejects_traversal(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"list": [
+            {"Name": "folder", "IsDir": True, "Size": -1},
+            {"Path": "clip.mp4", "IsDir": False, "Size": 2048, "ModTime": "2026-09-23T01:02:03Z"},
+        ]})
+
+        ok, entries, detail = rclone.list_files("media", "movies")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(entries[0]["path"], "movies/folder")
+        self.assertTrue(entries[0]["isDir"])
+        self.assertEqual(entries[1]["path"], "movies/clip.mp4")
+        self.assertEqual(entries[1]["size"], 2048)
+        ok, entries, detail = rclone.list_files("media", "../outside")
+        self.assertFalse(ok)
+        self.assertEqual(entries, [])
+        self.assertEqual(detail, "网盘路径无效")
+
+    def test_remote_copy_uses_async_rclone_job(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 42})
+
+        ok, job, detail = rclone.copy_remote("media", "movies/clip.mp4", "archive", "backup", False, "copy")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertIsNotNone(job)
+        self.assertEqual(job["action"], "copy")
+        call = rclone._req.call_args
+        self.assertEqual(call.args[0], "/operations/copyfile")
+        payload = json.loads(call.kwargs["data"])
+        self.assertEqual(payload["srcFs"], "media:")
+        self.assertEqual(payload["srcRemote"], "movies/clip.mp4")
+        self.assertEqual(payload["dstFs"], "archive:")
+        self.assertEqual(payload["dstRemote"], "backup/clip.mp4")
+        self.assertTrue(payload["_async"])
+
+    def test_remote_directory_copy_keeps_directory_name(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 43})
+
+        ok, job, detail = rclone.copy_remote("media", "movies/season", "archive", "backup", True, "copy")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertIsNotNone(job)
+        call = rclone._req.call_args
+        self.assertEqual(call.args[0], "/sync/copy")
+        payload = json.loads(call.kwargs["data"])
+        self.assertEqual(payload["srcFs"], "media:movies/season")
+        self.assertEqual(payload["dstFs"], "archive:backup/season")
+        self.assertEqual(payload["dstRemote"], "")
+        self.assertTrue(payload["_async"])
+
+    def test_remote_download_rejects_local_path_traversal(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock()
+
+        ok, job, detail = rclone.download_remote("media", "movies/clip.mp4", "../outside", False)
+
+        self.assertFalse(ok)
+        self.assertIsNone(job)
+        self.assertEqual(detail, "网盘路径无效")
+        rclone._req.assert_not_called()
+
+    def test_remote_file_operations_reject_unsafe_paths_without_request(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock()
+
+        ok, entries, detail = rclone.list_files("media", "folder/../secret")
+
+        self.assertFalse(ok)
+        self.assertEqual(entries, [])
+        self.assertEqual(detail, "网盘路径无效")
+        rclone._req.assert_not_called()
+
     def test_remote_test_reads_root(self):
         rclone = providers.RcloneProvider()
         rclone._req = Mock(return_value={"list": []})

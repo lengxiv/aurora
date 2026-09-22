@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -465,6 +465,161 @@ def rclone_delete(body: RcloneDeleteBody, _user: str = Depends(require_auth)):
     ok, err = providers._rclone.delete_remote(body.name)
     if not ok:
         raise HTTPException(status_code=400, detail=err or "删除失败")
+    return {"ok": True}
+
+
+class RclonePathBody(BaseModel):
+    name: str
+    path: str = ""
+
+
+@app.get("/api/rclone/files")
+def rclone_files(name: str, path: str = "", _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, entries, detail = providers._rclone.list_files(name, path)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"name": name, "path": path, "items": entries}
+
+
+@app.post("/api/rclone/files/mkdir")
+def rclone_mkdir(body: RclonePathBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, detail = providers._rclone.mkdir_remote(body.name, body.path)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+class RcloneFileDeleteBody(RclonePathBody):
+    is_dir: bool = False
+
+
+@app.post("/api/rclone/files/delete")
+def rclone_file_delete(body: RcloneFileDeleteBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, job, detail = providers._rclone.delete_remote_file(body.name, body.path, body.is_dir)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "job": job}
+
+
+class RcloneRenameBody(RclonePathBody):
+    new_name: str
+    is_dir: bool = False
+
+
+@app.post("/api/rclone/files/rename")
+def rclone_file_rename(body: RcloneRenameBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, job, detail = providers._rclone.rename_remote(body.name, body.path, body.new_name, body.is_dir)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "job": job}
+
+
+class RcloneCopyBody(BaseModel):
+    source_name: str
+    source_path: str
+    destination_name: str
+    destination_path: str = ""
+    is_dir: bool = False
+    action: str = "copy"
+
+
+@app.post("/api/rclone/transfers/copy")
+def rclone_copy(body: RcloneCopyBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, job, detail = providers._rclone.copy_remote(
+        body.source_name, body.source_path, body.destination_name,
+        body.destination_path, body.is_dir, body.action,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "job": job}
+
+
+class RcloneDownloadBody(RclonePathBody):
+    destination: str = ""
+    is_dir: bool = False
+
+
+@app.post("/api/rclone/transfers/download")
+def rclone_download(body: RcloneDownloadBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, job, detail = providers._rclone.download_remote(
+        body.name, body.path, body.destination, body.is_dir,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/rclone/transfers/upload")
+async def rclone_upload(
+    name: str = Form(...),
+    path: str = Form(""),
+    file: UploadFile = File(...),
+    _user: str = Depends(require_auth),
+):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    raw_name = str(file.filename or "").replace("\\", "/")
+    filename = Path(raw_name).name
+    if not filename or filename in (".", "..") or "/" in filename:
+        raise HTTPException(status_code=400, detail="文件名无效")
+    staging_dir = Path(providers._DATA_DIR) / "rclone-staging"
+    staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stage = staging_dir / f"{secrets.token_hex(16)}-{filename}"
+    total = 0
+    try:
+        with stage.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > providers._RCLONE_UPLOAD_LIMIT:
+                    raise HTTPException(status_code=413, detail="文件不能超过 2 GB")
+                out.write(chunk)
+        ok, job, detail = providers._rclone.upload_file(name, str(stage), filename, path, total)
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail)
+        return {"ok": True, "job": job}
+    except HTTPException:
+        stage.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        stage.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(e).strip()[:180] or "上传失败")
+    finally:
+        await file.close()
+
+
+@app.get("/api/rclone/transfers")
+def rclone_transfers(_user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    return {"jobs": providers._rclone.transfers()}
+
+
+class RcloneTransferCancelBody(BaseModel):
+    id: str
+
+
+@app.post("/api/rclone/transfers/cancel")
+def rclone_transfer_cancel(body: RcloneTransferCancelBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, detail = providers._rclone.cancel_transfer(body.id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
     return {"ok": True}
 
 

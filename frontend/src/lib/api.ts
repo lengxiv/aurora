@@ -380,6 +380,99 @@ export async function deleteRcloneRemote(name: string) {
   } catch { return { ok: false, detail: '网络请求失败' } }
 }
 
+export interface RcloneEntry {
+  name: string
+  path: string
+  isDir: boolean
+  size: number
+  modTime: string
+  mimeType: string
+}
+
+export interface RcloneTransfer {
+  id: string
+  action: 'upload' | 'download' | 'copy' | 'move' | 'delete'
+  label: string
+  status: 'running' | 'done' | 'error' | 'canceled'
+  progress: number | null
+  bytes: number
+  total: number | null
+  speed: number
+  detail: string
+  created: number
+  finished: number
+}
+
+async function rcloneMutation(url: string, body: unknown) {
+  try {
+    const r = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify(body),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const { data, detail } = await responseDetail(r, '操作失败')
+    return { ok: r.ok && !!data?.ok, detail, job: data?.job as RcloneTransfer | null }
+  } catch { return { ok: false, detail: '网络请求失败', job: null } }
+}
+
+export async function fetchRcloneFiles(name: string, path = ''): Promise<{ name: string; path: string; items: RcloneEntry[] } | null> {
+  try {
+    const r = await fetch(`/api/rclone/files?name=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`, { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return await r.json() as { name: string; path: string; items: RcloneEntry[] }
+  } catch { return null }
+}
+
+export async function mkdirRclone(name: string, path: string) {
+  return rcloneMutation('/api/rclone/files/mkdir', { name, path })
+}
+
+export async function deleteRcloneFile(name: string, path: string, isDir: boolean) {
+  return rcloneMutation('/api/rclone/files/delete', { name, path, is_dir: isDir })
+}
+
+export async function renameRcloneFile(name: string, path: string, newName: string, isDir: boolean) {
+  return rcloneMutation('/api/rclone/files/rename', { name, path, new_name: newName, is_dir: isDir })
+}
+
+export async function copyRcloneFile(sourceName: string, sourcePath: string, destinationName: string, destinationPath: string, isDir: boolean, action: 'copy' | 'move') {
+  return rcloneMutation('/api/rclone/transfers/copy', {
+    source_name: sourceName, source_path: sourcePath, destination_name: destinationName,
+    destination_path: destinationPath, is_dir: isDir, action,
+  })
+}
+
+export async function downloadRcloneFile(name: string, path: string, destination: string, isDir: boolean) {
+  return rcloneMutation('/api/rclone/transfers/download', { name, path, destination, is_dir: isDir })
+}
+
+export async function uploadRcloneFile(name: string, path: string, file: File) {
+  try {
+    const body = new FormData()
+    body.append('name', name)
+    body.append('path', path)
+    body.append('file', file, file.name)
+    const r = await fetch('/api/rclone/transfers/upload', { method: 'POST', credentials: 'include', body })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '', job: null } }
+    const { data, detail } = await responseDetail(r, '上传失败')
+    return { ok: r.ok && !!data?.ok, detail, job: data?.job as RcloneTransfer | null }
+  } catch { return { ok: false, detail: '网络请求失败', job: null } }
+}
+
+export async function fetchRcloneTransfers(): Promise<RcloneTransfer[]> {
+  try {
+    const r = await fetch('/api/rclone/transfers', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
+    if (!r.ok) return []
+    return (await r.json()).jobs || []
+  } catch { return [] }
+}
+
+export async function cancelRcloneTransfer(id: string) {
+  return rcloneMutation('/api/rclone/transfers/cancel', { id })
+}
+
 export async function fetchLogs() {
   try {
     const r = await fetch('/api/logs', { credentials: 'include' })

@@ -15,4 +15,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/aurora/rclone
+ReadWritePaths=/var/lib/aurora/rclone /var/lib/aurora/media

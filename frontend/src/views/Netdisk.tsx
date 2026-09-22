@@ -3,6 +3,7 @@ import { Cloud, Plus, Trash2, ExternalLink, X, RefreshCw, Eye, EyeOff, Pencil } 
 import { fetchRcloneRemotes, testRcloneRemote, fetchRcloneRemote, updateRcloneRemote, createRcloneRemote, deleteRcloneRemote, type RcloneRemote } from '../lib/api'
 import { EmptyState } from '../components/ui'
 import { useToast } from '../toast'
+import RcloneBrowser from './netdisk/RcloneBrowser'
 
 const FIELD_LABELS: Record<string, string> = {
   url: '地址',
@@ -219,6 +220,7 @@ export default function NetdiskView() {
             ))}
           </div>
         )}
+        {rc && rc.online && rc.remotes.length > 0 && <RcloneBrowser remotes={rc.remotes} />}
         <div className="mt-6 max-w-3xl text-[11px] leading-relaxed text-dim/70">
           网盘配置保存在 /root/.config/rclone/rclone.conf；保存后 ≤2 秒自动生效，管理台与监控大屏的挂载来源变为「rclone 真实」。WebDAV / S3 / 阿里云盘可表单直配；Google Drive / OneDrive 需浏览器 OAuth 回调，请在高级配置（rclone WebGUI）中完成。
         </div>
