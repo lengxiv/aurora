@@ -261,6 +261,61 @@ _RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "
 _RCLONE_TRANSFER_LIMIT = 100
 _RCLONE_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
 
+_S3_PROVIDER_NAMES = {
+    "aws": "AWS",
+    "alibaba": "Alibaba",
+    "aliyun": "Alibaba",
+    "ceph": "Ceph",
+    "cloudflare": "Cloudflare",
+    "digitalocean": "DigitalOcean",
+    "dreamhost": "Dreamhost",
+    "huaweiobs": "HuaweiOBS",
+    "ibmcos": "IBMCOS",
+    "idrive": "IDrive",
+    "ionos": "IONOS",
+    "lyvecloud": "LyveCloud",
+    "minio": "Minio",
+    "netease": "Netease",
+    "rackcorp": "RackCorp",
+    "scaleway": "Scaleway",
+    "seaweedfs": "SeaweedFS",
+    "stackpath": "StackPath",
+    "storj": "Storj",
+    "tencentcos": "TencentCOS",
+    "wasabi": "Wasabi",
+    "qiniu": "Qiniu",
+    "other": "Other",
+}
+
+
+def _canonical_s3_provider(value: str) -> str:
+    raw = str(value or "").strip()
+    return _S3_PROVIDER_NAMES.get(raw.casefold(), raw)
+
+
+def _normalize_s3_params(params: dict) -> dict:
+    """Normalize S3 values before handing them to rclone's config API."""
+    normalized = dict(params or {})
+    provider = _canonical_s3_provider(normalized.get("provider", ""))
+    if provider:
+        normalized["provider"] = provider
+    endpoint = str(normalized.get("endpoint", "")).strip()
+    if provider == "Cloudflare" and endpoint:
+        parsed = urllib.parse.urlsplit(endpoint)
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise ValueError("Cloudflare R2 端点不能包含 bucket 路径，请填写 r2.cloudflarestorage.com 地址")
+        normalized["endpoint"] = endpoint.rstrip("/")
+    return normalized
+
+
+def _friendly_rclone_error(detail: str) -> str:
+    message = str(detail or "").strip()
+    if "HeadObjectInput.Key" in message:
+        return "S3/R2 目标路径为空，请先进入 bucket 目录后再上传"
+    if "AccessDenied" in message or "status code: 403" in message:
+        return "R2 写入被拒绝，请为 API Token 授予该 bucket 的 Object Read & Write 权限"
+    return message[:180]
+
 
 def _clean_rclone_path(path: str, allow_empty: bool = True) -> str:
     """Normalize a remote-relative path without allowing traversal."""
@@ -385,6 +440,16 @@ class RcloneProvider:
             raise ValueError("网盘名称无效")
         return name, _clean_rclone_path(path, allow_empty=allow_empty)
 
+    def _remote_type(self, name: str) -> str:
+        try:
+            data = self._req(
+                "/config/get", timeout=5.0, method="POST",
+                data=f"name={urllib.parse.quote(name)}",
+            ) or {}
+            return str(data.get("type") or "").casefold()
+        except Exception:
+            return ""
+
     def list_files(self, name: str, path: str = "") -> tuple[bool, list[dict], str]:
         """List one remote directory without exposing backend-specific fields."""
         try:
@@ -423,7 +488,10 @@ class RcloneProvider:
             entries.sort(key=lambda item: (not item["isDir"], item["name"].casefold()))
             return True, entries, ""
         except Exception as e:
-            return False, [], str(e).strip()[:180] or "读取网盘目录失败"
+            detail = str(e).strip()
+            if not path and self._remote_type(name) == "s3":
+                detail = "S3/R2 根目录没有 bucket 列表权限，请在路径框中输入 bucket 名称"
+            return False, [], detail[:180] or "读取网盘目录失败"
 
     def _start_job(self, endpoint: str, payload: dict, *, action: str, label: str,
                    total: int | None = None, cleanup: str = "") -> dict:
@@ -488,7 +556,7 @@ class RcloneProvider:
             return
         if status.get("finished"):
             job["status"] = "done" if status.get("success") else "error"
-            job["detail"] = "" if status.get("success") else str(status.get("error") or "传输失败")[:180]
+            job["detail"] = "" if status.get("success") else _friendly_rclone_error(status.get("error") or "传输失败")
             job["progress"] = 1.0 if job["status"] == "done" else job.get("progress")
             job["finished"] = int(time.time())
             self._cleanup_transfer(job)
@@ -712,6 +780,9 @@ class RcloneProvider:
             data_dir = os.path.realpath(_DATA_DIR)
             if not stage.startswith(data_dir + os.sep) or not os.path.isfile(stage):
                 return False, None, "上传文件暂存失败"
+            if not destination:
+                if self._remote_type(name) == "s3":
+                    return False, None, "S3/R2 上传请先进入 bucket 目录后再上传"
             target = _join_rclone_path(destination, filename)
             job = self._start_job(
                 "/operations/copyfile",
@@ -721,7 +792,7 @@ class RcloneProvider:
             )
             return True, job, ""
         except Exception as e:
-            return False, None, str(e).strip()[:180] or "上传失败"
+            return False, None, _friendly_rclone_error(str(e)) or "上传失败"
 
     def get_remote(self, name: str) -> tuple[bool, dict, str]:
         """Return editable non-secret fields and the names of stored secrets."""
@@ -745,7 +816,7 @@ class RcloneProvider:
                     if value:
                         secrets.append(key)
                 elif isinstance(value, (str, int, float, bool)):
-                    params[key] = str(value)
+                    params[key] = _canonical_s3_provider(value) if ftype == "s3" and key == "provider" else str(value)
             return True, {"name": name, "type": ftype, "params": params, "secretFields": secrets}, ""
         except Exception as e:
             return False, {}, str(e).strip()[:180] or "读取网盘配置失败"
@@ -838,6 +909,11 @@ class RcloneProvider:
             if key in _RCLONE_SECRET_KEYS and not value.strip():
                 continue
             safe[key] = value
+        if str(safe.get("provider") or "").strip() or str(safe.get("endpoint") or "").strip():
+            try:
+                safe = _normalize_s3_params(safe)
+            except ValueError as e:
+                return False, str(e)
         if not safe:
             return False, "没有需要更新的配置"
         try:
@@ -872,6 +948,11 @@ class RcloneProvider:
         for k, v in (params or {}).items():
             if k in _RCLONE_PARAM_KEYS:
                 safe[k] = str(v)[:512]
+        if ftype == "s3":
+            try:
+                safe = _normalize_s3_params(safe)
+            except ValueError as e:
+                return False, str(e)
         body["parameters"] = safe
         try:
             import json as _json

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   ArrowDownAZ, ArrowUpAZ, Check, ChevronRight, Copy, Download, File, Folder,
   FolderPlus, LoaderCircle, Move, Pencil, RefreshCw, RotateCcw, Search, Trash2,
@@ -66,6 +66,7 @@ export default function RcloneBrowser({ remotes }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [remote, setRemote] = useState(remotes[0]?.name || '')
   const [path, setPath] = useState('')
+  const [pathDraft, setPathDraft] = useState('')
   const [items, setItems] = useState<RcloneEntry[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
@@ -78,6 +79,8 @@ export default function RcloneBrowser({ remotes }: Props) {
   const [sortAsc, setSortAsc] = useState(true)
   const [localUploads, setLocalUploads] = useState<RcloneTransfer[]>([])
   const previousJobs = useRef<Record<string, RcloneTransfer['status']>>({})
+  const remoteType = remotes.find((item) => item.name === remote)?.type || ''
+  const isObjectStore = remoteType === 's3'
 
   useEffect(() => {
     if (!remotes.some((item) => item.name === remote)) {
@@ -94,6 +97,7 @@ export default function RcloneBrowser({ remotes }: Props) {
     if (data) {
       setItems(data.items || [])
       setSelected(new Set())
+      setError(data.detail || '')
     } else {
       setError('目录读取失败，请检查网盘连接')
     }
@@ -103,6 +107,7 @@ export default function RcloneBrowser({ remotes }: Props) {
   useEffect(() => { load() }, [load])
 
   useEffect(() => { setQuery('') }, [path, remote])
+  useEffect(() => { setPathDraft(path) }, [path])
 
   useEffect(() => {
     let on = true
@@ -273,6 +278,11 @@ export default function RcloneBrowser({ remotes }: Props) {
     setSelected(new Set())
   }
 
+  const openPath = (event: FormEvent) => {
+    event.preventDefault()
+    browse(pathDraft.trim())
+  }
+
   if (!remote) return null
 
   return (
@@ -307,6 +317,10 @@ export default function RcloneBrowser({ remotes }: Props) {
               return <span key={crumbPath} className="flex shrink-0 items-center gap-1"><ChevronRight size={13} className="text-dim/50" /><button onClick={() => browse(crumbPath)} className={`rounded-md px-2 py-1.5 ${index === crumbs.length - 1 ? 'bg-white/8 text-fg' : 'text-dim hover:text-fg'}`}>{crumb}</button></span>
             })}
           </div>
+          {isObjectStore && <form onSubmit={openPath} className="flex min-w-44 shrink-0 items-center gap-1 rounded-lg border border-line bg-white/4 px-2 py-1 focus-within:border-aurora-2/50">
+            <input value={pathDraft} onChange={(event) => setPathDraft(event.target.value)} aria-label="网盘路径" placeholder="输入 bucket / 路径" className="min-w-0 flex-1 bg-transparent px-0.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+            <button type="submit" title="打开路径" aria-label="打开路径" className="grid h-6 w-6 shrink-0 place-items-center text-dim hover:text-fg"><ChevronRight size={13} /></button>
+          </form>}
           <button onClick={load} title="刷新目录" aria-label="刷新目录" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-white/4 text-dim hover:text-fg"><RefreshCw size={14} className={loading ? 'animate-spin' : ''} /></button>
           <button onClick={() => openDialog('mkdir')} title="新建目录" aria-label="新建目录" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-white/4 text-dim hover:text-fg"><FolderPlus size={14} /></button>
         </div>

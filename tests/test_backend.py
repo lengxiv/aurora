@@ -117,6 +117,54 @@ class TorrentStateTests(unittest.TestCase):
 
 
 class RcloneTests(unittest.TestCase):
+    def test_s3_provider_is_canonicalized_for_rclone(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={})
+
+        ok, detail = rclone.create_remote("r2", "s3", {
+            "provider": "cloudflare",
+            "endpoint": "https://account.r2.cloudflarestorage.com/",
+        })
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        payload = json.loads(rclone._req.call_args.kwargs["data"])
+        self.assertEqual(payload["parameters"]["provider"], "Cloudflare")
+        self.assertEqual(payload["parameters"]["endpoint"], "https://account.r2.cloudflarestorage.com")
+
+    def test_cloudflare_endpoint_rejects_bucket_path(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock()
+
+        ok, detail = rclone.create_remote("r2", "s3", {
+            "provider": "cloudflare",
+            "endpoint": "https://account.r2.cloudflarestorage.com/lengxi",
+        })
+
+        self.assertFalse(ok)
+        self.assertIn("不能包含 bucket 路径", detail)
+        rclone._req.assert_not_called()
+
+    def test_s3_upload_at_root_returns_bucket_hint(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"type": "s3"})
+        with tempfile.TemporaryDirectory() as td:
+            stage = Path(td) / "sample.bin"
+            stage.write_bytes(b"data")
+            old_data_dir = providers._DATA_DIR
+            providers._DATA_DIR = td
+            try:
+                ok, job, detail = rclone.upload_file("r2", str(stage), "sample.bin", "", 4)
+            finally:
+                providers._DATA_DIR = old_data_dir
+
+        self.assertFalse(ok)
+        self.assertIsNone(job)
+        self.assertEqual(detail, "S3/R2 上传请先进入 bucket 目录后再上传")
+        rclone._req.assert_called_once_with(
+            "/config/get", timeout=5.0, method="POST", data="name=r2",
+        )
+
     def test_remote_file_listing_maps_entries_and_rejects_traversal(self):
         rclone = providers.RcloneProvider()
         rclone._req = Mock(return_value={"list": [
@@ -136,6 +184,22 @@ class RcloneTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(entries, [])
         self.assertEqual(detail, "网盘路径无效")
+
+    def test_s3_root_permission_error_is_actionable(self):
+        rclone = providers.RcloneProvider()
+
+        def request(path, **_kwargs):
+            if path == "/operations/list":
+                raise RuntimeError("HTTP Error 500: Internal Server Error")
+            return {"type": "s3"}
+
+        rclone._req = Mock(side_effect=request)
+
+        ok, entries, detail = rclone.list_files("r2", "")
+
+        self.assertFalse(ok)
+        self.assertEqual(entries, [])
+        self.assertEqual(detail, "S3/R2 根目录没有 bucket 列表权限，请在路径框中输入 bucket 名称")
 
     def test_remote_copy_uses_async_rclone_job(self):
         rclone = providers.RcloneProvider()

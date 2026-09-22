@@ -417,12 +417,13 @@ async function rcloneMutation(url: string, body: unknown) {
   } catch { return { ok: false, detail: '网络请求失败', job: null } }
 }
 
-export async function fetchRcloneFiles(name: string, path = ''): Promise<{ name: string; path: string; items: RcloneEntry[] } | null> {
+export async function fetchRcloneFiles(name: string, path = ''): Promise<{ name: string; path: string; items: RcloneEntry[]; detail?: string } | null> {
   try {
     const r = await fetch(`/api/rclone/files?name=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`, { credentials: 'include' })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
-    if (!r.ok) return null
-    return await r.json() as { name: string; path: string; items: RcloneEntry[] }
+    const data = await r.json().catch(() => null) as { name?: string; path?: string; items?: RcloneEntry[]; detail?: string } | null
+    if (!r.ok) return { name, path, items: [], detail: data?.detail || '目录读取失败' }
+    return { name: data?.name || name, path: data?.path || path, items: data?.items || [], detail: data?.detail }
   } catch { return null }
 }
 
