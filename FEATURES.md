@@ -1,6 +1,12 @@
 # Aurora · 功能清单
 
-> 记录到 2026-08-12 为止已实现的功能。实际访问地址由部署环境决定（后端 systemd `aurora.service`，FastAPI :8787）。
+> 记录到 2026-09-23 为止已实现的功能。实际访问地址由部署环境决定（后端 systemd `aurora.service`，FastAPI :8787）。
+
+## 更新记录（2026-09-23）
+- **磁力下载位置选择**：添加磁力链接或 `.torrent` 文件时，可选择已有下载目录，或在弹窗内新建目录；默认使用下载根目录。
+- **路径安全校验**：后端仅允许使用本地下载盘内的相对目录，并映射为 qBittorrent 的 `/downloads/...` 路径。
+- **任务提交接口**：`/api/torrents/add` 和 `/api/torrents/upload` 支持保存目录参数，磁力与种子文件行为保持一致。
+- **验证结果**：后端 33 项测试通过，前端生产构建通过。
 
 ## 认证与安全
 - 应用层登录页（`/login`），用户名默认为 `admin`，密码由 `AURORA_AUTH_PASS` 或受限状态文件管理
@@ -28,8 +34,8 @@
 - 本地磁盘 df 真实容量 + 可用空间 + 读写速率（/proc/diskstats）
 - 磁力调度表：任务列表、进度、速率、S/L；状态中文显示
 - **磁力操作**：单条（暂停/续传/删除）+ **批量多选**（全选/多选 → 批量暂停/续传/删除）
-- **添加磁力**弹窗（真实提交 qBittorrent）
-- **上传种子文件**（管理台选择 `.torrent` 文件，单文件最大 20 MB，真实提交 qBittorrent）
+- **添加磁力**弹窗（真实提交 qBittorrent，可选择下载目录）
+- **上传种子文件**（管理台选择 `.torrent` 文件，单文件最大 20 MB，可选择下载目录，真实提交 qBittorrent）
 - 磁力实时来源徽标（中文：挂载/磁力/播放/磁盘/带宽 · 真实/未接入）
 - 搜索过滤磁力队列
 
@@ -81,8 +87,8 @@
 - `/api/auth/login|/logout|/me`
 - `/api/auth/sessions` `/api/auth/sessions/revoke` `/api/auth/password`
 - `/api/metrics` `/api/sources` `/api/info` `/api/logs`
-- `/api/torrents/add` `/api/torrents/{action}` `/api/torrents/batch` `/api/torrents/peers?hash=`（对等方明细）
-- `/api/torrents/upload`（上传 `.torrent` 文件）
+- `/api/torrents/add` `/api/torrents/{action}` `/api/torrents/batch` `/api/torrents/peers?hash=`（对等方明细；添加接口支持 `save_path`）
+- `/api/torrents/upload`（上传 `.torrent` 文件，支持 `save_path`）
 - `/api/media` `/api/media/stream` `/api/media/delete` `/api/media/rename` `/api/media/move`
 - `/api/media/trash` `/api/media/trash/restore` `/api/media/trash/purge`
 - `/api/media/dirs`（目录列表） `/api/media/mkdir`（新建目录） `/api/media/rmdir`（删空目录）
