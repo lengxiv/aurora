@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Check, ChevronRight, Copy, Download, File, Folder, FolderPlus, LoaderCircle,
-  Move, Pencil, RefreshCw, Trash2, Upload, X,
+  ArrowDownAZ, ArrowUpAZ, Check, ChevronRight, Copy, Download, File, Folder,
+  FolderPlus, LoaderCircle, Move, Pencil, RefreshCw, RotateCcw, Search, Trash2,
+  Upload, X,
 } from 'lucide-react'
 import {
-  cancelRcloneTransfer, copyRcloneFile, deleteRcloneFile, downloadRcloneFile,
+  cancelRcloneTransfer, clearRcloneTransfers, copyRcloneFile, deleteRcloneFile, downloadRcloneFile,
   fetchRcloneFiles, fetchRcloneTransfers, mkdirRclone, renameRcloneFile,
-  uploadRcloneFile, type RcloneEntry, type RcloneRemote, type RcloneTransfer,
+  retryRcloneTransfer, uploadRcloneFile, type RcloneEntry, type RcloneRemote, type RcloneTransfer,
 } from '../../lib/api'
 import { EmptyState } from '../../components/ui'
 import { useToast } from '../../toast'
 
 type DialogKind = 'mkdir' | 'rename' | 'copy' | 'move' | 'download'
+type SortKey = 'name' | 'size' | 'modified' | 'type'
 
 interface DialogState {
   kind: DialogKind
@@ -67,6 +69,9 @@ export default function RcloneBrowser({ remotes }: Props) {
   const [dialog, setDialog] = useState<DialogState | null>(null)
   const [transfers, setTransfers] = useState<RcloneTransfer[]>([])
   const [showTransfers, setShowTransfers] = useState(false)
+  const [query, setQuery] = useState('')
+  const [sortKey, setSortKey] = useState<SortKey>('name')
+  const [sortAsc, setSortAsc] = useState(true)
   const previousJobs = useRef<Record<string, RcloneTransfer['status']>>({})
 
   useEffect(() => {
@@ -92,6 +97,8 @@ export default function RcloneBrowser({ remotes }: Props) {
 
   useEffect(() => { load() }, [load])
 
+  useEffect(() => { setQuery('') }, [path, remote])
+
   useEffect(() => {
     let on = true
     const tick = async () => {
@@ -112,8 +119,24 @@ export default function RcloneBrowser({ remotes }: Props) {
 
   const activeTransfers = transfers.filter((job) => job.status === 'running')
   const crumbs = useMemo(() => path.split('/').filter(Boolean), [path])
-  const allSelected = items.length > 0 && items.every((item) => selected.has(item.path))
+  const visibleItems = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase()
+    const filtered = needle ? items.filter((item) => item.name.toLocaleLowerCase().includes(needle)) : items
+    const sorted = [...filtered].sort((left, right) => {
+      let result = 0
+      if (sortKey === 'size') result = left.size - right.size
+      else if (sortKey === 'modified') result = (Date.parse(left.modTime) || 0) - (Date.parse(right.modTime) || 0)
+      else if (sortKey === 'type') result = Number(left.isDir) - Number(right.isDir)
+      else result = left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+      if (result === 0) result = left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+      if (left.isDir !== right.isDir) return Number(right.isDir) - Number(left.isDir)
+      return result * (sortAsc ? 1 : -1)
+    })
+    return sorted
+  }, [items, query, sortAsc, sortKey])
+  const allSelected = visibleItems.length > 0 && visibleItems.every((item) => selected.has(item.path))
   const selectedItems = items.filter((item) => selected.has(item.path))
+  const finishedTransfers = transfers.filter((job) => job.status !== 'running')
 
   const toggle = (item: RcloneEntry) => {
     setSelected((current) => {
@@ -186,6 +209,17 @@ export default function RcloneBrowser({ remotes }: Props) {
 
   const deleteSelected = () => deleteEntries(selectedItems)
 
+  const retry = async (job: RcloneTransfer) => {
+    const result = await retryRcloneTransfer(job.id)
+    toast(result.ok ? '重试任务已提交' : `重试失败：${result.detail}`, result.ok ? 'ok' : 'bad')
+  }
+
+  const clearTransfers = async () => {
+    const result = await clearRcloneTransfers()
+    if (result.ok) setTransfers((current) => current.filter((job) => job.status === 'running'))
+    toast(result.ok ? '已清理结束任务' : `清理失败：${result.detail}`, result.ok ? 'ok' : 'bad')
+  }
+
   const upload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
@@ -240,6 +274,19 @@ export default function RcloneBrowser({ remotes }: Props) {
           <button onClick={() => openDialog('mkdir')} title="新建目录" aria-label="新建目录" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-white/4 text-dim hover:text-fg"><FolderPlus size={14} /></button>
         </div>
 
+        <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2.5">
+          <label className="flex min-w-44 flex-1 items-center gap-2 rounded-lg border border-line bg-white/4 px-2.5 py-1.5 text-xs text-dim focus-within:border-aurora-2/50">
+            <Search size={13} className="shrink-0" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前目录" className="min-w-0 flex-1 bg-transparent text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+            {query && <button onClick={() => setQuery('')} title="清除搜索" aria-label="清除搜索" className="shrink-0 text-dim hover:text-fg"><X size={13} /></button>}
+          </label>
+          <span className="text-[11px] text-dim">{query ? `${visibleItems.length}/${items.length} 项` : `${items.length} 项`}</span>
+          <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)} aria-label="排序方式" className="rounded-lg border border-line bg-white/4 px-2 py-1.5 text-xs text-dim focus:border-aurora-2/50 focus:outline-none">
+            <option value="name">按名称</option><option value="size">按大小</option><option value="modified">按修改时间</option><option value="type">按类型</option>
+          </select>
+          <button onClick={() => setSortAsc((value) => !value)} title={sortAsc ? '升序' : '降序'} aria-label={sortAsc ? '升序' : '降序'} className="grid h-7 w-7 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg">{sortAsc ? <ArrowDownAZ size={13} /> : <ArrowUpAZ size={13} />}</button>
+        </div>
+
         {selectedItems.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 border-b border-line bg-aurora-2/5 px-4 py-2.5">
             <span className="text-xs text-fg">已选 {selectedItems.length} 项</span>
@@ -254,11 +301,11 @@ export default function RcloneBrowser({ remotes }: Props) {
 
         {showTransfers && (
           <div className="border-b border-line bg-black/10 px-4 py-3">
-            <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium text-fg">传输任务</span><span className="num text-[10px] text-dim">最近 {transfers.length} 条</span></div>
+            <div className="mb-2 flex items-center gap-3"><span className="text-xs font-medium text-fg">传输任务</span><span className="num mr-auto text-[10px] text-dim">最近 {transfers.length} 条</span>{finishedTransfers.length > 0 && <button onClick={clearTransfers} title="清理已结束任务" aria-label="清理已结束任务" className="inline-flex items-center gap-1 text-[10px] text-dim hover:text-fg"><Trash2 size={12} /> 清理</button>}</div>
             {transfers.length === 0 ? <div className="py-3 text-center text-xs text-dim">暂无传输任务</div> : <div className="flex max-h-56 flex-col gap-2 overflow-y-auto">
               {transfers.map((job) => (
                 <div key={job.id} className="rounded-lg border border-line bg-white/3 px-3 py-2">
-                  <div className="flex items-center gap-2 text-xs"><span className={`shrink-0 ${job.status === 'error' ? 'text-rose-300' : job.status === 'done' ? 'text-teal-300' : 'text-aurora-1'}`}>{job.status === 'running' ? <LoaderCircle size={13} className="animate-spin" /> : job.status === 'done' ? <Check size={13} /> : <span className="inline-block w-3 text-center">·</span>}</span><span className="min-w-0 flex-1 truncate text-fg">{job.label}</span><span className="num shrink-0 text-[10px] text-dim">{transferStatus(job)}</span>{job.status === 'running' && <button onClick={async () => { const result = await cancelRcloneTransfer(job.id); if (!result.ok) toast(result.detail, 'bad') }} title="取消任务" aria-label="取消任务" className="grid h-6 w-6 place-items-center text-dim hover:text-rose-300"><X size={12} /></button>}</div>
+                  <div className="flex items-center gap-2 text-xs"><span className={`shrink-0 ${job.status === 'error' ? 'text-rose-300' : job.status === 'done' ? 'text-teal-300' : 'text-aurora-1'}`}>{job.status === 'running' ? <LoaderCircle size={13} className="animate-spin" /> : job.status === 'done' ? <Check size={13} /> : <span className="inline-block w-3 text-center">·</span>}</span><span className="min-w-0 flex-1 truncate text-fg">{job.label}</span><span className="num shrink-0 text-[10px] text-dim">{transferStatus(job)}</span>{job.status === 'running' && <button onClick={async () => { const result = await cancelRcloneTransfer(job.id); if (!result.ok) toast(result.detail, 'bad') }} title="取消任务" aria-label="取消任务" className="grid h-6 w-6 place-items-center text-dim hover:text-rose-300"><X size={12} /></button>}{(job.status === 'error' || job.status === 'canceled') && job.retryable && <button onClick={() => retry(job)} title="重试任务" aria-label="重试任务" className="grid h-6 w-6 place-items-center text-dim hover:text-fg"><RotateCcw size={12} /></button>}</div>
                   {job.status === 'running' && <div className="mt-1.5 flex items-center gap-2"><div className="h-1 flex-1 overflow-hidden rounded-full bg-white/8"><div className="h-full rounded-full grad-bar transition-all" style={{ width: `${job.progress === null ? 18 : Math.max(2, job.progress * 100)}%` }} /></div><span className="num w-20 text-right text-[10px] text-dim">{fmtSpeed(job.speed)}</span></div>}
                   {job.status === 'error' && job.detail && <div className="mt-1 text-[10px] text-rose-300">{job.detail}</div>}
                 </div>
@@ -267,13 +314,13 @@ export default function RcloneBrowser({ remotes }: Props) {
           </div>
         )}
 
-        {error ? <div className="px-4 py-10"><EmptyState icon={<Folder size={20} />} title={error} hint="可以刷新目录或检查 remote 连接" /></div> : loading && !items.length ? <div className="flex flex-col gap-2 px-4 py-4"><div className="skeleton h-10 rounded-lg" /><div className="skeleton h-10 rounded-lg" /><div className="skeleton h-10 rounded-lg" /></div> : !items.length ? <div className="px-4 py-10"><EmptyState icon={<Folder size={20} />} title="此目录为空" hint="可以上传文件或新建目录" /></div> : <div>
+        {error ? <div className="px-4 py-10"><EmptyState icon={<Folder size={20} />} title={error} hint="可以刷新目录或检查 remote 连接" /></div> : loading && !items.length ? <div className="flex flex-col gap-2 px-4 py-4"><div className="skeleton h-10 rounded-lg" /><div className="skeleton h-10 rounded-lg" /><div className="skeleton h-10 rounded-lg" /></div> : !items.length ? <div className="px-4 py-10"><EmptyState icon={<Folder size={20} />} title="此目录为空" hint="可以上传文件或新建目录" /></div> : !visibleItems.length ? <div className="px-4 py-10"><EmptyState icon={<Search size={20} />} title="没有匹配项" hint="尝试其他名称" /></div> : <div>
           <div className="grid grid-cols-[auto_minmax(0,1fr)_6rem_10rem_auto] items-center gap-3 border-b border-line px-4 py-2 text-[10px] uppercase tracking-[0.16em] text-dim/70">
-            <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(items.map((item) => item.path)))} aria-label="全选" className="accent-[#a78bfa]" />
+            <input type="checkbox" checked={allSelected} onChange={() => setSelected((current) => { const next = new Set(current); if (allSelected) visibleItems.forEach((item) => next.delete(item.path)); else visibleItems.forEach((item) => next.add(item.path)); return next })} aria-label="全选" className="accent-[#a78bfa]" />
             <span>名称</span><span className="hidden sm:block">大小</span><span className="hidden md:block">修改时间</span><span />
           </div>
           <div className="divide-y divide-line/50">
-            {items.map((item) => <div key={item.path} className={`grid grid-cols-[auto_minmax(0,1fr)_6rem_10rem_auto] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-white/4 ${selected.has(item.path) ? 'bg-aurora-2/5' : ''}`}>
+            {visibleItems.map((item) => <div key={item.path} className={`grid grid-cols-[auto_minmax(0,1fr)_6rem_10rem_auto] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-white/4 ${selected.has(item.path) ? 'bg-aurora-2/5' : ''}`}>
               <input type="checkbox" checked={selected.has(item.path)} onChange={() => toggle(item)} aria-label={`选择 ${item.name}`} className="accent-[#a78bfa]" />
               <button onDoubleClick={() => item.isDir && browse(item.path)} onClick={() => item.isDir ? browse(item.path) : toggle(item)} className="flex min-w-0 items-center gap-2 text-left">
                 {item.isDir ? <Folder size={16} className="shrink-0 text-aurora-1" /> : <File size={16} className="shrink-0 text-dim" />}

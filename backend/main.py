@@ -425,6 +425,7 @@ def rclone_config(name: str, _user: str = Depends(require_auth)):
 
 class RcloneUpdateBody(BaseModel):
     name: str
+    new_name: str = ""
     params: dict = {}
 
 
@@ -432,10 +433,25 @@ class RcloneUpdateBody(BaseModel):
 def rclone_update(body: RcloneUpdateBody, _user: str = Depends(require_auth)):
     if not providers._rclone.available():
         raise HTTPException(status_code=503, detail="rclone 未接入")
-    ok, detail = providers._rclone.update_remote(body.name, body.params)
-    if not ok:
-        raise HTTPException(status_code=400, detail=detail)
-    return {"ok": True}
+    target_name = body.name
+    renamed = False
+    if body.new_name.strip() and body.new_name.strip() != body.name:
+        ok, detail = providers._rclone.rename_remote(body.name, body.new_name)
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail)
+        target_name = body.new_name.strip()
+        renamed = True
+    if body.params:
+        ok, detail = providers._rclone.update_remote(target_name, body.params)
+        if not ok and detail != "没有需要更新的配置":
+            if renamed:
+                providers._rclone.rename_remote(target_name, body.name)
+            raise HTTPException(status_code=400, detail=detail)
+        if not ok and not renamed:
+            raise HTTPException(status_code=400, detail=detail)
+    elif not renamed:
+        raise HTTPException(status_code=400, detail="没有需要更新的配置")
+    return {"ok": True, "name": target_name}
 
 
 class RcloneCreateBody(BaseModel):
@@ -621,6 +637,23 @@ def rclone_transfer_cancel(body: RcloneTransferCancelBody, _user: str = Depends(
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
     return {"ok": True}
+
+
+@app.post("/api/rclone/transfers/retry")
+def rclone_transfer_retry(body: RcloneTransferCancelBody, _user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    ok, job, detail = providers._rclone.retry_transfer(body.id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/rclone/transfers/clear")
+def rclone_transfer_clear(_user: str = Depends(require_auth)):
+    if not providers._rclone.available():
+        raise HTTPException(status_code=503, detail="rclone 未接入")
+    return {"ok": True, "cleared": providers._rclone.clear_transfers()}
 
 
 @app.post("/api/tg/test")

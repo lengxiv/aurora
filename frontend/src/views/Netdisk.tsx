@@ -123,13 +123,14 @@ export default function NetdiskView() {
         if (secretFields.has(key) && !(params[key] || '').trim()) return false
         return (params[key] ?? '') !== (originalParams.current[key] ?? '')
       })
-      if (!changed) {
+      const renamed = n !== editName
+      if (!changed && !renamed) {
         toast('配置未修改', 'ok')
         closeForm()
         return
       }
-      const r = await updateRcloneRemote(editName, params)
-      toast(r.ok ? `已保存 ${editName}` : `保存失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+      const r = await updateRcloneRemote(editName, params, n)
+      toast(r.ok ? `已保存 ${n}` : `保存失败：${r.detail}`, r.ok ? 'ok' : 'bad')
       if (r.ok) { closeForm(); reload() }
       return
     }
@@ -239,7 +240,7 @@ export default function NetdiskView() {
               {/* 名称 */}
               <div>
                 <label className="block text-[11px] uppercase tracking-[0.2em] text-dim">名称</label>
-                <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} disabled={!!editName} placeholder="如 aliyun / gd / r2"
+                <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} placeholder="如 aliyun / gd / r2"
                   className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" />
               </div>
 

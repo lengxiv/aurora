@@ -427,6 +427,7 @@ class RcloneProvider:
 
     def _start_job(self, endpoint: str, payload: dict, *, action: str, label: str,
                    total: int | None = None, cleanup: str = "") -> dict:
+        request_payload = dict(payload)
         body = dict(payload)
         body["_async"] = True
         data = self._req(
@@ -450,6 +451,8 @@ class RcloneProvider:
             "created": int(time.time()),
             "finished": 0,
             "cleanup": cleanup,
+            "retryable": not bool(cleanup),
+            "request": {"endpoint": endpoint, "payload": request_payload},
         }
         with self._transfer_lock:
             self._transfer_jobs[job["id"]] = job
@@ -457,7 +460,7 @@ class RcloneProvider:
 
     @staticmethod
     def _public_transfer(job: dict) -> dict:
-        return {k: v for k, v in job.items() if k not in ("rcloneJobId", "cleanup")}
+        return {k: v for k, v in job.items() if k not in ("rcloneJobId", "cleanup", "request")}
 
     def _cleanup_transfer(self, job: dict) -> None:
         path = job.get("cleanup") or ""
@@ -535,6 +538,41 @@ class RcloneProvider:
             return True, ""
         except Exception as e:
             return False, str(e).strip()[:180] or "取消传输失败"
+
+    def retry_transfer(self, transfer_id: str) -> tuple[bool, dict | None, str]:
+        with self._transfer_lock:
+            job = self._transfer_jobs.get(transfer_id)
+            if not job:
+                return False, None, "传输任务不存在"
+            if job.get("status") == "running":
+                return False, None, "任务正在执行"
+            if job.get("status") not in ("error", "canceled"):
+                return False, None, "只有失败或已取消的任务可以重试"
+            if not job.get("retryable") or not job.get("request"):
+                return False, None, "该任务无法重试"
+            request = dict(job["request"])
+            action = str(job.get("action") or "transfer")
+            label = str(job.get("label") or "传输任务")
+            total = job.get("total")
+        try:
+            retry = self._start_job(
+                request["endpoint"], request["payload"], action=action,
+                label=label, total=total,
+            )
+            return True, retry, ""
+        except Exception as e:
+            return False, None, str(e).strip()[:180] or "重试失败"
+
+    def clear_transfers(self) -> int:
+        with self._transfer_lock:
+            removable = [
+                job for job in self._transfer_jobs.values()
+                if job.get("status") in ("done", "error", "canceled")
+            ]
+            for job in removable:
+                self._cleanup_transfer(job)
+                self._transfer_jobs.pop(job["id"], None)
+            return len(removable)
 
     def mkdir_remote(self, name: str, path: str) -> tuple[bool, str]:
         try:
@@ -711,6 +749,81 @@ class RcloneProvider:
             return True, {"name": name, "type": ftype, "params": params, "secretFields": secrets}, ""
         except Exception as e:
             return False, {}, str(e).strip()[:180] or "读取网盘配置失败"
+
+    def rename_remote(self, name: str, new_name: str) -> tuple[bool, str]:
+        """Rename a remote by recreating its complete config under a new name."""
+        import re as _re
+        name = str(name or "").strip()
+        new_name = str(new_name or "").strip()
+        name_pattern = r"[A-Za-z0-9_\-]{1,64}"
+        if not _re.fullmatch(name_pattern, name) or not _re.fullmatch(name_pattern, new_name):
+            return False, "名字只允许字母数字-_"
+        if name == new_name:
+            return True, ""
+        try:
+            remotes = self._req(
+                "/config/listremotes", timeout=5.0, method="POST",
+            ) or {}
+            existing = {str(item).rstrip(":") for item in (remotes.get("remotes") or [])}
+            if new_name in existing:
+                return False, "目标名称已存在"
+
+            old_config = self._req(
+                "/config/get", timeout=5.0, method="POST",
+                data=f"name={urllib.parse.quote(name)}",
+            ) or {}
+            remote_type = str(old_config.get("type") or "")
+            if not remote_type:
+                return False, "网盘配置不存在"
+
+            # config/get returns rclone's already-obscured secret values. Keep every
+            # scalar config key and ask config/create not to obscure them again.
+            parameters = {}
+            for key, value in old_config.items():
+                if key == "type" or not _re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", str(key)):
+                    continue
+                if isinstance(value, (str, int, float, bool)):
+                    parameters[str(key)] = str(value)
+            self._req(
+                "/config/create", timeout=8.0, method="POST",
+                data=json.dumps({
+                    "name": new_name,
+                    "type": remote_type,
+                    "parameters": parameters,
+                    "opt": {"noObscure": True, "noOutput": True, "nonInteractive": True},
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            created = self._req(
+                "/config/get", timeout=5.0, method="POST",
+                data=f"name={urllib.parse.quote(new_name)}",
+            ) or {}
+            if str(created.get("type") or "") != remote_type:
+                try:
+                    self._req(
+                        "/config/delete", timeout=5.0, method="POST",
+                        data=f"name={urllib.parse.quote(new_name)}",
+                    )
+                except Exception:
+                    pass
+                return False, "新名称配置校验失败"
+            try:
+                self._req(
+                    "/config/delete", timeout=5.0, method="POST",
+                    data=f"name={urllib.parse.quote(name)}",
+                )
+            except Exception as e:
+                try:
+                    self._req(
+                        "/config/delete", timeout=5.0, method="POST",
+                        data=f"name={urllib.parse.quote(new_name)}",
+                    )
+                except Exception:
+                    pass
+                return False, f"旧名称删除失败：{str(e).strip()[:140]}"
+            return True, ""
+        except Exception as e:
+            return False, str(e).strip()[:180] or "修改网盘名称失败"
 
     def update_remote(self, name: str, params: dict) -> tuple[bool, str]:
         """Update non-empty fields while preserving omitted or blank secrets."""

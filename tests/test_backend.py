@@ -184,6 +184,52 @@ class RcloneTests(unittest.TestCase):
         self.assertEqual(detail, "网盘路径无效")
         rclone._req.assert_not_called()
 
+    def test_failed_remote_transfer_can_be_retried(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 42})
+
+        ok, job, detail = rclone.copy_remote("media", "clip.mp4", "archive", "backup", False, "copy")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        internal = rclone._transfer_jobs[job["id"]]
+        internal["status"] = "error"
+        internal["detail"] = "temporary failure"
+        rclone._req.reset_mock()
+        rclone._req.return_value = {"jobid": 43}
+
+        ok, retry, detail = rclone.retry_transfer(job["id"])
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(retry["status"], "running")
+        self.assertEqual(rclone._req.call_args.args[0], "/operations/copyfile")
+        payload = json.loads(rclone._req.call_args.kwargs["data"])
+        self.assertEqual(payload["srcRemote"], "clip.mp4")
+        self.assertTrue(payload["_async"])
+
+    def test_upload_transfer_is_not_retryable_after_staging_cleanup(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 44})
+        with tempfile.TemporaryDirectory() as td:
+            stage = Path(td) / "sample.bin"
+            stage.write_bytes(b"data")
+            old_data_dir = providers._DATA_DIR
+            providers._DATA_DIR = td
+            try:
+                ok, job, detail = rclone.upload_file("media", str(stage), "sample.bin", "", 4)
+                self.assertTrue(ok)
+                self.assertEqual(detail, "")
+                internal = rclone._transfer_jobs[job["id"]]
+                self.assertFalse(internal["retryable"])
+                internal["status"] = "error"
+                ok, retry, detail = rclone.retry_transfer(job["id"])
+                self.assertFalse(ok)
+                self.assertIsNone(retry)
+                self.assertEqual(detail, "该任务无法重试")
+            finally:
+                providers._DATA_DIR = old_data_dir
+
     def test_remote_file_operations_reject_unsafe_paths_without_request(self):
         rclone = providers.RcloneProvider()
         rclone._req = Mock()
@@ -277,7 +323,47 @@ class RcloneTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(detail, "没有需要更新的配置")
-        rclone._req.assert_not_called()
+
+    def test_remote_rename_recreates_complete_config_and_removes_old_name(self):
+        rclone = providers.RcloneProvider()
+
+        def request(path, **kwargs):
+            if path == "/config/listremotes":
+                return {"remotes": ["old:"]}
+            if path == "/config/get":
+                payload = kwargs.get("data", "")
+                return {"type": "webdav", "url": "https://dav.example", "user": "alice",
+                        "pass": "obscured-secret", "custom_option": "preserve"} if "old" in payload else {"type": "webdav"}
+            return {}
+
+        rclone._req = Mock(side_effect=request)
+
+        ok, detail = rclone.rename_remote("old", "renamed")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        calls = rclone._req.call_args_list
+        create = next(call for call in calls if call.args[0] == "/config/create")
+        payload = json.loads(create.kwargs["data"])
+        self.assertEqual(payload["name"], "renamed")
+        self.assertEqual(payload["type"], "webdav")
+        self.assertEqual(payload["parameters"]["pass"], "obscured-secret")
+        self.assertEqual(payload["parameters"]["custom_option"], "preserve")
+        self.assertTrue(payload["opt"]["noObscure"])
+        delete_names = [
+            call.kwargs.get("data", "") for call in calls if call.args[0] == "/config/delete"
+        ]
+        self.assertIn("name=old", delete_names)
+
+    def test_remote_rename_rejects_existing_name_without_requesting_config(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"remotes": ["old:", "renamed:"]})
+
+        ok, detail = rclone.rename_remote("old", "renamed")
+
+        self.assertFalse(ok)
+        self.assertEqual(detail, "目标名称已存在")
+        rclone._req.assert_called_once_with("/config/listremotes", timeout=5.0, method="POST")
 
 
 if __name__ == "__main__":

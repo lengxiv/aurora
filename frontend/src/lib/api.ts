@@ -344,11 +344,11 @@ export async function fetchRcloneRemote(name: string): Promise<RcloneConfig | nu
   } catch { return null }
 }
 
-export async function updateRcloneRemote(name: string, params: Record<string, string>) {
+export async function updateRcloneRemote(name: string, params: Record<string, string>, newName = name) {
   try {
     const r = await fetch('/api/rclone/remotes/update', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
-      body: JSON.stringify({ name, params }),
+      body: JSON.stringify({ name, new_name: newName, params }),
     })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
     const d = await r.json().catch(() => null)
@@ -401,6 +401,7 @@ export interface RcloneTransfer {
   detail: string
   created: number
   finished: number
+  retryable?: boolean
 }
 
 async function rcloneMutation(url: string, body: unknown) {
@@ -471,6 +472,14 @@ export async function fetchRcloneTransfers(): Promise<RcloneTransfer[]> {
 
 export async function cancelRcloneTransfer(id: string) {
   return rcloneMutation('/api/rclone/transfers/cancel', { id })
+}
+
+export async function retryRcloneTransfer(id: string) {
+  return rcloneMutation('/api/rclone/transfers/retry', { id })
+}
+
+export async function clearRcloneTransfers() {
+  return rcloneMutation('/api/rclone/transfers/clear', {})
 }
 
 export async function fetchLogs() {
