@@ -357,7 +357,7 @@ export default function ConsoleView() {
               </div>
               <div className="mt-1.5 flex gap-2">
                 <select id="torrent-save-path" value={savePath} onChange={(e) => setSavePath(e.target.value)} disabled={busy || dirsBusy}
-                  className="min-w-0 flex-1 rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                  className="aurora-select min-w-0 flex-1 rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
                   <option value="">下载根目录（/downloads）</option>
                   {mediaDirs.map((dir) => <option key={dir.path} value={dir.path}>{dir.path}</option>)}
                 </select>

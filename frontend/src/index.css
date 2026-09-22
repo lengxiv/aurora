@@ -31,6 +31,21 @@ body {
 
 button, input, textarea { min-width: 0; }
 
+/* Keep native select menus readable against the dark Aurora surface. */
+.aurora-select {
+  color-scheme: dark;
+  background-color: rgba(255,255,255,0.04);
+  color: var(--color-fg);
+}
+.aurora-select option {
+  background-color: #151824;
+  color: var(--color-fg);
+}
+.aurora-select option:checked {
+  background-color: #3b315c;
+  color: #ffffff;
+}
+
 /* 隐藏滚动条但保留滚动（移动端顶栏导航用） */
 .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
 .no-scrollbar::-webkit-scrollbar { display: none; }
