@@ -119,17 +119,28 @@ class TorrentUploadTests(unittest.TestCase):
             "savepath": "/downloads/movies",
         })
 
+    def test_qbit_add_posts_remote_destination_tag(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.return_value.status_code = 200
+        qbit._sess = session
+
+        self.assertTrue(qbit.add("magnet:?xt=urn:btih:abcdef", "/downloads", "aurora-remote-test"))
+        self.assertEqual(session.post.call_args.kwargs["data"]["tags"], "aurora-remote-test")
+
     def test_qbit_add_file_posts_torrent_multipart(self):
         qbit = providers.QbittorrentProvider()
         session = Mock()
         session.post.return_value.status_code = 200
         qbit._sess = session
 
-        self.assertTrue(qbit.add_file("sample.torrent", b"torrent-data", "/downloads/movies"))
+        self.assertTrue(qbit.add_file("sample.torrent", b"torrent-data", "/downloads/movies", "aurora-remote-test"))
         call = session.post.call_args
         self.assertEqual(call.kwargs["files"]["torrents"][0], "sample.torrent")
         self.assertEqual(call.kwargs["files"]["torrents"][1], b"torrent-data")
-        self.assertEqual(call.kwargs["data"], {"savepath": "/downloads/movies"})
+        self.assertEqual(call.kwargs["data"], {
+            "savepath": "/downloads/movies", "tags": "aurora-remote-test",
+        })
 
     def test_qbit_add_file_rejects_non_torrent(self):
         qbit = providers.QbittorrentProvider()
@@ -138,6 +149,76 @@ class TorrentUploadTests(unittest.TestCase):
 
         self.assertFalse(qbit.add_file("sample.txt", b"data"))
         session.post.assert_not_called()
+
+
+class TorrentDestinationTests(unittest.TestCase):
+    def test_completed_torrent_starts_and_finishes_remote_upload(self):
+        old_dest_file = providers._TORRENT_DEST_FILE
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        old_qbit = providers._qbit
+        old_rclone = providers._rclone
+
+        class FakeQbit:
+            def available(self):
+                return True
+
+            def torrent_details(self):
+                return [{
+                    "hash": "abc", "name": "release", "tags": "aurora-remote-test",
+                    "progress": 1.0, "content_path": "/downloads/release",
+                }]
+
+        class FakeRclone:
+            def __init__(self):
+                self.jobs = []
+
+            def available(self):
+                return True
+
+            def transfers(self):
+                return self.jobs
+
+            def upload_local(self, name, local_path, destination):
+                self.jobs = [{"id": "job-1", "status": "running", "detail": ""}]
+                self.upload = (name, local_path, destination)
+                return True, {"id": "job-1"}, ""
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                providers._TORRENT_DEST_FILE = str(Path(td) / "destinations.json")
+                os.environ["AURORA_LOCAL_MOUNT"] = td
+                source = Path(td) / "release"
+                source.mkdir()
+                (source / "movie.mkv").write_bytes(b"data")
+                Path(providers._TORRENT_DEST_FILE).write_text(json.dumps({
+                    "aurora-remote-test": {
+                        "remote": "media", "path": "movies", "status": "waiting",
+                        "detail": "", "hash": "", "name": "", "local_path": "",
+                        "transfer_id": "", "created": 1, "finished": 0,
+                    },
+                }))
+                fake_qbit = FakeQbit()
+                fake_rclone = FakeRclone()
+                providers._qbit = fake_qbit
+                providers._rclone = fake_rclone
+
+                providers._process_torrent_destinations()
+                state = json.loads(Path(providers._TORRENT_DEST_FILE).read_text())["aurora-remote-test"]
+                self.assertEqual(state["status"], "uploading")
+                self.assertEqual(fake_rclone.upload[2], "movies/release")
+
+                fake_rclone.jobs = [{"id": "job-1", "status": "done", "detail": ""}]
+                providers._process_torrent_destinations()
+                state = json.loads(Path(providers._TORRENT_DEST_FILE).read_text())["aurora-remote-test"]
+                self.assertEqual(state["status"], "done")
+            finally:
+                providers._TORRENT_DEST_FILE = old_dest_file
+                providers._qbit = old_qbit
+                providers._rclone = old_rclone
+                if old_mount is None:
+                    os.environ.pop("AURORA_LOCAL_MOUNT", None)
+                else:
+                    os.environ["AURORA_LOCAL_MOUNT"] = old_mount
 
 
 class TorrentStateTests(unittest.TestCase):
@@ -333,6 +414,35 @@ class RcloneTests(unittest.TestCase):
         self.assertEqual(payload["srcRemote"], "movies/clip.mp4")
         self.assertEqual(payload["dstFs"], "archive:")
         self.assertEqual(payload["dstRemote"], "backup/clip.mp4")
+        self.assertTrue(payload["_async"])
+
+    def test_local_torrent_upload_uses_async_rclone_copy(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 44})
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            source = Path(td) / "release"
+            source.mkdir()
+            (source / "movie.mkv").write_bytes(b"data")
+            try:
+                ok, job, detail = rclone.upload_local("media", str(source), "movies/release")
+            finally:
+                if old_mount is None:
+                    os.environ.pop("AURORA_LOCAL_MOUNT", None)
+                else:
+                    os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertIsNotNone(job)
+        call = rclone._req.call_args
+        self.assertEqual(call.args[0], "/sync/copy")
+        payload = json.loads(call.kwargs["data"])
+        self.assertEqual(payload["srcFs"], str(source))
+        self.assertEqual(payload["srcRemote"], "")
+        self.assertEqual(payload["dstFs"], "media:")
+        self.assertEqual(payload["dstRemote"], "movies/release")
         self.assertTrue(payload["_async"])
 
     def test_remote_directory_copy_keeps_directory_name(self):

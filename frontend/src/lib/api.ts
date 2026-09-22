@@ -33,6 +33,12 @@ export interface Torrent {
   downGb: number
   conns: number
   hash: string
+  destination?: {
+    remote: string
+    path: string
+    status: 'waiting' | 'uploading' | 'done' | 'error'
+    detail: string
+  }
 }
 
 export interface Peer {
@@ -173,11 +179,14 @@ export async function createMediaDir(path: string) {
   }
 }
 
-export async function addTorrent(magnet: string, savePath = '') {
+export async function addTorrent(magnet: string, savePath = '', destinationRemote = '', destinationPath = '') {
   try {
     const r = await fetch('/api/torrents/add', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      credentials: 'include', body: JSON.stringify({ magnet, save_path: savePath }),
+      credentials: 'include', body: JSON.stringify({
+        magnet, save_path: savePath,
+        destination_remote: destinationRemote, destination_path: destinationPath,
+      }),
     })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, mode: '' } }
     const { data: d, detail } = await responseDetail(r, '提交失败')
@@ -187,11 +196,13 @@ export async function addTorrent(magnet: string, savePath = '') {
   }
 }
 
-export async function addTorrentFile(file: File, savePath = '') {
+export async function addTorrentFile(file: File, savePath = '', destinationRemote = '', destinationPath = '') {
   try {
     const body = new FormData()
     body.append('file', file, file.name)
     body.append('save_path', savePath)
+    body.append('destination_remote', destinationRemote)
+    body.append('destination_path', destinationPath)
     const r = await fetch('/api/torrents/upload', {
       method: 'POST', credentials: 'include', body,
     })

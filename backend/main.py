@@ -270,6 +270,8 @@ def hidden_api_docs():
 def _startup():
     # 每日做种日报定时推送线程（daemon，跟随服务生命周期）
     providers.start_daily_scheduler()
+    # 本地下载完成后自动转存到用户选择的网盘目标
+    providers.start_torrent_destination_scheduler()
 
 
 @app.get("/api/metrics")
@@ -288,6 +290,8 @@ def sources(_user: str = Depends(require_auth)):
 class AddMagnet(BaseModel):
     magnet: str
     save_path: str = ""
+    destination_remote: str = ""
+    destination_path: str = ""
 
 
 _MAX_TORRENT_FILE = 20 * 1024 * 1024
@@ -301,13 +305,28 @@ def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
     save_path = _torrent_save_path(body.save_path)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法添加磁力")
-    if not providers._qbit.add(magnet, save_path):
+    marker, destination_path, detail = providers.register_torrent_destination(
+        body.destination_remote, body.destination_path,
+    )
+    if detail:
+        raise HTTPException(status_code=400, detail=detail)
+    if not providers._qbit.add(magnet, save_path, marker):
+        providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该磁力（链接可能已存在或无效）")
-    return {"ok": True, "mode": "qbittorrent", "save_path": body.save_path.strip()}
+    return {
+        "ok": True, "mode": "qbittorrent", "save_path": body.save_path.strip(),
+        "destination_remote": body.destination_remote.strip(), "destination_path": destination_path,
+    }
 
 
 @app.post("/api/torrents/upload")
-async def upload_torrent(file: UploadFile = File(...), save_path: str = Form(""), _user: str = Depends(require_auth)):
+async def upload_torrent(
+    file: UploadFile = File(...),
+    save_path: str = Form(""),
+    destination_remote: str = Form(""),
+    destination_path: str = Form(""),
+    _user: str = Depends(require_auth),
+):
     name = Path(file.filename or "").name
     if not name or name == ".torrent" or not name.lower().endswith(".torrent"):
         raise HTTPException(status_code=400, detail="仅支持 .torrent 文件")
@@ -322,9 +341,18 @@ async def upload_torrent(file: UploadFile = File(...), save_path: str = Form("")
         raise HTTPException(status_code=400, detail="种子文件为空")
     if len(content) > _MAX_TORRENT_FILE:
         raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
-    if not providers._qbit.add_file(name, content, qbit_save_path):
+    marker, destination_path, detail = providers.register_torrent_destination(
+        destination_remote, destination_path,
+    )
+    if detail:
+        raise HTTPException(status_code=400, detail=detail)
+    if not providers._qbit.add_file(name, content, qbit_save_path, marker):
+        providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
-    return {"ok": True, "mode": "qbittorrent", "name": name, "save_path": save_path.strip()}
+    return {
+        "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_path.strip(),
+        "destination_remote": destination_remote.strip(), "destination_path": destination_path,
+    }
 
 
 class BatchAction(BaseModel):

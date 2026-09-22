@@ -47,7 +47,9 @@ _DATA_DIR = os.path.abspath(os.path.expanduser(
 ))
 _LOG_FILE = os.path.join(_DATA_DIR, "activity.json")
 _TRASH_FILE = os.path.join(_DATA_DIR, "trash.json")
+_TORRENT_DEST_FILE = os.path.join(_DATA_DIR, "torrent_destinations.json")
 _DATA_LOCK = threading.RLock()
+_TORRENT_DEST_LOCK = threading.RLock()
 
 
 def _atomic_json(path: str, data) -> None:
@@ -473,6 +475,18 @@ class RcloneProvider:
             out.append({"name": r, "type": typ, "bucket": _rclone_bucket(r) if typ == "s3" else ""})
         return out
 
+    def validate_destination(self, name: str, path: str = "") -> tuple[bool, str, str]:
+        """Validate a remote destination before a torrent is accepted."""
+        try:
+            name, path = self._validate_name_path(name, path)
+            data = self._req("/config/listremotes", timeout=5.0, method="POST") or {}
+            remotes = {str(item).rstrip(":") for item in (data.get("remotes") or [])}
+            if name not in remotes:
+                return False, "", "目标网盘不存在"
+            return True, path, ""
+        except Exception as e:
+            return False, "", str(e).strip()[:180] or "网盘目标路径无效"
+
     def test_remote(self, name: str) -> tuple[bool, str, int]:
         """Read the remote root to verify credentials and connectivity."""
         import re as _re
@@ -875,6 +889,44 @@ class RcloneProvider:
         except Exception as e:
             return False, None, _friendly_remote_error(name, str(e), write=True) or "上传失败"
 
+    def upload_local(self, name: str, local_path: str, destination: str) -> tuple[bool, dict | None, str]:
+        """Copy a completed local torrent payload to a remote directory."""
+        try:
+            name, destination = self._validate_name_path(name, destination, allow_empty=False)
+            source = os.path.realpath(local_path)
+            base = os.path.realpath(os.path.expanduser(
+                os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")
+            ))
+            if source != base and not source.startswith(base + os.sep):
+                return False, None, "本地源路径无效"
+            if not os.path.exists(source):
+                return False, None, "本地下载文件尚未就绪"
+            if os.path.isdir(source):
+                endpoint = "/sync/copy"
+                payload = {
+                    "srcFs": source,
+                    "srcRemote": "",
+                    "dstFs": _rclone_scoped_fs(name),
+                    "dstRemote": destination,
+                }
+                total = None
+            else:
+                endpoint = "/operations/copyfile"
+                payload = {
+                    "srcFs": os.path.dirname(source),
+                    "srcRemote": os.path.basename(source),
+                    "dstFs": _rclone_scoped_fs(name),
+                    "dstRemote": destination,
+                }
+                total = os.path.getsize(source)
+            job = self._start_job(
+                endpoint, payload, action="upload",
+                label=f"下载完成上传 {name}:{destination}", total=total,
+            )
+            return True, job, ""
+        except Exception as e:
+            return False, None, _friendly_remote_error(name, str(e), write=True) or "上传失败"
+
     def get_remote(self, name: str) -> tuple[bool, dict, str]:
         """Return editable non-secret fields and the names of stored secrets."""
         import re as _re
@@ -1117,16 +1169,19 @@ class QbittorrentProvider:
                 self._sess = None
         return False
 
-    def torrents(self):
-        out = []
+    def torrent_details(self) -> list[dict]:
         try:
             s = self._ensure()
-            data = s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json()
+            return s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
         except Exception:
-            data = []
+            return []
+
+    def torrents(self):
+        out = []
+        data = self.torrent_details()
         for t in data or []:
             st = _QBIT_STATES.get(t.get("state", "unknown"), "done")
-            out.append({
+            row = {
                 "id": t.get("hash", ""), "name": t.get("name", "?"), "state": st,
                 "progress": t.get("progress", 0),
                 "speed": round(t.get("dlspeed", 0) / 1e6, 2),
@@ -1141,7 +1196,11 @@ class QbittorrentProvider:
                 "completion_on": t.get("completion_on", 0) or 0,
                 "upB": t.get("uploaded", 0) or 0,
                 "downB": t.get("downloaded", 0) or 0,
-            })
+            }
+            destination = torrent_destination_for_tags(t.get("tags", ""))
+            if destination:
+                row["destination"] = destination
+            out.append(row)
         return out
 
     def peers(self, hash_):
@@ -1173,7 +1232,7 @@ class QbittorrentProvider:
             "leechers": d.get("peers_leechers", 0),
         }
 
-    def add(self, magnet: str, save_path: str = "") -> bool:
+    def add(self, magnet: str, save_path: str = "", tag: str = "") -> bool:
         try:
             if not magnet.startswith("magnet:"):
                 return False
@@ -1181,22 +1240,28 @@ class QbittorrentProvider:
             data = {"urls": magnet}
             if save_path:
                 data["savepath"] = save_path
+            if tag:
+                data["tags"] = tag
             r = s.post(f"{self.base}/api/v2/torrents/add", data=data, timeout=6)
             return r.status_code in (200, 201)   # 409=已存在/无效 -> False
         except Exception:
             return False
 
-    def add_file(self, filename: str, content: bytes, save_path: str = "") -> bool:
+    def add_file(self, filename: str, content: bytes, save_path: str = "", tag: str = "") -> bool:
         """Forward one .torrent file to qBittorrent's multipart upload endpoint."""
         try:
             if not filename.lower().endswith(".torrent") or not content:
                 return False
             s = self._ensure()
-            data = {"savepath": save_path} if save_path else None
+            data = {}
+            if save_path:
+                data["savepath"] = save_path
+            if tag:
+                data["tags"] = tag
             r = s.post(
                 f"{self.base}/api/v2/torrents/add",
                 files={"torrents": (filename, content, "application/x-bittorrent")},
-                data=data,
+                data=data or None,
                 timeout=15,
             )
             return r.status_code in (200, 201)
@@ -1399,6 +1464,205 @@ _rclone = RcloneProvider()
 _qbit = QbittorrentProvider()
 _jelly = JellyfinProvider()
 _local = LocalMountProvider()
+
+
+def _load_torrent_destinations() -> dict[str, dict]:
+    try:
+        with open(_TORRENT_DEST_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+
+
+def _save_torrent_destinations(data: dict[str, dict]) -> None:
+    try:
+        _atomic_json(_TORRENT_DEST_FILE, data)
+    except Exception:
+        pass
+
+
+def _tag_list(tags: str) -> list[str]:
+    return [item.strip() for item in str(tags or "").split(",") if item.strip()]
+
+
+def torrent_destination_for_tags(tags: str) -> dict | None:
+    """Return the public remote destination attached to a qBittorrent task."""
+    with _TORRENT_DEST_LOCK:
+        data = _load_torrent_destinations()
+        for tag in _tag_list(tags):
+            entry = data.get(tag)
+            if entry:
+                return {
+                    "remote": entry.get("remote", ""),
+                    "path": entry.get("path", ""),
+                    "status": entry.get("status", "waiting"),
+                    "detail": entry.get("detail", ""),
+                }
+    return None
+
+
+def register_torrent_destination(remote: str, path: str = "") -> tuple[str, str, str]:
+    """Reserve a remote destination and return the qBittorrent correlation tag."""
+    remote = str(remote or "").strip()
+    if not remote:
+        return "", "", ""
+    if not _rclone.available():
+        return "", "", "网盘服务未接入"
+    ok, path, detail = _rclone.validate_destination(remote, path)
+    if not ok:
+        return "", "", detail
+    marker = f"aurora-remote-{uuid.uuid4().hex[:16]}"
+    entry = {
+        "remote": remote,
+        "path": path,
+        "status": "waiting",
+        "detail": "",
+        "hash": "",
+        "name": "",
+        "local_path": "",
+        "transfer_id": "",
+        "created": int(time.time()),
+        "finished": 0,
+    }
+    with _TORRENT_DEST_LOCK:
+        data = _load_torrent_destinations()
+        data[marker] = entry
+        _save_torrent_destinations(data)
+    return marker, path, ""
+
+
+def discard_torrent_destination(marker: str) -> None:
+    if not marker:
+        return
+    with _TORRENT_DEST_LOCK:
+        data = _load_torrent_destinations()
+        if marker in data:
+            data.pop(marker, None)
+            _save_torrent_destinations(data)
+
+
+def _torrent_host_path(torrent: dict) -> str:
+    """Map qBittorrent's container path back to Aurora's host download path."""
+    base = os.path.realpath(os.path.expanduser(
+        os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")
+    ))
+    raw = str(torrent.get("content_path") or "")
+    if not raw:
+        save_path = str(torrent.get("save_path") or "/downloads").rstrip("/")
+        raw = f"{save_path}/{torrent.get('name', '')}"
+    if raw == "/downloads" or raw.startswith("/downloads/"):
+        relative = raw[len("/downloads"):].lstrip("/")
+        target = os.path.join(base, relative)
+    else:
+        target = raw
+    target = os.path.realpath(target)
+    if target != base and not target.startswith(base + os.sep):
+        return ""
+    return target
+
+
+def _process_torrent_destinations() -> None:
+    if not _qbit.available() or not _rclone.available():
+        return
+    details = _qbit.torrent_details()
+    with _TORRENT_DEST_LOCK:
+        destinations = _load_torrent_destinations()
+    if not destinations:
+        return
+    jobs = {str(job.get("id")): job for job in _rclone.transfers()}
+    changed = False
+    for marker, entry in destinations.items():
+        status = str(entry.get("status") or "waiting")
+        if status == "done":
+            continue
+        if status == "uploading":
+            job = jobs.get(str(entry.get("transfer_id") or ""))
+            if job and job.get("status") == "done":
+                entry["status"] = "done"
+                entry["detail"] = ""
+                entry["finished"] = int(time.time())
+                changed = True
+                continue
+            if job and job.get("status") == "error":
+                entry["status"] = "error"
+                entry["detail"] = job.get("detail") or "网盘上传失败"
+                entry["finished"] = int(time.time())
+                changed = True
+                continue
+            if job:
+                continue
+            # The in-memory rclone job may have disappeared after a restart or cleanup.
+            if entry.get("local_path"):
+                entry["status"] = "waiting"
+                entry["transfer_id"] = ""
+                changed = True
+            continue
+        if status == "error":
+            continue
+        torrent = next((item for item in details if marker in _tag_list(item.get("tags", ""))), None)
+        if not torrent:
+            continue
+        entry["hash"] = torrent.get("hash", "")
+        entry["name"] = torrent.get("name", "")
+        if float(torrent.get("progress", 0) or 0) < 0.999999:
+            changed = True
+            continue
+        local_path = _torrent_host_path(torrent)
+        if not local_path or not os.path.exists(local_path):
+            entry["detail"] = "等待本地下载文件就绪"
+            changed = True
+            continue
+        item_name = os.path.basename(local_path.rstrip(os.sep))
+        if not item_name:
+            entry["status"] = "error"
+            entry["detail"] = "无法确定本地下载文件名"
+            changed = True
+            continue
+        try:
+            target = _join_rclone_path(entry.get("path", ""), item_name)
+        except ValueError:
+            entry["status"] = "error"
+            entry["detail"] = "网盘目标路径无效"
+            changed = True
+            continue
+        ok, job, detail = _rclone.upload_local(entry["remote"], local_path, target)
+        if ok and job:
+            entry["status"] = "uploading"
+            entry["detail"] = ""
+            entry["local_path"] = local_path
+            entry["transfer_id"] = job.get("id", "")
+            entry["target_path"] = target
+        else:
+            entry["status"] = "error"
+            entry["detail"] = detail or "网盘上传失败"
+        changed = True
+    if changed:
+        with _TORRENT_DEST_LOCK:
+            _save_torrent_destinations(destinations)
+
+
+_destination_sched_started = False
+
+
+def start_torrent_destination_scheduler() -> None:
+    global _destination_sched_started
+    if _destination_sched_started:
+        return
+    _destination_sched_started = True
+
+    def loop():
+        while True:
+            try:
+                _process_torrent_destinations()
+            except Exception as e:
+                _log("torrent.remote.error", str(e))
+            time.sleep(8)
+
+    threading.Thread(target=loop, daemon=True).start()
+
 
 # ---------------------------------------------------------------------------
 # notifications + daily stats

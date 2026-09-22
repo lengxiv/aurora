@@ -1,6 +1,6 @@
-import { useState, type ReactNode } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search } from 'lucide-react'
-import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, torrentAction, batchAction, type MediaDir, type Torrent, type MountStatus } from '../lib/api'
+import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneRemotes, torrentAction, batchAction, type MediaDir, type RcloneRemote, type Torrent, type MountStatus } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -8,6 +8,7 @@ const statusTone: Record<MountStatus, 'ok' | 'warn' | 'bad'> = { online: 'ok', d
 const stateTone: Record<Torrent['state'], 'ok' | 'warn' | 'bad' | 'muted'> = {
   downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
 }
+const destinationStatus: Record<string, string> = { waiting: '等待下载完成', uploading: '上传中', done: '已上传', error: '上传失败' }
 
 function RowBtn({ children, onClick, title, danger }: { children: ReactNode; onClick: () => void; title?: string; danger?: boolean }) {
   return (
@@ -32,6 +33,11 @@ export default function ConsoleView() {
   const [newDir, setNewDir] = useState('')
   const [dirMsg, setDirMsg] = useState('')
   const [dirMsgBad, setDirMsgBad] = useState(false)
+  const [targetMode, setTargetMode] = useState<'local' | 'remote'>('local')
+  const [rcloneRemotes, setRcloneRemotes] = useState<RcloneRemote[]>([])
+  const [remoteBusy, setRemoteBusy] = useState(false)
+  const [targetRemote, setTargetRemote] = useState('')
+  const [targetRemotePath, setTargetRemotePath] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [msgBad, setMsgBad] = useState(false)
@@ -54,11 +60,25 @@ export default function ConsoleView() {
     setDirsBusy(false)
   }
 
+  const loadRcloneRemotes = async () => {
+    setRemoteBusy(true)
+    const result = await fetchRcloneRemotes()
+    const next = result?.remotes || []
+    setRcloneRemotes(next)
+    setTargetRemote((current) => next.some((item) => item.name === current) ? current : (next[0]?.name || ''))
+    setRemoteBusy(false)
+  }
+
+  useEffect(() => {
+    // Preload remotes so the target selector is ready when the dialog opens.
+    void loadRcloneRemotes()
+  }, [])
+
   const openAdd = () => {
     setOpen(true)
     setDirMsg('')
     setDirMsgBad(false)
-    void loadMediaDirs()
+    void Promise.all([loadMediaDirs(), loadRcloneRemotes()])
   }
 
   const closeAdd = () => {
@@ -74,6 +94,9 @@ export default function ConsoleView() {
     setMsgBad(false)
     setDirMsg('')
     setDirMsgBad(false)
+    setTargetMode('local')
+    setTargetRemote('')
+    setTargetRemotePath('')
   }
 
   const chooseMode = (mode: 'magnet' | 'file') => {
@@ -128,9 +151,20 @@ export default function ConsoleView() {
   const submit = async () => {
     if (addMode === 'magnet' && !magnet.trim()) return
     if (addMode === 'file' && !torrentFile) return
+    if (targetMode === 'remote' && !targetRemote) {
+      setMsgBad(true)
+      setMsg('请先选择已接入的网盘')
+      return
+    }
     setBusy(true); setMsg(''); setMsgBad(false)
-    const r = addMode === 'magnet' ? await addTorrent(magnet.trim(), savePath) : await addTorrentFile(torrentFile!, savePath)
-    const target = savePath || '下载根目录'
+    const remote = targetMode === 'remote' ? targetRemote : ''
+    const remotePath = targetMode === 'remote' ? targetRemotePath.trim() : ''
+    const r = addMode === 'magnet'
+      ? await addTorrent(magnet.trim(), savePath, remote, remotePath)
+      : await addTorrentFile(torrentFile!, savePath, remote, remotePath)
+    const target = targetMode === 'remote'
+      ? `完成后上传到 ${remote}:${remotePath || '/'}`
+      : `本地 · ${savePath || '下载根目录'}`
     setMsg(r.ok ? (r.mode === 'qbittorrent' ? `已提交到 qBittorrent · ${target}` : `已加入队列（演示） · ${target}`) : r.detail)
     setMsgBad(!r.ok)
     if (r.ok) {
@@ -297,6 +331,9 @@ export default function ConsoleView() {
                       <div className="min-w-0">
                         <div className="num truncate text-fg" title={t.name}>{t.name}</div>
                         <div className="text-[11px] text-dim">S/L {t.seeders} · P/L {t.leechers}</div>
+                        {t.destination && <div className={`truncate text-[10px] ${t.destination.status === 'error' ? 'text-rose-300' : 'text-aurora-1'}`} title={`${t.destination.remote}:${t.destination.path || '/'}`}>
+                          网盘 · {t.destination.remote}:{t.destination.path || '/'} · {destinationStatus[t.destination.status] ?? t.destination.status}
+                        </div>}
                       </div>
                     </div>
                   </td>
@@ -342,8 +379,35 @@ export default function ConsoleView() {
               </button>
             </div>
             <div className="mt-4">
+              <label htmlFor="torrent-target-mode" className="block text-xs text-dim">下载目标</label>
+              <select id="torrent-target-mode" value={targetMode} onChange={(e) => setTargetMode(e.target.value as 'local' | 'remote')} disabled={busy}
+                className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                <option value="local">本地下载盘</option>
+                <option value="remote">下载完成后上传到网盘</option>
+              </select>
+              {targetMode === 'remote' && (
+                <div className="mt-2 grid gap-2">
+                  <div className="flex items-center gap-2">
+                    <select value={targetRemote} onChange={(e) => setTargetRemote(e.target.value)} disabled={busy || remoteBusy || !rcloneRemotes.length}
+                      className="aurora-select w-full rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                      {!rcloneRemotes.length && <option value="">{remoteBusy ? '正在读取网盘列表…' : '暂无可用网盘'}</option>}
+                      {rcloneRemotes.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.type || 'remote'}</option>)}
+                    </select>
+                    <button type="button" onClick={() => void loadRcloneRemotes()} disabled={busy || remoteBusy} title="刷新网盘列表" aria-label="刷新网盘列表"
+                      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-line bg-white/4 text-dim hover:bg-white/8 hover:text-fg disabled:opacity-40">
+                      <RefreshCw size={13} className={remoteBusy ? 'animate-spin' : ''} />
+                    </button>
+                  </div>
+                  {!remoteBusy && !rcloneRemotes.length && <div className="text-xs text-rose-300">没有读取到已接入网盘，请先在网盘设置中完成对接。</div>}
+                  <input value={targetRemotePath} onChange={(e) => setTargetRemotePath(e.target.value)} placeholder="网盘目标目录，留空表示根目录" disabled={busy || remoteBusy}
+                    className="w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+                  <div className="text-[11px] text-dim/70">任务会先下载到本地，完成后自动上传到所选网盘。</div>
+                </div>
+              )}
+            </div>
+            <div className="mt-4">
               <div className="flex items-center justify-between gap-3">
-                <label htmlFor="torrent-save-path" className="text-xs text-dim">保存到</label>
+                <label htmlFor="torrent-save-path" className="text-xs text-dim">{targetMode === 'remote' ? '本地临时目录' : '保存到'}</label>
                 <div className="flex items-center gap-2">
                   <button type="button" onClick={() => { setShowNewDir((v) => !v); setDirMsg(''); setDirMsgBad(false) }} disabled={busy || dirsBusy}
                     className="inline-flex items-center gap-1 text-xs text-dim hover:text-fg disabled:opacity-40">
@@ -391,7 +455,7 @@ export default function ConsoleView() {
             {msg && <div className={`mt-3 text-xs ${msgBad ? 'text-rose-300' : 'text-aurora-1'}`}>{msg}</div>}
             <div className="mt-4 flex justify-end gap-3">
               <button onClick={closeAdd} disabled={busy} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg disabled:opacity-40">取消</button>
-              <button onClick={submit} disabled={busy || (addMode === 'magnet' ? !magnet.trim() : !torrentFile)} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
+              <button onClick={submit} disabled={busy || remoteBusy || (targetMode === 'remote' && !targetRemote) || (addMode === 'magnet' ? !magnet.trim() : !torrentFile)} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
             </div>
           </div>
         </div>
