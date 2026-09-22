@@ -1173,25 +1173,30 @@ class QbittorrentProvider:
             "leechers": d.get("peers_leechers", 0),
         }
 
-    def add(self, magnet: str) -> bool:
+    def add(self, magnet: str, save_path: str = "") -> bool:
         try:
             if not magnet.startswith("magnet:"):
                 return False
             s = self._ensure()
-            r = s.post(f"{self.base}/api/v2/torrents/add", data={"urls": magnet}, timeout=6)
+            data = {"urls": magnet}
+            if save_path:
+                data["savepath"] = save_path
+            r = s.post(f"{self.base}/api/v2/torrents/add", data=data, timeout=6)
             return r.status_code in (200, 201)   # 409=已存在/无效 -> False
         except Exception:
             return False
 
-    def add_file(self, filename: str, content: bytes) -> bool:
+    def add_file(self, filename: str, content: bytes, save_path: str = "") -> bool:
         """Forward one .torrent file to qBittorrent's multipart upload endpoint."""
         try:
             if not filename.lower().endswith(".torrent") or not content:
                 return False
             s = self._ensure()
+            data = {"savepath": save_path} if save_path else None
             r = s.post(
                 f"{self.base}/api/v2/torrents/add",
                 files={"torrents": (filename, content, "application/x-bittorrent")},
+                data=data,
                 timeout=15,
             )
             return r.status_code in (200, 201)

@@ -83,6 +83,11 @@ export interface Metrics {
   bandwidth: Bandwidth
 }
 
+export interface MediaDir {
+  path: string
+  name: string
+}
+
 async function getJson<T>(url: string): Promise<T | null> {
   try {
     const ctrl = new AbortController()
@@ -149,11 +154,30 @@ async function responseDetail(r: Response, fallback: string) {
   return { data: d, detail: (d && typeof d.detail === 'string' && d.detail) || fallback }
 }
 
-export async function addTorrent(magnet: string) {
+export async function fetchMediaDirs(): Promise<MediaDir[]> {
+  const d = await getJson<{ dirs?: MediaDir[] }>('/api/media/dirs')
+  return d?.dirs || []
+}
+
+export async function createMediaDir(path: string) {
+  try {
+    const r = await fetch('/api/media/mkdir', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ path }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const { data: d, detail } = await responseDetail(r, '新建目录失败')
+    return { ok: r.ok && !!d?.ok, detail, path: (d && d.new) || path }
+  } catch {
+    return { ok: false, detail: '网络请求失败', path }
+  }
+}
+
+export async function addTorrent(magnet: string, savePath = '') {
   try {
     const r = await fetch('/api/torrents/add', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      credentials: 'include', body: JSON.stringify({ magnet }),
+      credentials: 'include', body: JSON.stringify({ magnet, save_path: savePath }),
     })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, mode: '' } }
     const { data: d, detail } = await responseDetail(r, '提交失败')
@@ -163,10 +187,11 @@ export async function addTorrent(magnet: string) {
   }
 }
 
-export async function addTorrentFile(file: File) {
+export async function addTorrentFile(file: File, savePath = '') {
   try {
     const body = new FormData()
     body.append('file', file, file.name)
+    body.append('save_path', savePath)
     const r = await fetch('/api/torrents/upload', {
       method: 'POST', credentials: 'include', body,
     })

@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
-import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, X, Play, Pause, Trash2, Search } from 'lucide-react'
-import { useMetrics, addTorrent, addTorrentFile, torrentAction, batchAction, type Torrent, type MountStatus } from '../lib/api'
+import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search } from 'lucide-react'
+import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, torrentAction, batchAction, type MediaDir, type Torrent, type MountStatus } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -25,6 +25,13 @@ export default function ConsoleView() {
   const [addMode, setAddMode] = useState<'magnet' | 'file'>('magnet')
   const [magnet, setMagnet] = useState('')
   const [torrentFile, setTorrentFile] = useState<File | null>(null)
+  const [savePath, setSavePath] = useState('')
+  const [mediaDirs, setMediaDirs] = useState<MediaDir[]>([])
+  const [dirsBusy, setDirsBusy] = useState(false)
+  const [showNewDir, setShowNewDir] = useState(false)
+  const [newDir, setNewDir] = useState('')
+  const [dirMsg, setDirMsg] = useState('')
+  const [dirMsgBad, setDirMsgBad] = useState(false)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [msgBad, setMsgBad] = useState(false)
@@ -40,14 +47,33 @@ export default function ConsoleView() {
     ? (data.mounts.every((m) => m.driver === 'local') ? fmtBytes(totalReads) + '/s' : `${totalReads}`)
     : '—'
 
+  const loadMediaDirs = async () => {
+    setDirsBusy(true)
+    const dirs = await fetchMediaDirs()
+    setMediaDirs(dirs)
+    setDirsBusy(false)
+  }
+
+  const openAdd = () => {
+    setOpen(true)
+    setDirMsg('')
+    setDirMsgBad(false)
+    void loadMediaDirs()
+  }
+
   const closeAdd = () => {
     if (busy) return
     setOpen(false)
     setAddMode('magnet')
     setMagnet('')
     setTorrentFile(null)
+    setSavePath('')
+    setShowNewDir(false)
+    setNewDir('')
     setMsg('')
     setMsgBad(false)
+    setDirMsg('')
+    setDirMsgBad(false)
   }
 
   const chooseMode = (mode: 'magnet' | 'file') => {
@@ -75,12 +101,37 @@ export default function ConsoleView() {
     setMsgBad(false)
   }
 
+  const createDownloadDir = async () => {
+    const path = newDir.trim().replace(/\\/g, '/')
+    const parts = path.split('/')
+    if (!path || path.startsWith('/') || parts.some((part) => !part || part === '.' || part === '..')) {
+      setDirMsgBad(true)
+      setDirMsg('请输入下载盘内的相对目录，例如：电影/2026')
+      return
+    }
+    setDirsBusy(true)
+    const r = await createMediaDir(path)
+    if (r.ok) {
+      await loadMediaDirs()
+      setSavePath(r.path)
+      setShowNewDir(false)
+      setNewDir('')
+      setDirMsgBad(false)
+      setDirMsg('目录已创建，并已选中')
+    } else {
+      setDirsBusy(false)
+      setDirMsgBad(true)
+      setDirMsg(r.detail)
+    }
+  }
+
   const submit = async () => {
     if (addMode === 'magnet' && !magnet.trim()) return
     if (addMode === 'file' && !torrentFile) return
     setBusy(true); setMsg(''); setMsgBad(false)
-    const r = addMode === 'magnet' ? await addTorrent(magnet.trim()) : await addTorrentFile(torrentFile!)
-    setMsg(r.ok ? (r.mode === 'qbittorrent' ? '已提交到 qBittorrent' : '已加入队列（演示）') : r.detail)
+    const r = addMode === 'magnet' ? await addTorrent(magnet.trim(), savePath) : await addTorrentFile(torrentFile!, savePath)
+    const target = savePath || '下载根目录'
+    setMsg(r.ok ? (r.mode === 'qbittorrent' ? `已提交到 qBittorrent · ${target}` : `已加入队列（演示） · ${target}`) : r.detail)
     setMsgBad(!r.ok)
     if (r.ok) {
       setMagnet('')
@@ -117,7 +168,7 @@ export default function ConsoleView() {
         </div>
         <div className="flex flex-col items-end gap-2">
           <SourceBadge sources={sources} />
-          <button onClick={() => setOpen(true)} className="panel panel-hover flex items-center gap-2 px-4 py-2 text-sm text-fg">
+          <button onClick={openAdd} className="panel panel-hover flex items-center gap-2 px-4 py-2 text-sm text-fg">
             <Plus size={16} /> 添加任务
           </button>
         </div>
@@ -198,7 +249,7 @@ export default function ConsoleView() {
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="筛选磁力…"
                 className="w-36 rounded-lg border border-line bg-white/4 py-1.5 pl-7 pr-2 text-xs text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none sm:w-48" />
             </div>
-            <button onClick={() => setOpen(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8">
+            <button onClick={openAdd} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8">
               <Plus size={13} /> 新增
             </button>
           </div>
@@ -289,6 +340,39 @@ export default function ConsoleView() {
               <button type="button" role="tab" aria-selected={addMode === 'file'} onClick={() => chooseMode('file')} className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs transition-colors ${addMode === 'file' ? 'bg-white/10 text-fg' : 'text-dim hover:text-fg'}`}>
                 <FileUp size={13} /> 种子文件
               </button>
+            </div>
+            <div className="mt-4">
+              <div className="flex items-center justify-between gap-3">
+                <label htmlFor="torrent-save-path" className="text-xs text-dim">保存到</label>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={() => { setShowNewDir((v) => !v); setDirMsg(''); setDirMsgBad(false) }} disabled={busy || dirsBusy}
+                    className="inline-flex items-center gap-1 text-xs text-dim hover:text-fg disabled:opacity-40">
+                    <FolderPlus size={13} /> {showNewDir ? '取消新建' : '新建目录'}
+                  </button>
+                  <button type="button" onClick={() => void loadMediaDirs()} disabled={busy || dirsBusy} title="刷新目录" aria-label="刷新目录"
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-md text-dim hover:bg-white/8 hover:text-fg disabled:opacity-40">
+                    <RefreshCw size={13} className={dirsBusy ? 'animate-spin' : ''} />
+                  </button>
+                </div>
+              </div>
+              <div className="mt-1.5 flex gap-2">
+                <select id="torrent-save-path" value={savePath} onChange={(e) => setSavePath(e.target.value)} disabled={busy || dirsBusy}
+                  className="min-w-0 flex-1 rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                  <option value="">下载根目录（/downloads）</option>
+                  {mediaDirs.map((dir) => <option key={dir.path} value={dir.path}>{dir.path}</option>)}
+                </select>
+              </div>
+              {showNewDir && (
+                <div className="mt-2 flex gap-2">
+                  <input value={newDir} onChange={(e) => setNewDir(e.target.value)} placeholder="例如：电影/2026" disabled={busy || dirsBusy}
+                    className="min-w-0 flex-1 rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+                  <button type="button" onClick={() => void createDownloadDir()} disabled={busy || dirsBusy || !newDir.trim()}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-line bg-white/4 px-3 py-2 text-xs text-fg hover:bg-white/8 disabled:opacity-40">
+                    <FolderPlus size={13} /> 创建
+                  </button>
+                </div>
+              )}
+              {dirMsg && <div className={`mt-1.5 text-xs ${dirMsgBad ? 'text-rose-300' : 'text-aurora-1'}`}>{dirMsg}</div>}
             </div>
             {addMode === 'magnet' ? (
               <textarea value={magnet} onChange={(e) => setMagnet(e.target.value)} rows={3}

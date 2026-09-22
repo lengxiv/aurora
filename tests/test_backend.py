@@ -72,6 +72,22 @@ class MediaPathTests(unittest.TestCase):
         else:
             os.environ["AURORA_LOCAL_MOUNT"] = old_mount
 
+    def test_torrent_save_path_is_scoped_to_download_mount(self):
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            Path(td, "movies").mkdir()
+            self.assertEqual(main._torrent_save_path("movies"), "/downloads/movies")
+            self.assertEqual(main._torrent_save_path(""), "/downloads")
+            with self.assertRaises(main.HTTPException):
+                main._torrent_save_path("../outside")
+            with self.assertRaises(main.HTTPException):
+                main._torrent_save_path("missing")
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
 
 class SettingsTests(unittest.TestCase):
     def test_settings_are_bounded(self):
@@ -91,16 +107,29 @@ class SettingsTests(unittest.TestCase):
 
 
 class TorrentUploadTests(unittest.TestCase):
+    def test_qbit_add_posts_savepath(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.return_value.status_code = 200
+        qbit._sess = session
+
+        self.assertTrue(qbit.add("magnet:?xt=urn:btih:abcdef", "/downloads/movies"))
+        self.assertEqual(session.post.call_args.kwargs["data"], {
+            "urls": "magnet:?xt=urn:btih:abcdef",
+            "savepath": "/downloads/movies",
+        })
+
     def test_qbit_add_file_posts_torrent_multipart(self):
         qbit = providers.QbittorrentProvider()
         session = Mock()
         session.post.return_value.status_code = 200
         qbit._sess = session
 
-        self.assertTrue(qbit.add_file("sample.torrent", b"torrent-data"))
+        self.assertTrue(qbit.add_file("sample.torrent", b"torrent-data", "/downloads/movies"))
         call = session.post.call_args
         self.assertEqual(call.kwargs["files"]["torrents"][0], "sample.torrent")
         self.assertEqual(call.kwargs["files"]["torrents"][1], b"torrent-data")
+        self.assertEqual(call.kwargs["data"], {"savepath": "/downloads/movies"})
 
     def test_qbit_add_file_rejects_non_torrent(self):
         qbit = providers.QbittorrentProvider()
