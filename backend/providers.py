@@ -260,6 +260,7 @@ _RCLONE_PARAM_KEYS = frozenset({
 _RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "token", "refresh_token"})
 _RCLONE_TRANSFER_LIMIT = 100
 _RCLONE_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
+_RCLONE_BUCKETS_FILE = os.path.join(_DATA_DIR, "rclone-buckets.json")
 
 _S3_PROVIDER_NAMES = {
     "aws": "AWS",
@@ -308,13 +309,22 @@ def _normalize_s3_params(params: dict) -> dict:
     return normalized
 
 
-def _friendly_rclone_error(detail: str) -> str:
+def _friendly_rclone_error(detail: str, *, write: bool = False) -> str:
     message = str(detail or "").strip()
     if "HeadObjectInput.Key" in message:
         return "S3/R2 目标路径为空，请先进入 bucket 目录后再上传"
     if "AccessDenied" in message or "status code: 403" in message:
-        return "R2 写入被拒绝，请为 API Token 授予该 bucket 的 Object Read & Write 权限"
+        return "远端拒绝访问，请检查网盘权限"
     return message[:180]
+
+
+def _friendly_remote_error(name: str, detail: str, *, write: bool = False) -> str:
+    message = str(detail or "").strip()
+    if write and _rclone_bucket(name) and (
+        "HTTP Error 500" in message or "AccessDenied" in message or "status code: 403" in message
+    ):
+        return "R2 写入被拒绝，请为该 bucket 的 API Token 授予 Object Read & Write 权限"
+    return _friendly_rclone_error(message, write=write)
 
 
 def _clean_rclone_path(path: str, allow_empty: bool = True) -> str:
@@ -333,6 +343,55 @@ def _clean_rclone_path(path: str, allow_empty: bool = True) -> str:
     if len(clean) > 2048:
         raise ValueError("网盘路径过长")
     return clean
+
+
+def _validate_rclone_bucket(bucket: str) -> str:
+    value = str(bucket or "").strip()
+    if not value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}", value):
+        raise ValueError("bucket 名称无效")
+    return value
+
+
+def _load_rclone_buckets() -> dict[str, str]:
+    try:
+        with open(_RCLONE_BUCKETS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        result = {}
+        for name, bucket in data.items():
+            try:
+                result[str(name)] = _validate_rclone_bucket(bucket)
+            except (TypeError, ValueError):
+                continue
+        return result
+    except Exception:
+        return {}
+
+
+def _rclone_bucket(name: str) -> str:
+    with _DATA_LOCK:
+        return _load_rclone_buckets().get(name, "")
+
+
+def _set_rclone_bucket(name: str, bucket: str) -> bool:
+    try:
+        value = _validate_rclone_bucket(bucket) if bucket else ""
+        with _DATA_LOCK:
+            data = _load_rclone_buckets()
+            if value:
+                data[name] = value
+            else:
+                data.pop(name, None)
+            _atomic_json(_RCLONE_BUCKETS_FILE, data)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _rclone_scoped_fs(name: str) -> str:
+    """Use a configured S3 bucket as the remote root for bucket-scoped tokens."""
+    return _rclone_fs(name, _rclone_bucket(name))
 
 
 def _join_rclone_path(parent: str, child: str) -> str:
@@ -411,7 +470,7 @@ class RcloneProvider:
                 typ = (meta or {}).get("type", "")
             except Exception:
                 pass
-            out.append({"name": r, "type": typ})
+            out.append({"name": r, "type": typ, "bucket": _rclone_bucket(r) if typ == "s3" else ""})
         return out
 
     def test_remote(self, name: str) -> tuple[bool, str, int]:
@@ -426,7 +485,7 @@ class RcloneProvider:
                 "/operations/list",
                 timeout=8.0,
                 method="POST",
-                data=_json.dumps({"fs": f"{name}:", "remote": ""}),
+                data=_json.dumps({"fs": _rclone_scoped_fs(name), "remote": ""}),
                 headers={"Content-Type": "application/json"},
             )
             return True, "根目录读取成功", round((time.monotonic() - started) * 1000)
@@ -457,7 +516,7 @@ class RcloneProvider:
             data = self._req(
                 "/operations/list", timeout=12.0, method="POST",
                 data=json.dumps({
-                    "fs": _rclone_fs(name),
+                    "fs": _rclone_scoped_fs(name),
                     "remote": path,
                     "opt": {"recurse": False, "noModTime": False, "noMimeType": False},
                 }),
@@ -490,7 +549,10 @@ class RcloneProvider:
         except Exception as e:
             detail = str(e).strip()
             if not path and self._remote_type(name) == "s3":
-                detail = "S3/R2 根目录没有 bucket 列表权限，请在路径框中输入 bucket 名称"
+                if _rclone_bucket(name):
+                    detail = "S3/R2 bucket 读取失败，请检查 bucket 权限"
+                else:
+                    detail = "S3/R2 根目录没有 bucket 列表权限，请在路径框中输入 bucket 名称"
             return False, [], detail[:180] or "读取网盘目录失败"
 
     def _start_job(self, endpoint: str, payload: dict, *, action: str, label: str,
@@ -556,7 +618,16 @@ class RcloneProvider:
             return
         if status.get("finished"):
             job["status"] = "done" if status.get("success") else "error"
-            job["detail"] = "" if status.get("success") else _friendly_rclone_error(status.get("error") or "传输失败")
+            if status.get("success"):
+                job["detail"] = ""
+            else:
+                request = job.get("request") or {}
+                payload = request.get("payload") or {}
+                destination = str(payload.get("dstFs") or payload.get("fs") or "")
+                remote_name = destination.split(":", 1)[0] if ":" in destination else ""
+                job["detail"] = _friendly_remote_error(
+                    remote_name, status.get("error") or "传输失败", write=job.get("action") != "download",
+                )
             job["progress"] = 1.0 if job["status"] == "done" else job.get("progress")
             job["finished"] = int(time.time())
             self._cleanup_transfer(job)
@@ -647,30 +718,30 @@ class RcloneProvider:
             name, path = self._validate_name_path(name, path, allow_empty=False)
             self._req(
                 "/operations/mkdir", timeout=12.0, method="POST",
-                data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                data=json.dumps({"fs": _rclone_scoped_fs(name), "remote": path}),
                 headers={"Content-Type": "application/json"},
             )
             return True, ""
         except Exception as e:
-            return False, str(e).strip()[:180] or "新建目录失败"
+            return False, _friendly_remote_error(name, str(e), write=True) or "新建目录失败"
 
     def delete_remote_file(self, name: str, path: str, is_dir: bool) -> tuple[bool, dict | None, str]:
         try:
             name, path = self._validate_name_path(name, path, allow_empty=False)
             if is_dir:
                 job = self._start_job(
-                    "/operations/purge", {"fs": _rclone_fs(name), "remote": path},
+                    "/operations/purge", {"fs": _rclone_scoped_fs(name), "remote": path},
                     action="delete", label=f"删除目录 {name}:{path}",
                 )
                 return True, job, ""
             self._req(
                 "/operations/deletefile", timeout=12.0, method="POST",
-                data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                data=json.dumps({"fs": _rclone_scoped_fs(name), "remote": path}),
                 headers={"Content-Type": "application/json"},
             )
             return True, None, ""
         except Exception as e:
-            return False, None, str(e).strip()[:180] or "删除失败"
+            return False, None, _friendly_remote_error(name, str(e), write=True) or "删除失败"
 
     def rename_remote(self, name: str, path: str, new_name: str, is_dir: bool) -> tuple[bool, dict | None, str]:
         try:
@@ -681,21 +752,25 @@ class RcloneProvider:
             parent = posixpath.dirname(path)
             destination = _join_rclone_path(parent, new_name)
             if is_dir:
-                src_fs = _rclone_fs(name, path)
-                dst_fs = _rclone_fs(name, destination)
+                if _rclone_bucket(name):
+                    src_fs, src_remote = _rclone_scoped_fs(name), path
+                    dst_fs, dst_remote = _rclone_scoped_fs(name), destination
+                else:
+                    src_fs, src_remote = _rclone_fs(name, path), ""
+                    dst_fs, dst_remote = _rclone_fs(name, destination), ""
                 job = self._start_job(
-                    "/sync/move", {"srcFs": src_fs, "srcRemote": "", "dstFs": dst_fs, "dstRemote": ""},
+                    "/sync/move", {"srcFs": src_fs, "srcRemote": src_remote, "dstFs": dst_fs, "dstRemote": dst_remote},
                     action="move", label=f"重命名 {name}:{path}",
                 )
             else:
                 job = self._start_job(
                     "/operations/movefile",
-                    {"srcFs": _rclone_fs(name), "srcRemote": path, "dstFs": _rclone_fs(name), "dstRemote": destination},
+                    {"srcFs": _rclone_scoped_fs(name), "srcRemote": path, "dstFs": _rclone_scoped_fs(name), "dstRemote": destination},
                     action="move", label=f"重命名 {name}:{path}",
                 )
             return True, job, ""
         except Exception as e:
-            return False, None, str(e).strip()[:180] or "重命名失败"
+            return False, None, _friendly_remote_error(name, str(e), write=True) or "重命名失败"
 
     def copy_remote(self, source_name: str, source_path: str, destination_name: str,
                     destination_path: str, is_dir: bool, action: str) -> tuple[bool, dict | None, str]:
@@ -708,17 +783,21 @@ class RcloneProvider:
                 endpoint = "/sync/copy" if action == "copy" else "/sync/move"
                 dirname = posixpath.basename(source_path)
                 target = _join_rclone_path(destination_path, dirname)
+                source_bucket = _rclone_bucket(source_name)
+                destination_bucket = _rclone_bucket(destination_name)
                 payload = {
-                    "srcFs": _rclone_fs(source_name, source_path), "srcRemote": "",
-                    "dstFs": _rclone_fs(destination_name, target), "dstRemote": "",
+                    "srcFs": _rclone_scoped_fs(source_name) if source_bucket else _rclone_fs(source_name, source_path),
+                    "srcRemote": source_path if source_bucket else "",
+                    "dstFs": _rclone_scoped_fs(destination_name) if destination_bucket else _rclone_fs(destination_name, target),
+                    "dstRemote": target if destination_bucket else "",
                 }
             else:
                 endpoint = "/operations/copyfile" if action == "copy" else "/operations/movefile"
                 filename = posixpath.basename(source_path)
                 target = _join_rclone_path(destination_path, filename)
                 payload = {
-                    "srcFs": _rclone_fs(source_name), "srcRemote": source_path,
-                    "dstFs": _rclone_fs(destination_name), "dstRemote": target,
+                    "srcFs": _rclone_scoped_fs(source_name), "srcRemote": source_path,
+                    "dstFs": _rclone_scoped_fs(destination_name), "dstRemote": target,
                 }
             job = self._start_job(
                 endpoint, payload, action=action,
@@ -726,7 +805,7 @@ class RcloneProvider:
             )
             return True, job, ""
         except Exception as e:
-            return False, None, str(e).strip()[:180] or "传输失败"
+            return False, None, _friendly_remote_error(destination_name, str(e), write=True) or "传输失败"
 
     def download_remote(self, name: str, path: str, destination: str, is_dir: bool) -> tuple[bool, dict | None, str]:
         try:
@@ -738,14 +817,16 @@ class RcloneProvider:
                 return False, None, "本地目标路径无效"
             os.makedirs(target, exist_ok=True)
             if is_dir:
-                src_fs = _rclone_fs(name, path)
-                payload = {"srcFs": src_fs, "srcRemote": "", "dstFs": target, "dstRemote": ""}
+                if _rclone_bucket(name):
+                    payload = {"srcFs": _rclone_scoped_fs(name), "srcRemote": path, "dstFs": target, "dstRemote": ""}
+                else:
+                    payload = {"srcFs": _rclone_fs(name, path), "srcRemote": "", "dstFs": target, "dstRemote": ""}
                 endpoint = "/sync/copy"
                 total = None
             else:
                 filename = posixpath.basename(path)
                 payload = {
-                    "srcFs": _rclone_fs(name), "srcRemote": path,
+                    "srcFs": _rclone_scoped_fs(name), "srcRemote": path,
                     "dstFs": target, "dstRemote": filename,
                 }
                 endpoint = "/operations/copyfile"
@@ -753,7 +834,7 @@ class RcloneProvider:
                 try:
                     stat = self._req(
                         "/operations/stat", timeout=8.0, method="POST",
-                        data=json.dumps({"fs": _rclone_fs(name), "remote": path}),
+                        data=json.dumps({"fs": _rclone_scoped_fs(name), "remote": path}),
                         headers={"Content-Type": "application/json"},
                     ) or {}
                     item = stat.get("item") or {}
@@ -781,18 +862,18 @@ class RcloneProvider:
             if not stage.startswith(data_dir + os.sep) or not os.path.isfile(stage):
                 return False, None, "上传文件暂存失败"
             if not destination:
-                if self._remote_type(name) == "s3":
+                if self._remote_type(name) == "s3" and not _rclone_bucket(name):
                     return False, None, "S3/R2 上传请先进入 bucket 目录后再上传"
             target = _join_rclone_path(destination, filename)
             job = self._start_job(
                 "/operations/copyfile",
                 {"srcFs": os.path.dirname(stage), "srcRemote": os.path.basename(stage),
-                 "dstFs": _rclone_fs(name), "dstRemote": target},
+                 "dstFs": _rclone_scoped_fs(name), "dstRemote": target},
                 action="upload", label=f"上传 {name}:{target}", total=total, cleanup=stage,
             )
             return True, job, ""
         except Exception as e:
-            return False, None, _friendly_rclone_error(str(e)) or "上传失败"
+            return False, None, _friendly_remote_error(name, str(e), write=True) or "上传失败"
 
     def get_remote(self, name: str) -> tuple[bool, dict, str]:
         """Return editable non-secret fields and the names of stored secrets."""
@@ -817,6 +898,8 @@ class RcloneProvider:
                         secrets.append(key)
                 elif isinstance(value, (str, int, float, bool)):
                     params[key] = _canonical_s3_provider(value) if ftype == "s3" and key == "provider" else str(value)
+            if ftype == "s3":
+                params["bucket"] = _rclone_bucket(name)
             return True, {"name": name, "type": ftype, "params": params, "secretFields": secrets}, ""
         except Exception as e:
             return False, {}, str(e).strip()[:180] or "读取网盘配置失败"
@@ -846,6 +929,7 @@ class RcloneProvider:
             remote_type = str(old_config.get("type") or "")
             if not remote_type:
                 return False, "网盘配置不存在"
+            bucket = _rclone_bucket(name)
 
             # config/get returns rclone's already-obscured secret values. Keep every
             # scalar config key and ask config/create not to obscure them again.
@@ -892,6 +976,8 @@ class RcloneProvider:
                 except Exception:
                     pass
                 return False, f"旧名称删除失败：{str(e).strip()[:140]}"
+            if bucket and (not _set_rclone_bucket(new_name, bucket) or not _set_rclone_bucket(name, "")):
+                return False, "bucket 配置迁移失败"
             return True, ""
         except Exception as e:
             return False, str(e).strip()[:180] or "修改网盘名称失败"
@@ -902,8 +988,17 @@ class RcloneProvider:
         if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", name or ""):
             return False, "网盘名称无效"
         safe = {}
+        bucket_present = "bucket" in (params or {})
+        bucket = str((params or {}).get("bucket") or "").strip()
+        if bucket_present and bucket:
+            try:
+                bucket = _validate_rclone_bucket(bucket)
+            except ValueError as e:
+                return False, str(e)
         for key, value in (params or {}).items():
             if key not in _RCLONE_PARAM_KEYS:
+                continue
+            if key == "bucket":
                 continue
             value = str(value)[:512]
             if key in _RCLONE_SECRET_KEYS and not value.strip():
@@ -914,19 +1009,22 @@ class RcloneProvider:
                 safe = _normalize_s3_params(safe)
             except ValueError as e:
                 return False, str(e)
-        if not safe:
+        if not safe and not bucket_present:
             return False, "没有需要更新的配置"
         try:
             import json as _json
-            self._req(
-                "/config/update", timeout=8.0, method="POST",
-                data=_json.dumps({
-                    "name": name,
-                    "parameters": safe,
-                    "opt": {"obscure": True, "noOutput": True, "nonInteractive": True},
-                }),
-                headers={"Content-Type": "application/json"},
-            )
+            if safe:
+                self._req(
+                    "/config/update", timeout=8.0, method="POST",
+                    data=_json.dumps({
+                        "name": name,
+                        "parameters": safe,
+                        "opt": {"obscure": True, "noOutput": True, "nonInteractive": True},
+                    }),
+                    headers={"Content-Type": "application/json"},
+                )
+            if bucket_present and not _set_rclone_bucket(name, bucket):
+                return False, "bucket 配置保存失败"
             return True, ""
         except Exception as e:
             return False, str(e).strip()[:180] or "更新网盘配置失败"
@@ -945,8 +1043,16 @@ class RcloneProvider:
         body = {"name": name, "type": ftype}
         # 只透传白名单内的字符串参数，避免注入任意 rc 字段
         safe = {}
+        bucket = str((params or {}).get("bucket") or "").strip() if ftype == "s3" else ""
+        if ftype == "s3" and bucket:
+            try:
+                bucket = _validate_rclone_bucket(bucket)
+            except ValueError as e:
+                return False, str(e)
         for k, v in (params or {}).items():
             if k in _RCLONE_PARAM_KEYS:
+                if k == "bucket":
+                    continue
                 safe[k] = str(v)[:512]
         if ftype == "s3":
             try:
@@ -959,6 +1065,8 @@ class RcloneProvider:
             self._req("/config/create", timeout=6.0, method="POST",
                       data=_json.dumps(body),
                       headers={"Content-Type": "application/json"})
+            if ftype == "s3" and not _set_rclone_bucket(name, bucket):
+                return False, "bucket 配置保存失败"
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -969,6 +1077,7 @@ class RcloneProvider:
             return False, "bad name"
         try:
             self._req("/config/delete", timeout=5.0, method="POST", data=f"name={name}")
+            _set_rclone_bucket(name, "")
             return True, ""
         except Exception as e:
             return False, str(e)

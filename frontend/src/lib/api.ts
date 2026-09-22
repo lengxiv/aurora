@@ -305,7 +305,7 @@ export async function testTelegram(token: string, chatId: string) {
   } catch { return { ok: false, detail: '请求失败' } }
 }
 
-export interface RcloneRemote { name: string; type: string }
+export interface RcloneRemote { name: string; type: string; bucket?: string }
 
 export async function fetchRcloneRemotes(): Promise<{ online: boolean; remotes: RcloneRemote[] } | null> {
   try {

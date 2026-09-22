@@ -79,8 +79,10 @@ export default function RcloneBrowser({ remotes }: Props) {
   const [sortAsc, setSortAsc] = useState(true)
   const [localUploads, setLocalUploads] = useState<RcloneTransfer[]>([])
   const previousJobs = useRef<Record<string, RcloneTransfer['status']>>({})
-  const remoteType = remotes.find((item) => item.name === remote)?.type || ''
+  const currentRemote = remotes.find((item) => item.name === remote)
+  const remoteType = currentRemote?.type || ''
   const isObjectStore = remoteType === 's3'
+  const hasFixedBucket = Boolean(currentRemote?.bucket)
 
   useEffect(() => {
     if (!remotes.some((item) => item.name === remote)) {
@@ -317,7 +319,7 @@ export default function RcloneBrowser({ remotes }: Props) {
               return <span key={crumbPath} className="flex shrink-0 items-center gap-1"><ChevronRight size={13} className="text-dim/50" /><button onClick={() => browse(crumbPath)} className={`rounded-md px-2 py-1.5 ${index === crumbs.length - 1 ? 'bg-white/8 text-fg' : 'text-dim hover:text-fg'}`}>{crumb}</button></span>
             })}
           </div>
-          {isObjectStore && <form onSubmit={openPath} className="flex min-w-44 shrink-0 items-center gap-1 rounded-lg border border-line bg-white/4 px-2 py-1 focus-within:border-aurora-2/50">
+          {isObjectStore && !hasFixedBucket && <form onSubmit={openPath} className="flex min-w-44 shrink-0 items-center gap-1 rounded-lg border border-line bg-white/4 px-2 py-1 focus-within:border-aurora-2/50">
             <input value={pathDraft} onChange={(event) => setPathDraft(event.target.value)} aria-label="网盘路径" placeholder="输入 bucket / 路径" className="min-w-0 flex-1 bg-transparent px-0.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
             <button type="submit" title="打开路径" aria-label="打开路径" className="grid h-6 w-6 shrink-0 place-items-center text-dim hover:text-fg"><ChevronRight size={13} /></button>
           </form>}

@@ -12,6 +12,7 @@ const FIELD_LABELS: Record<string, string> = {
   pass: '密码',
   provider: '云服务商',
   endpoint: '端点地址',
+  bucket: 'Bucket',
   access_key_id: 'Access Key ID',
   secret_access_key: 'Secret Key',
   region: '区域',
@@ -27,9 +28,10 @@ const rcTypes: Record<string, { label: string; desc: string; fields: { k: string
   s3: { label: 'S3 / R2 / COS / OSS', desc: 'Cloudflare R2 / AWS S3 / 腾讯 COS / 阿里 OSS', fields: [
     { k: 'provider', ph: 'Cloudflare / AWS / TencentCOS / Alibaba' },
     { k: 'endpoint', ph: 'https://<acct>.r2.cloudflarestorage.com' },
+    { k: 'bucket', ph: 'Bucket 名称，如 lengxi' },
     { k: 'access_key_id', ph: 'Access Key ID' }, { k: 'secret_access_key', ph: 'Secret Key', pw: true },
     { k: 'region', ph: 'auto / us-east-1 / ap-northeast-1' },
-  ] },
+  ], hint: 'R2 endpoint 不要带 bucket 路径；填写 bucket 后，应用会直接进入该 bucket，不要求账号具备 bucket 列表权限' },
   aliyundrive_open: { label: '阿里云盘', desc: '阿里云盘开放平台（需申请应用）', fields: [
     { k: 'client_id', ph: '开放平台 Client ID' }, { k: 'client_secret', ph: 'Client Secret', pw: true },
   ], hint: '需先到阿里云盘开放平台申请应用；保存后可能仍需在高级配置里补 OAuth 授权' },

@@ -121,10 +121,16 @@ class RcloneTests(unittest.TestCase):
         rclone = providers.RcloneProvider()
         rclone._req = Mock(return_value={})
 
-        ok, detail = rclone.create_remote("r2", "s3", {
-            "provider": "cloudflare",
-            "endpoint": "https://account.r2.cloudflarestorage.com/",
-        })
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            try:
+                ok, detail = rclone.create_remote("r2", "s3", {
+                    "provider": "cloudflare",
+                    "endpoint": "https://account.r2.cloudflarestorage.com/",
+                })
+            finally:
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
 
         self.assertTrue(ok)
         self.assertEqual(detail, "")
@@ -164,6 +170,86 @@ class RcloneTests(unittest.TestCase):
         rclone._req.assert_called_once_with(
             "/config/get", timeout=5.0, method="POST", data="name=r2",
         )
+
+    def test_fixed_s3_bucket_is_used_as_remote_root(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"list": [{"Name": "clip.mp4", "IsDir": False, "Size": 12}]})
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            providers._set_rclone_bucket("r2", "lengxi")
+            try:
+                ok, entries, detail = rclone.list_files("r2", "")
+            finally:
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(entries[0]["path"], "clip.mp4")
+        payload = json.loads(rclone._req.call_args.kwargs["data"])
+        self.assertEqual(payload["fs"], "r2:lengxi")
+        self.assertEqual(payload["remote"], "")
+
+    def test_upload_uses_fixed_s3_bucket_without_manual_path(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 45})
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            providers._set_rclone_bucket("r2", "lengxi")
+            stage = Path(td) / "sample.bin"
+            stage.write_bytes(b"data")
+            old_data_dir = providers._DATA_DIR
+            providers._DATA_DIR = td
+            try:
+                ok, job, detail = rclone.upload_file("r2", str(stage), "sample.bin", "", 4)
+            finally:
+                providers._DATA_DIR = old_data_dir
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertIsNotNone(job)
+        payload = json.loads(rclone._req.call_args.kwargs["data"])
+        self.assertEqual(payload["dstFs"], "r2:lengxi")
+        self.assertEqual(payload["dstRemote"], "sample.bin")
+
+    def test_s3_bucket_config_is_stored_outside_rclone_parameters(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={})
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            try:
+                ok, detail = rclone.create_remote("r2", "s3", {
+                    "provider": "cloudflare",
+                    "endpoint": "https://account.r2.cloudflarestorage.com",
+                    "bucket": "lengxi",
+                })
+                saved_bucket = providers._rclone_bucket("r2")
+            finally:
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(saved_bucket, "lengxi")
+        payload = json.loads(rclone._req.call_args.kwargs["data"])
+        self.assertNotIn("bucket", payload["parameters"])
+
+    def test_s3_write_permission_error_is_actionable(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(side_effect=RuntimeError("HTTP Error 500: Internal Server Error"))
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            providers._set_rclone_bucket("r2", "lengxi")
+            try:
+                ok, detail = rclone.mkdir_remote("r2", "folder")
+            finally:
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
+
+        self.assertFalse(ok)
+        self.assertEqual(detail, "R2 写入被拒绝，请为该 bucket 的 API Token 授予 Object Read & Write 权限")
 
     def test_remote_file_listing_maps_entries_and_rejects_traversal(self):
         rclone = providers.RcloneProvider()
