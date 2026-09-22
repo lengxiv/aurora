@@ -296,8 +296,8 @@ export default function RcloneBrowser({ remotes }: Props) {
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => setShowTransfers((value) => !value)} title="传输任务" aria-label="传输任务"
-            className={`relative grid h-8 w-8 place-items-center rounded-lg border ${showTransfers ? 'border-aurora-2/50 text-aurora-1' : 'border-line bg-white/4 text-dim hover:text-fg'}`}>
-            <Upload size={14} />
+            className={`relative inline-flex h-8 items-center rounded-lg border px-2.5 text-xs ${showTransfers ? 'border-aurora-2/50 text-aurora-1' : 'border-line bg-white/4 text-dim hover:text-fg'}`}>
+            任务
             {activeTransfers.length > 0 && <span className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-aurora-2 px-1 text-[9px] text-ink">{activeTransfers.length}</span>}
           </button>
           <input ref={inputRef} type="file" multiple className="hidden" onChange={upload} />
