@@ -225,7 +225,7 @@ export default function NetdiskView() {
         )}
         {rc && rc.online && rc.remotes.length > 0 && <RcloneBrowser remotes={rc.remotes} />}
         <div className="mt-6 max-w-3xl text-[11px] leading-relaxed text-dim/70">
-          网盘配置保存在 /root/.config/rclone/rclone.conf；保存后 ≤2 秒自动生效，管理台与监控大屏的挂载来源变为「rclone 真实」。WebDAV / S3 / 阿里云盘可表单直配；Google Drive / OneDrive 需浏览器 OAuth 回调，请在高级配置（rclone WebGUI）中完成。
+          网盘配置由 rclone 服务账户保存；保存后 ≤2 秒自动生效，管理台与监控大屏的挂载来源变为「rclone 真实」。WebDAV / S3 / 阿里云盘可表单直配；Google Drive / OneDrive 需浏览器 OAuth 回调，请在高级配置（rclone WebGUI）中完成。
         </div>
       </main>
 

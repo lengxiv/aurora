@@ -309,7 +309,7 @@ export default function RcloneBrowser({ remotes }: Props) {
       <div className="panel overflow-hidden">
         <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
           <select value={remote} onChange={(event) => { setRemote(event.target.value); setPath('') }}
-            className="min-w-32 rounded-lg border border-line bg-white/4 px-2.5 py-2 text-xs text-fg focus:border-aurora-2/50 focus:outline-none">
+            className="aurora-select min-w-32 rounded-lg border border-line px-2.5 py-2 text-xs focus:border-aurora-2/50 focus:outline-none">
             {remotes.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.type || 'remote'}</option>)}
           </select>
           <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto text-xs">
@@ -334,7 +334,7 @@ export default function RcloneBrowser({ remotes }: Props) {
             {query && <button onClick={() => setQuery('')} title="清除搜索" aria-label="清除搜索" className="shrink-0 text-dim hover:text-fg"><X size={13} /></button>}
           </label>
           <span className="text-[11px] text-dim">{query ? `${visibleItems.length}/${items.length} 项` : `${items.length} 项`}</span>
-          <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)} aria-label="排序方式" className="rounded-lg border border-line bg-white/4 px-2 py-1.5 text-xs text-dim focus:border-aurora-2/50 focus:outline-none">
+          <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)} aria-label="排序方式" className="aurora-select rounded-lg border border-line px-2 py-1.5 text-xs focus:border-aurora-2/50 focus:outline-none">
             <option value="name">按名称</option><option value="size">按大小</option><option value="modified">按修改时间</option><option value="type">按类型</option>
           </select>
           <button onClick={() => setSortAsc((value) => !value)} title={sortAsc ? '升序' : '降序'} aria-label={sortAsc ? '升序' : '降序'} className="grid h-7 w-7 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg">{sortAsc ? <ArrowDownAZ size={13} /> : <ArrowUpAZ size={13} />}</button>
@@ -396,7 +396,7 @@ export default function RcloneBrowser({ remotes }: Props) {
         <div className="panel w-full max-w-md px-5 py-5" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-between"><span className="text-sm font-medium text-fg">{dialog.kind === 'mkdir' ? '新建目录' : dialog.kind === 'rename' ? '重命名' : dialog.kind === 'download' ? '下载到本地' : dialog.kind === 'copy' ? '复制到网盘' : '移动到网盘'}</span><button onClick={closeDialog} title="关闭" aria-label="关闭" className="text-dim hover:text-fg"><X size={16} /></button></div>
           {dialog.kind === 'mkdir' || dialog.kind === 'rename' ? <div className="mt-4"><label className="block text-xs text-dim">{dialog.kind === 'mkdir' ? '目录名称' : '新名称'}</label><input autoFocus value={dialog.value} onChange={(event) => setDialog({ ...dialog, value: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') runDialog() }} className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg focus:border-aurora-2/50 focus:outline-none" /></div> : <div className="mt-4 grid gap-3">
-            {dialog.kind !== 'download' && <label className="block text-xs text-dim">目标网盘<select value={dialog.targetRemote} onChange={(event) => setDialog({ ...dialog, targetRemote: event.target.value })} className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg focus:border-aurora-2/50 focus:outline-none">{remotes.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
+            {dialog.kind !== 'download' && <label className="block text-xs text-dim">目标网盘<select value={dialog.targetRemote} onChange={(event) => setDialog({ ...dialog, targetRemote: event.target.value })} className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2.5 text-sm focus:border-aurora-2/50 focus:outline-none">{remotes.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
             <label className="block text-xs text-dim">{dialog.kind === 'download' ? '本地目标目录（相对下载目录）' : '目标目录'}<input value={dialog.targetPath} onChange={(event) => setDialog({ ...dialog, targetPath: event.target.value })} placeholder={dialog.kind === 'download' ? '留空表示下载目录根目录' : '留空表示根目录'} className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" /></label>
             <div className="text-[11px] leading-relaxed text-dim/70">{dialog.entries.length === 1 ? dialog.entries[0].name : `已选择 ${dialog.entries.length} 项`} · 任务将在后台执行，可在传输任务中查看进度。</div>
           </div>}

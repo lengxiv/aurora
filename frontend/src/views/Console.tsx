@@ -1,6 +1,6 @@
-import { useState, useEffect, type ReactNode } from 'react'
-import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search } from 'lucide-react'
-import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneRemotes, torrentAction, batchAction, type MediaDir, type RcloneRemote, type Torrent, type MountStatus } from '../lib/api'
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
+import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search, RotateCcw, ChevronUp, Folder } from 'lucide-react'
+import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneFiles, fetchRcloneRemotes, retryTorrentDestination, torrentAction, batchAction, type MediaDir, type RcloneEntry, type RcloneRemote, type Torrent, type MountStatus } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -8,7 +8,7 @@ const statusTone: Record<MountStatus, 'ok' | 'warn' | 'bad'> = { online: 'ok', d
 const stateTone: Record<Torrent['state'], 'ok' | 'warn' | 'bad' | 'muted'> = {
   downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
 }
-const destinationStatus: Record<string, string> = { waiting: '等待下载完成', uploading: '上传中', done: '已上传', error: '上传失败' }
+const destinationStatus: Record<string, string> = { waiting: '等待下载完成', uploading: '上传中', done: '已上传', error: '上传失败', orphaned: '任务已不存在' }
 
 function RowBtn({ children, onClick, title, danger }: { children: ReactNode; onClick: () => void; title?: string; danger?: boolean }) {
   return (
@@ -38,6 +38,12 @@ export default function ConsoleView() {
   const [remoteBusy, setRemoteBusy] = useState(false)
   const [targetRemote, setTargetRemote] = useState('')
   const [targetRemotePath, setTargetRemotePath] = useState('')
+  const [remoteBrowsePath, setRemoteBrowsePath] = useState('')
+  const [remoteDirs, setRemoteDirs] = useState<RcloneEntry[]>([])
+  const [remotePathBusy, setRemotePathBusy] = useState(false)
+  const [remotePathMsg, setRemotePathMsg] = useState('')
+  const targetRemotePathRef = useRef('')
+  targetRemotePathRef.current = targetRemotePath
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [msgBad, setMsgBad] = useState(false)
@@ -69,10 +75,37 @@ export default function ConsoleView() {
     setRemoteBusy(false)
   }
 
+  const loadRemotePath = useCallback(async (name: string, nextPath: string) => {
+    if (!name) return
+    setRemotePathBusy(true)
+    setRemotePathMsg('')
+    const result = await fetchRcloneFiles(name, nextPath)
+    if (result) {
+      setRemoteBrowsePath(nextPath)
+      setRemoteDirs((result.items || []).filter((item) => item.isDir))
+      setRemotePathMsg(result.detail || '')
+    } else {
+      setRemoteDirs([])
+      setRemotePathMsg('目录读取失败，请检查网盘连接')
+    }
+    setRemotePathBusy(false)
+  }, [])
+
   useEffect(() => {
     // Preload remotes so the target selector is ready when the dialog opens.
     void loadRcloneRemotes()
   }, [])
+
+  useEffect(() => {
+    if (targetMode !== 'remote' || !targetRemote) {
+      setRemoteDirs([])
+      setRemotePathMsg('')
+      return
+    }
+    const initial = targetRemotePathRef.current.trim()
+    setRemoteBrowsePath(initial)
+    void loadRemotePath(targetRemote, initial)
+  }, [loadRemotePath, targetMode, targetRemote])
 
   const openAdd = () => {
     setOpen(true)
@@ -97,6 +130,9 @@ export default function ConsoleView() {
     setTargetMode('local')
     setTargetRemote('')
     setTargetRemotePath('')
+    setRemoteBrowsePath('')
+    setRemoteDirs([])
+    setRemotePathMsg('')
   }
 
   const chooseMode = (mode: 'magnet' | 'file') => {
@@ -183,7 +219,17 @@ export default function ConsoleView() {
     toast(r.ok ? `${label}成功` + (r.mode === 'demo' ? '（演示）' : '') : `${label}失败：${r.detail}`, r.ok ? 'ok' : 'bad')
   }
 
-  const toggleSel = (id: string) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+  const retryDestination = async (id: string) => {
+    const r = await retryTorrentDestination(id)
+    toast(r.ok ? '网盘转存已加入重试队列' : `转存重试失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+  }
+
+  const toggleSel = (id: string) => setSel((s) => {
+    const next = new Set(s)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
   const toggleAll = () => setSel(torrents.length === sel.size ? new Set() : new Set(torrents.map((t) => t.id)))
   const doBatch = async (action: string, label: string) => {
     if (sel.size === 0) return
@@ -331,8 +377,9 @@ export default function ConsoleView() {
                       <div className="min-w-0">
                         <div className="num truncate text-fg" title={t.name}>{t.name}</div>
                         <div className="text-[11px] text-dim">S/L {t.seeders} · P/L {t.leechers}</div>
-                        {t.destination && <div className={`truncate text-[10px] ${t.destination.status === 'error' ? 'text-rose-300' : 'text-aurora-1'}`} title={`${t.destination.remote}:${t.destination.path || '/'}`}>
-                          网盘 · {t.destination.remote}:{t.destination.path || '/'} · {destinationStatus[t.destination.status] ?? t.destination.status}
+                        {t.destination && <div className={`flex min-w-0 items-center gap-1 text-[10px] ${t.destination.status === 'error' || t.destination.status === 'orphaned' ? 'text-rose-300' : 'text-aurora-1'}`} title={`${t.destination.remote}:${t.destination.path || '/'}`}>
+                          <span className="min-w-0 truncate">网盘 · {t.destination.remote}:{t.destination.path || '/'} · {destinationStatus[t.destination.status] ?? t.destination.status}</span>
+                          {t.destination.status === 'error' && <button onClick={() => retryDestination(t.destination!.id)} title="重试网盘转存" aria-label="重试网盘转存" className="grid h-5 w-5 shrink-0 place-items-center rounded text-rose-300 hover:bg-rose-400/10 hover:text-rose-200"><RotateCcw size={11} /></button>}
                         </div>}
                       </div>
                     </div>
@@ -388,7 +435,7 @@ export default function ConsoleView() {
               {targetMode === 'remote' && (
                 <div className="mt-2 grid gap-2">
                   <div className="flex items-center gap-2">
-                    <select value={targetRemote} onChange={(e) => setTargetRemote(e.target.value)} disabled={busy || remoteBusy || !rcloneRemotes.length}
+                    <select value={targetRemote} onChange={(e) => { setTargetRemote(e.target.value); setTargetRemotePath('') }} disabled={busy || remoteBusy || !rcloneRemotes.length}
                       className="aurora-select w-full rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
                       {!rcloneRemotes.length && <option value="">{remoteBusy ? '正在读取网盘列表…' : '暂无可用网盘'}</option>}
                       {rcloneRemotes.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.type || 'remote'}</option>)}
@@ -401,6 +448,28 @@ export default function ConsoleView() {
                   {!remoteBusy && !rcloneRemotes.length && <div className="text-xs text-rose-300">没有读取到已接入网盘，请先在网盘设置中完成对接。</div>}
                   <input value={targetRemotePath} onChange={(e) => setTargetRemotePath(e.target.value)} placeholder="网盘目标目录，留空表示根目录" disabled={busy || remoteBusy}
                     className="w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+                  <div className="rounded-lg border border-line bg-white/3 px-3 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <Folder size={13} className="text-aurora-1" />
+                      <span className="text-[11px] text-dim">选择网盘目录</span>
+                      <button type="button" onClick={() => void loadRemotePath(targetRemote, targetRemotePath.trim())} disabled={busy || remotePathBusy}
+                        title="读取目录" aria-label="读取目录" className="ml-auto grid h-6 w-6 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg disabled:opacity-40">
+                        <RefreshCw size={12} className={remotePathBusy ? 'animate-spin' : ''} />
+                      </button>
+                    </div>
+                    <div className="mt-2 flex items-center gap-1.5 text-[11px]">
+                      <button type="button" onClick={() => { const parent = remoteBrowsePath.split('/').filter(Boolean).slice(0, -1).join('/'); void loadRemotePath(targetRemote, parent) }} disabled={busy || remotePathBusy || !remoteBrowsePath}
+                        className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2 py-1 text-dim hover:text-fg disabled:opacity-40"><ChevronUp size={11} /> 上级</button>
+                      <span className="min-w-0 flex-1 truncate text-dim">当前：{remoteBrowsePath || '/'}</span>
+                      <button type="button" onClick={() => setTargetRemotePath(remoteBrowsePath)} disabled={busy || remotePathBusy}
+                        className="rounded-md border border-aurora-2/30 bg-aurora-2/8 px-2 py-1 text-aurora-1 hover:bg-aurora-2/15 disabled:opacity-40">选择</button>
+                    </div>
+                    {remotePathMsg && <div className="mt-2 text-[11px] text-rose-300">{remotePathMsg}</div>}
+                    {remoteDirs.length > 0 && <div className="mt-2 grid max-h-28 gap-1 overflow-y-auto">
+                      {remoteDirs.map((item) => <button key={item.path} type="button" onClick={() => void loadRemotePath(targetRemote, item.path)} disabled={remotePathBusy}
+                        className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11px] text-dim hover:bg-white/6 hover:text-fg disabled:opacity-50"><Folder size={12} className="shrink-0 text-aurora-1" /><span className="truncate">{item.name}</span></button>)}
+                    </div>}
+                  </div>
                   <div className="text-[11px] text-dim/70">任务会先下载到本地，完成后自动上传到所选网盘。</div>
                 </div>
               )}

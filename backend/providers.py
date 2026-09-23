@@ -8,6 +8,7 @@ it, and the matching section flips to real readings with no frontend change.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import posixpath
 import re
@@ -19,6 +20,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---- infohash helpers (manual / demo queue) ----
 
@@ -50,6 +54,8 @@ _TRASH_FILE = os.path.join(_DATA_DIR, "trash.json")
 _TORRENT_DEST_FILE = os.path.join(_DATA_DIR, "torrent_destinations.json")
 _DATA_LOCK = threading.RLock()
 _TORRENT_DEST_LOCK = threading.RLock()
+_TORRENT_DEST_ORPHAN_GRACE = 60 * 60
+_TORRENT_DEST_RETENTION = 7 * 24 * 60 * 60
 
 
 def _atomic_json(path: str, data) -> None:
@@ -75,8 +81,10 @@ def _log(event: str, detail: str = ""):
             _LOG[:] = _LOG[-200:]
         try:
             _atomic_json(_LOG_FILE, _LOG)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Activity history is best-effort, but a permissions or disk error
+            # must remain visible in journald instead of silently disappearing.
+            _LOGGER.warning("activity log write failed: %s", exc)
 
 
 def logs(limit: int = 20):
@@ -263,6 +271,10 @@ _RCLONE_SECRET_KEYS = frozenset({"pass", "secret_access_key", "client_secret", "
 _RCLONE_TRANSFER_LIMIT = 100
 _RCLONE_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
 _RCLONE_BUCKETS_FILE = os.path.join(_DATA_DIR, "rclone-buckets.json")
+_RCLONE_TRANSFER_FILE = os.path.join(_DATA_DIR, "rclone-transfers.json")
+_RCLONE_TERMINAL_STATUSES = frozenset({"done", "error", "canceled"})
+_RCLONE_TRANSFER_RETENTION = 7 * 24 * 60 * 60
+_RCLONE_STATUS_FAILURE_LIMIT = 30
 
 _S3_PROVIDER_NAMES = {
     "aws": "AWS",
@@ -424,11 +436,55 @@ class RcloneProvider:
         self.base = os.environ.get("AURORA_RCLONE_RC", "http://127.0.0.1:5572").rstrip("/")
         # rc 启用 Basic Auth 时提供凭据（用户:密码，纯回环仍建议开，公网反代必须开）
         self.auth = os.environ.get("AURORA_RCLONE_RC_AUTH", "")
-        self._transfer_jobs: dict[str, dict] = {}
         self._transfer_lock = threading.RLock()
+        self._transfer_jobs: dict[str, dict] = {}
+        self._load_transfer_jobs()
 
     def _req(self, path, **kw):
         return _http(f"{self.base}{path}", auth=self.auth or None, **kw)
+
+    def _load_transfer_jobs(self) -> None:
+        """Restore the local view of transfers after an Aurora restart.
+
+        rclone owns the actual job; this journal only preserves the correlation
+        id, labels and retry request so the UI and torrent scheduler do not
+        forget an in-flight task when the API process is restarted.
+        """
+        try:
+            with open(_RCLONE_TRANSFER_FILE) as f:
+                rows = json.load(f)
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            job = dict(raw)
+            job_id = str(job.get("id") or "")
+            if not job_id or job.get("rcloneJobId") is None:
+                continue
+            status = str(job.get("status") or "running")
+            if status not in _RCLONE_TERMINAL_STATUSES and status != "running":
+                continue
+            job["id"] = job_id
+            job["status"] = status
+            job.setdefault("created", int(time.time()))
+            job.setdefault("finished", 0)
+            job.setdefault("bytes", 0)
+            job.setdefault("total", None)
+            job.setdefault("speed", 0)
+            job.setdefault("progress", None)
+            job.setdefault("detail", "")
+            job.setdefault("retryable", status in ("error", "canceled"))
+            job.setdefault("status_failures", 0)
+            self._transfer_jobs[job_id] = job
+
+    def _persist_transfer_jobs_locked(self) -> None:
+        try:
+            _atomic_json(_RCLONE_TRANSFER_FILE, list(self._transfer_jobs.values()))
+        except Exception as exc:
+            _LOGGER.warning("rclone transfer journal write failed: %s", exc)
 
     def available(self) -> bool:
         # rclone rcd 的 rc API 只接受 POST（--rc-serve 仅 serve 命令支持）
@@ -483,6 +539,8 @@ class RcloneProvider:
             remotes = {str(item).rstrip(":") for item in (data.get("remotes") or [])}
             if name not in remotes:
                 return False, "", "目标网盘不存在"
+            if not path and self._remote_type(name) == "s3" and not _rclone_bucket(name):
+                return False, "", "S3/R2 目标请填写 bucket 名称或目录"
             return True, path, ""
         except Exception as e:
             return False, "", str(e).strip()[:180] or "网盘目标路径无效"
@@ -587,6 +645,7 @@ class RcloneProvider:
             "action": action,
             "label": label[:240],
             "status": "running",
+            "phase": "transferring",
             "progress": 0.0 if total else None,
             "bytes": 0,
             "total": total,
@@ -595,16 +654,23 @@ class RcloneProvider:
             "created": int(time.time()),
             "finished": 0,
             "cleanup": cleanup,
-            "retryable": not bool(cleanup),
+            # Upload staging files are retained on failure so a retry can use
+            # the same bytes. Successful/canceled jobs clear this flag below.
+            "retryable": True,
+            "status_failures": 0,
             "request": {"endpoint": endpoint, "payload": request_payload},
         }
         with self._transfer_lock:
             self._transfer_jobs[job["id"]] = job
+            self._persist_transfer_jobs_locked()
         return self._public_transfer(job)
 
     @staticmethod
     def _public_transfer(job: dict) -> dict:
-        return {k: v for k, v in job.items() if k not in ("rcloneJobId", "cleanup", "request")}
+        return {
+            k: v for k, v in job.items()
+            if k not in ("rcloneJobId", "cleanup", "request", "status_failures")
+        }
 
     def _cleanup_transfer(self, job: dict) -> None:
         path = job.get("cleanup") or ""
@@ -616,48 +682,106 @@ class RcloneProvider:
         except OSError:
             pass
         job["cleanup"] = ""
+        job["retryable"] = False
 
-    def _refresh_transfer(self, job: dict) -> None:
-        if job.get("status") in ("done", "error", "canceled"):
-            return
+    @staticmethod
+    def _job_status_missing(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        message = str(exc).casefold()
+        return code == 404 or any(text in message for text in ("job not found", "unknown job", "no such job"))
+
+    def _refresh_transfer(self, job: dict) -> bool:
+        with self._transfer_lock:
+            if job.get("status") in _RCLONE_TERMINAL_STATUSES:
+                return False
+            remote_job = job.get("rcloneJobId")
         try:
             status = self._req(
                 "/job/status", timeout=4.0, method="POST",
-                data=json.dumps({"jobid": job["rcloneJobId"]}),
+                data=json.dumps({"jobid": remote_job}),
                 headers={"Content-Type": "application/json"},
             ) or {}
         except Exception as e:
-            # A temporary status failure should not make an active transfer look failed.
-            job["detail"] = str(e).strip()[:180]
-            return
+            # A temporary status failure should not make an active transfer
+            # look failed. If the job remains unreadable, expose a retryable
+            # terminal state instead of leaving the torrent scheduler stuck in
+            # "uploading" forever. The staging file is deliberately retained.
+            with self._transfer_lock:
+                failures = int(job.get("status_failures") or 0) + 1
+                job["status_failures"] = failures
+                if self._job_status_missing(e) or failures >= _RCLONE_STATUS_FAILURE_LIMIT:
+                    job["status"] = "error"
+                    job["detail"] = "rclone 传输任务状态已丢失，请检查服务后重试"
+                    job["finished"] = int(time.time())
+                    job["retryable"] = bool(job.get("request"))
+                    self._persist_transfer_jobs_locked()
+                    return True
+                job["detail"] = str(e).strip()[:180]
+            return False
         if status.get("finished"):
-            job["status"] = "done" if status.get("success") else "error"
-            if status.get("success"):
-                job["detail"] = ""
-            else:
-                request = job.get("request") or {}
-                payload = request.get("payload") or {}
-                destination = str(payload.get("dstFs") or payload.get("fs") or "")
-                remote_name = destination.split(":", 1)[0] if ":" in destination else ""
-                job["detail"] = _friendly_remote_error(
-                    remote_name, status.get("error") or "传输失败", write=job.get("action") != "download",
-                )
-            job["progress"] = 1.0 if job["status"] == "done" else job.get("progress")
-            job["finished"] = int(time.time())
-            self._cleanup_transfer(job)
-            return
+            with self._transfer_lock:
+                job["status_failures"] = 0
+                job["status"] = "done" if status.get("success") else "error"
+                if status.get("success"):
+                    job["detail"] = ""
+                    job["progress"] = 1.0
+                    self._cleanup_transfer(job)
+                else:
+                    request = job.get("request") or {}
+                    payload = request.get("payload") or {}
+                    destination = str(payload.get("dstFs") or payload.get("fs") or "")
+                    remote_name = destination.split(":", 1)[0] if ":" in destination else ""
+                    job["detail"] = _friendly_remote_error(
+                        remote_name, status.get("error") or "传输失败", write=job.get("action") != "download",
+                    )
+                    # Keep an upload staging file on failure so the user can
+                    # retry without uploading the browser file again.
+                    job["retryable"] = bool(job.get("request"))
+                job["finished"] = int(time.time())
+                self._persist_transfer_jobs_locked()
+            return True
         try:
             stats = self._req("/core/stats", timeout=3.0, method="POST") or {}
-            done = max(0, int(stats.get("bytes", 0) or 0))
-            total = stats.get("totalBytes")
-            if total:
-                job["total"] = max(int(total), int(job.get("total") or 0))
-            job["bytes"] = max(int(job.get("bytes") or 0), done)
-            job["speed"] = max(0, int(float(stats.get("speed", 0) or 0)))
-            if job.get("total"):
-                job["progress"] = min(1.0, job["bytes"] / job["total"])
+            with self._transfer_lock:
+                active = [
+                    item for item in self._transfer_jobs.values()
+                    if item.get("status") == "running"
+                ]
+            rows = stats.get("transferring") or []
+            request = job.get("request") or {}
+            payload = request.get("payload") or {}
+            candidates = {
+                os.path.basename(str(payload.get("srcRemote") or "")),
+                os.path.basename(str(payload.get("dstRemote") or "")),
+            }
+            candidates.discard("")
+            row = next(
+                (item for item in rows if str(item.get("name") or "") in candidates),
+                None,
+            )
+            # rclone exposes aggregate stats when it cannot identify a single
+            # transfer. They are safe to use only when this is the sole active
+            # job; otherwise one upload would display another one's progress.
+            if row is None and len(active) == 1:
+                row = stats
+            if row is not None:
+                done = max(0, int(row.get("bytes", stats.get("bytes", 0)) or 0))
+                total = row.get("size") or row.get("totalBytes") or stats.get("totalBytes")
+                speed = row.get("speed", stats.get("speed", 0))
+                percentage = row.get("percentage")
+                with self._transfer_lock:
+                    job["status_failures"] = 0
+                    job["bytes"] = max(int(job.get("bytes") or 0), done)
+                    if total:
+                        job["total"] = max(int(total), int(job.get("total") or 0))
+                    job["speed"] = max(0, int(float(speed or 0)))
+                    if percentage is not None:
+                        job["progress"] = min(1.0, max(0.0, float(percentage) / 100))
+                    elif job.get("total"):
+                        job["progress"] = min(1.0, job["bytes"] / job["total"])
         except Exception:
             pass
+        return False
 
     def transfers(self) -> list[dict]:
         with self._transfer_lock:
@@ -666,10 +790,32 @@ class RcloneProvider:
             self._refresh_transfer(job)
         with self._transfer_lock:
             ordered = sorted(self._transfer_jobs.values(), key=lambda item: item["created"], reverse=True)
-            for job in ordered[_RCLONE_TRANSFER_LIMIT:]:
-                self._cleanup_transfer(job)
-                self._transfer_jobs.pop(job["id"], None)
-            return [self._public_transfer(job) for job in ordered[:_RCLONE_TRANSFER_LIMIT]]
+            active = [job for job in ordered if job.get("status") == "running"]
+            finished = [job for job in ordered if job.get("status") in _RCLONE_TERMINAL_STATUSES]
+            now = int(time.time())
+            removed = False
+            for job in finished:
+                finished_at = int(job.get("finished") or job.get("created") or now)
+                if now - finished_at > _RCLONE_TRANSFER_RETENTION:
+                    self._cleanup_transfer(job)
+                    self._transfer_jobs.pop(job["id"], None)
+                    removed = True
+            finished = [job for job in finished if job.get("id") in self._transfer_jobs]
+            if removed:
+                self._persist_transfer_jobs_locked()
+            # Keep every running task visible. The UI cap applies only to
+            # historical rows; the internal journal retains newer terminal
+            # rows so torrent destinations can still resolve their job id.
+            return [self._public_transfer(job) for job in active + finished[:_RCLONE_TRANSFER_LIMIT]]
+
+    def get_transfer(self, transfer_id: str) -> dict | None:
+        """Refresh and return one transfer, including older retained rows."""
+        with self._transfer_lock:
+            job = self._transfer_jobs.get(str(transfer_id))
+        if not job:
+            return None
+        self._refresh_transfer(job)
+        return self._public_transfer(job)
 
     def cancel_transfer(self, transfer_id: str) -> tuple[bool, str]:
         with self._transfer_lock:
@@ -688,6 +834,8 @@ class RcloneProvider:
             job["detail"] = "已取消"
             job["finished"] = int(time.time())
             self._cleanup_transfer(job)
+            with self._transfer_lock:
+                self._persist_transfer_jobs_locked()
             return True, ""
         except Exception as e:
             return False, str(e).strip()[:180] or "取消传输失败"
@@ -707,10 +855,11 @@ class RcloneProvider:
             action = str(job.get("action") or "transfer")
             label = str(job.get("label") or "传输任务")
             total = job.get("total")
+            cleanup = str(job.get("cleanup") or "")
         try:
             retry = self._start_job(
                 request["endpoint"], request["payload"], action=action,
-                label=label, total=total,
+                label=label, total=total, cleanup=cleanup,
             )
             return True, retry, ""
         except Exception as e:
@@ -725,6 +874,8 @@ class RcloneProvider:
             for job in removable:
                 self._cleanup_transfer(job)
                 self._transfer_jobs.pop(job["id"], None)
+            if removable:
+                self._persist_transfer_jobs_locked()
             return len(removable)
 
     def mkdir_remote(self, name: str, path: str) -> tuple[bool, str]:
@@ -875,6 +1026,12 @@ class RcloneProvider:
             data_dir = os.path.realpath(_DATA_DIR)
             if not stage.startswith(data_dir + os.sep) or not os.path.isfile(stage):
                 return False, None, "上传文件暂存失败"
+            actual_total = os.path.getsize(stage)
+            if actual_total <= 0 or actual_total > _RCLONE_UPLOAD_LIMIT:
+                return False, None, "文件大小超出限制"
+            # The multipart length is client-controlled metadata. Use the
+            # server-written file size for progress and validation.
+            total = actual_total
             if not destination:
                 if self._remote_type(name) == "s3" and not _rclone_bucket(name):
                     return False, None, "S3/R2 上传请先进入 bucket 目录后再上传"
@@ -1142,6 +1299,8 @@ class QbittorrentProvider:
         self.base = os.environ.get("AURORA_QBIT_URL", "http://127.0.0.1:8080").rstrip("/")
         self.user = os.environ.get("AURORA_QBIT_USER", "")
         self.pw = os.environ.get("AURORA_QBIT_PASS", "")
+        self._session_lock = threading.RLock()
+        self._last_details_ok = False
 
     def _ensure(self):
         if getattr(self, "_sess", None) is None:
@@ -1159,22 +1318,30 @@ class QbittorrentProvider:
         """Probe qBittorrent. If the cached session is stale (qbit restarted /
         cookie expired), drop it and rebuild so we don't silently fall back to
         demo data until the whole service is restarted."""
-        for _ in range(2):
-            try:
-                s = self._ensure()
-                if s.get(f"{self.base}/api/v2/app/version", timeout=4).status_code == 200:
-                    return True
-                self._sess = None            # stale/reused connection -> force re-login
-            except Exception:
-                self._sess = None
+        with self._session_lock:
+            for _ in range(2):
+                try:
+                    s = self._ensure()
+                    if s.get(f"{self.base}/api/v2/app/version", timeout=4).status_code == 200:
+                        return True
+                    self._sess = None        # stale/reused connection -> force re-login
+                except Exception:
+                    self._sess = None
         return False
 
     def torrent_details(self) -> list[dict]:
-        try:
-            s = self._ensure()
-            return s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
-        except Exception:
-            return []
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                response = s.get(f"{self.base}/api/v2/torrents/info", timeout=5)
+                if response.status_code >= 300:
+                    raise RuntimeError(f"qbit info HTTP {response.status_code}")
+                data = response.json() or []
+                self._last_details_ok = isinstance(data, list)
+                return data if isinstance(data, list) else []
+            except Exception:
+                self._last_details_ok = False
+                return []
 
     def torrents(self):
         out = []
@@ -1205,12 +1372,13 @@ class QbittorrentProvider:
 
     def peers(self, hash_):
         """当前连到这个种子的对等方（谁在从我们这里下载）。"""
-        try:
-            s = self._ensure()
-            r = s.get(f"{self.base}/api/v2/sync/torrentPeers", params={"hash": hash_}, timeout=5)
-            d = r.json()
-        except Exception:
-            return {"peers": [], "connected": 0, "seeds": 0, "leechers": 0}
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                r = s.get(f"{self.base}/api/v2/sync/torrentPeers", params={"hash": hash_}, timeout=5)
+                d = r.json()
+            except Exception:
+                return {"peers": [], "connected": 0, "seeds": 0, "leechers": 0}
         out = []
         for ip, p in (d.get("peers") or {}).items():
             out.append({
@@ -1233,66 +1401,70 @@ class QbittorrentProvider:
         }
 
     def add(self, magnet: str, save_path: str = "", tag: str = "") -> bool:
-        try:
-            if not magnet.startswith("magnet:"):
+        with self._session_lock:
+            try:
+                if not magnet.startswith("magnet:"):
+                    return False
+                s = self._ensure()
+                data = {"urls": magnet}
+                if save_path:
+                    data["savepath"] = save_path
+                if tag:
+                    data["tags"] = tag
+                r = s.post(f"{self.base}/api/v2/torrents/add", data=data, timeout=6)
+                return r.status_code in (200, 201)   # 409=已存在/无效 -> False
+            except Exception:
                 return False
-            s = self._ensure()
-            data = {"urls": magnet}
-            if save_path:
-                data["savepath"] = save_path
-            if tag:
-                data["tags"] = tag
-            r = s.post(f"{self.base}/api/v2/torrents/add", data=data, timeout=6)
-            return r.status_code in (200, 201)   # 409=已存在/无效 -> False
-        except Exception:
-            return False
 
     def add_file(self, filename: str, content: bytes, save_path: str = "", tag: str = "") -> bool:
         """Forward one .torrent file to qBittorrent's multipart upload endpoint."""
-        try:
-            if not filename.lower().endswith(".torrent") or not content:
+        with self._session_lock:
+            try:
+                if not filename.lower().endswith(".torrent") or not content:
+                    return False
+                s = self._ensure()
+                data = {}
+                if save_path:
+                    data["savepath"] = save_path
+                if tag:
+                    data["tags"] = tag
+                r = s.post(
+                    f"{self.base}/api/v2/torrents/add",
+                    files={"torrents": (filename, content, "application/x-bittorrent")},
+                    data=data or None,
+                    timeout=15,
+                )
+                return r.status_code in (200, 201)
+            except Exception:
                 return False
-            s = self._ensure()
-            data = {}
-            if save_path:
-                data["savepath"] = save_path
-            if tag:
-                data["tags"] = tag
-            r = s.post(
-                f"{self.base}/api/v2/torrents/add",
-                files={"torrents": (filename, content, "application/x-bittorrent")},
-                data=data or None,
-                timeout=15,
-            )
-            return r.status_code in (200, 201)
-        except Exception:
-            return False
 
     def action(self, hash_, action):
-        try:
-            # qBittorrent 5.x removed pause/resume -> use stop/start
-            cmd = {"remove": "delete", "pause": "stop", "resume": "start"}.get(action)
-            if not cmd:
+        with self._session_lock:
+            try:
+                # qBittorrent 5.x removed pause/resume -> use stop/start
+                cmd = {"remove": "delete", "pause": "stop", "resume": "start"}.get(action)
+                if not cmd:
+                    return False
+                s = self._ensure()
+                # qbit 5.x delete REQUIRES deleteFiles param (400 "Missing required parameters" without it)
+                # 仅移除任务、保留已下载文件（前端提示语如此），故 deleteFiles=false
+                data = {"hashes": hash_, "deleteFiles": "false"} if cmd == "delete" else {"hashes": hash_}
+                r = s.post(f"{self.base}/api/v2/torrents/{cmd}", data=data, timeout=5)
+                return r.status_code == 200          # 404/400=hash 无效 -> False
+            except Exception:
                 return False
-            s = self._ensure()
-            # qbit 5.x delete REQUIRES deleteFiles param (400 "Missing required parameters" without it)
-            # 仅移除任务、保留已下载文件（前端提示语如此），故 deleteFiles=false
-            data = {"hashes": hash_, "deleteFiles": "false"} if cmd == "delete" else {"hashes": hash_}
-            r = s.post(f"{self.base}/api/v2/torrents/{cmd}", data=data, timeout=5)
-            return r.status_code == 200          # 404/400=hash 无效 -> False
-        except Exception:
-            return False
 
 
     _UP_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP", "stoppedUP", "pausedUP"}
 
     def seeding_files(self) -> set[str]:
         """做种相关（含暂停）torrent 引用的宿主文件绝对路径集合，供媒资库毁种提示。"""
-        try:
-            s = self._ensure()
-            info = s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
-        except Exception:
-            return set()
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                info = s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
+            except Exception:
+                return set()
         base = os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")
         out = set()
         for t in info:
@@ -1301,10 +1473,11 @@ class QbittorrentProvider:
             h = t.get("hash", "")
             if not h:
                 continue
-            try:
-                files = s.get(f"{self.base}/api/v2/torrents/files", params={"hash": h}, timeout=5).json() or []
-            except Exception:
-                continue
+            with self._session_lock:
+                try:
+                    files = s.get(f"{self.base}/api/v2/torrents/files", params={"hash": h}, timeout=5).json() or []
+                except Exception:
+                    continue
             sp = (t.get("save_path") or "/downloads").rstrip("/")
             rel_dir = sp[len("/downloads"):].lstrip("/") if sp.startswith("/downloads") else ""
             for f in files:
@@ -1317,11 +1490,12 @@ class QbittorrentProvider:
 
     def seed_map(self) -> dict[str, str]:
         """宿主文件绝对路径 -> 所属做种种子 hash，供媒资库联动移动。"""
-        try:
-            s = self._ensure()
-            info = s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
-        except Exception:
-            return {}
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                info = s.get(f"{self.base}/api/v2/torrents/info", timeout=5).json() or []
+            except Exception:
+                return {}
         base = os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")
         out = {}
         for t in info:
@@ -1330,10 +1504,11 @@ class QbittorrentProvider:
             h = t.get("hash", "")
             if not h:
                 continue
-            try:
-                files = s.get(f"{self.base}/api/v2/torrents/files", params={"hash": h}, timeout=5).json() or []
-            except Exception:
-                continue
+            with self._session_lock:
+                try:
+                    files = s.get(f"{self.base}/api/v2/torrents/files", params={"hash": h}, timeout=5).json() or []
+                except Exception:
+                    continue
             sp = (t.get("save_path") or "/downloads").rstrip("/")
             rel_dir = sp[len("/downloads"):].lstrip("/") if sp.startswith("/downloads") else ""
             for f in files:
@@ -1345,13 +1520,14 @@ class QbittorrentProvider:
 
     def move_seed(self, hash_: str, location: str) -> bool:
         """整种子移动到容器内目录（qbit 自己搬文件并更新路径，保持做种）。"""
-        try:
-            s = self._ensure()
-            r = s.post(f"{self.base}/api/v2/torrents/setLocation",
-                       data={"hashes": hash_, "location": location}, timeout=10)
-            return r.status_code == 200
-        except Exception:
-            return False
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                r = s.post(f"{self.base}/api/v2/torrents/setLocation",
+                           data={"hashes": hash_, "location": location}, timeout=10)
+                return r.status_code == 200
+            except Exception:
+                return False
 
 class JellyfinProvider:
     name = "jellyfin"
@@ -1496,6 +1672,7 @@ def torrent_destination_for_tags(tags: str) -> dict | None:
             entry = data.get(tag)
             if entry:
                 return {
+                    "id": tag,
                     "remote": entry.get("remote", ""),
                     "path": entry.get("path", ""),
                     "status": entry.get("status", "waiting"),
@@ -1544,6 +1721,27 @@ def discard_torrent_destination(marker: str) -> None:
             _save_torrent_destinations(data)
 
 
+def retry_torrent_destination(marker: str) -> tuple[bool, str]:
+    """Put a failed torrent-to-remote transfer back in the scheduler queue."""
+    marker = str(marker or "").strip()
+    if not re.fullmatch(r"aurora-remote-[0-9a-f]{16}", marker):
+        return False, "转存任务编号无效"
+    with _TORRENT_DEST_LOCK:
+        data = _load_torrent_destinations()
+        entry = data.get(marker)
+        if not entry:
+            return False, "转存任务不存在"
+        if entry.get("status") != "error":
+            return False, "当前任务不需要重试"
+        entry["status"] = "waiting"
+        entry["detail"] = ""
+        entry["transfer_id"] = ""
+        entry["finished"] = 0
+        _save_torrent_destinations(data)
+    _log("torrent.remote.retry", entry.get("name") or marker)
+    return True, ""
+
+
 def _torrent_host_path(torrent: dict) -> str:
     """Map qBittorrent's container path back to Aurora's host download path."""
     base = os.path.realpath(os.path.expanduser(
@@ -1568,52 +1766,91 @@ def _process_torrent_destinations() -> None:
     if not _qbit.available() or not _rclone.available():
         return
     details = _qbit.torrent_details()
+    # An empty result after a failed qBittorrent request must not be treated as
+    # proof that every tracked torrent was deleted.
+    if not getattr(_qbit, "_last_details_ok", True):
+        return
     with _TORRENT_DEST_LOCK:
         destinations = _load_torrent_destinations()
     if not destinations:
         return
     jobs = {str(job.get("id")): job for job in _rclone.transfers()}
+    now = int(time.time())
+    by_marker = {}
+    for torrent in details:
+        for tag in _tag_list(torrent.get("tags", "")):
+            if tag in destinations:
+                by_marker[tag] = torrent
     changed = False
-    for marker, entry in destinations.items():
+    for marker, entry in list(destinations.items()):
         status = str(entry.get("status") or "waiting")
         if status == "done":
             continue
         if status == "uploading":
             job = jobs.get(str(entry.get("transfer_id") or ""))
+            if not job and entry.get("transfer_id"):
+                get_transfer = getattr(_rclone, "get_transfer", None)
+                if get_transfer:
+                    job = get_transfer(str(entry.get("transfer_id")))
             if job and job.get("status") == "done":
                 entry["status"] = "done"
                 entry["detail"] = ""
-                entry["finished"] = int(time.time())
+                entry["finished"] = now
                 changed = True
                 continue
             if job and job.get("status") == "error":
                 entry["status"] = "error"
                 entry["detail"] = job.get("detail") or "网盘上传失败"
-                entry["finished"] = int(time.time())
+                entry["finished"] = now
+                changed = True
+                continue
+            if job and job.get("status") == "canceled":
+                entry["status"] = "error"
+                entry["detail"] = "网盘上传已取消，请点击重试"
+                entry["finished"] = now
                 changed = True
                 continue
             if job:
                 continue
-            # The in-memory rclone job may have disappeared after a restart or cleanup.
-            if entry.get("local_path"):
-                entry["status"] = "waiting"
-                entry["transfer_id"] = ""
+            # Never silently return to waiting: doing so can upload a partially
+            # completed remote object a second time after a service restart.
+            entry["status"] = "error"
+            entry["detail"] = "网盘转存任务状态已丢失，请点击重试"
+            entry["finished"] = now
+            changed = True
+            continue
+
+        torrent = by_marker.get(marker)
+        if not torrent:
+            try:
+                age = max(0, now - int(entry.get("created") or now))
+            except (TypeError, ValueError):
+                age = 0
+            if age >= _TORRENT_DEST_ORPHAN_GRACE and status != "orphaned":
+                entry["status"] = "orphaned"
+                entry["detail"] = "qBittorrent 任务已不存在，请确认任务后再重试"
+                entry["finished"] = now
+                changed = True
+            elif status == "orphaned" and age >= _TORRENT_DEST_RETENTION:
+                destinations.pop(marker, None)
                 changed = True
             continue
-        if status == "error":
+
+        for key, value in (("hash", torrent.get("hash", "")),
+                           ("name", torrent.get("name", "")),
+                           ("last_seen", now)):
+            if entry.get(key) != value:
+                entry[key] = value
+                changed = True
+        if status in ("error", "orphaned"):
             continue
-        torrent = next((item for item in details if marker in _tag_list(item.get("tags", ""))), None)
-        if not torrent:
-            continue
-        entry["hash"] = torrent.get("hash", "")
-        entry["name"] = torrent.get("name", "")
         if float(torrent.get("progress", 0) or 0) < 0.999999:
-            changed = True
             continue
         local_path = _torrent_host_path(torrent)
         if not local_path or not os.path.exists(local_path):
-            entry["detail"] = "等待本地下载文件就绪"
-            changed = True
+            if entry.get("detail") != "等待本地下载文件就绪":
+                entry["detail"] = "等待本地下载文件就绪"
+                changed = True
             continue
         item_name = os.path.basename(local_path.rstrip(os.sep))
         if not item_name:
@@ -1638,6 +1875,7 @@ def _process_torrent_destinations() -> None:
         else:
             entry["status"] = "error"
             entry["detail"] = detail or "网盘上传失败"
+        entry["finished"] = 0 if ok else now
         changed = True
     if changed:
         with _TORRENT_DEST_LOCK:

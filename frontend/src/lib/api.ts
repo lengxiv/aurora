@@ -34,9 +34,10 @@ export interface Torrent {
   conns: number
   hash: string
   destination?: {
+    id: string
     remote: string
     path: string
-    status: 'waiting' | 'uploading' | 'done' | 'error'
+    status: 'waiting' | 'uploading' | 'done' | 'error' | 'orphaned'
     detail: string
   }
 }
@@ -283,6 +284,18 @@ export async function batchAction(ids: string[], action: string) {
   } catch {
     return { done: 0, failed: 0 }
   }
+}
+
+export async function retryTorrentDestination(id: string) {
+  try {
+    const r = await fetch('/api/torrents/destination/retry', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ id }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const { detail } = await responseDetail(r, '重试失败')
+    return { ok: r.ok, detail }
+  } catch { return { ok: false, detail: '网络请求失败' } }
 }
 
 export async function fetchTorrentPeers(hash: string): Promise<TorrentPeers | null> {

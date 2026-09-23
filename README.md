@@ -65,7 +65,7 @@ cd /opt/aurora/backend
 - Aurora、qBittorrent WebUI、Jellyfin 管理端口均只监听 `127.0.0.1`，公网请求经 Cloudflare 和 Nginx 进入；BT 对等端口 `39876` 保持公开。
 - 登录使用服务端会话，支持在设置页查看和撤销其他活动会话。修改密码要求验证当前密码，并使其他会话立即失效。
 - 媒资删除先移动到同磁盘隐藏目录 `.aurora-trash`；可在媒资库的「回收站」恢复或彻底删除，同名路径冲突时拒绝覆盖。
-- `aurora-backup.timer` 每日约 04:20 自动备份配置和元数据到 `/root/backup/aurora`，保留最近 14 份。下载内容和媒体文件不进入配置归档。
+- `aurora-backup.timer` 每日约 04:20 自动备份配置、元数据、rclone 配置和相关服务文件到 `/var/backups/aurora`，保留最近 14 份。下载内容和媒体文件不进入配置归档。
 - `compose.yaml` 固化 qBittorrent/Jellyfin 的回环管理端口和持久化目录。维护容器时必须保留 `/opt/aurora/qbit`、`/opt/aurora/jellyfin` 及下载目录。
 
 ## 数据说明（适配器架构）
@@ -81,6 +81,6 @@ cd /opt/aurora/backend
 
 任一路真实源探测不到 → 该模块自动回退演示数据。`GET /api/sources` 返回每模块当前来源（`system`/`rclone`/`qbittorrent`/`jellyfin`/`demo`），方便确认对接状态。
 
-运行状态路径可通过 `AURORA_STATE_DIR` 和 `AURORA_DATA_DIR` 配置，默认分别使用后端目录和 `backend/data`。生产环境建议把这些目录放在源码目录之外。
+运行状态路径可通过 `AURORA_STATE_DIR` 和 `AURORA_DATA_DIR` 配置，默认分别使用后端目录和 `backend/data`。生产环境建议把这些目录放在源码目录之外；生产 rclone 配置默认位于 `/var/lib/aurora/rclone/rclone.conf`，不应放进 Git。
 
 **以后接入**：把对应服务跑起来（rclone `--rc` 开 5572、qBittorrent WebUI、Jellyfin），必要时设环境变量，后端重启即自动切真，前端零改动。

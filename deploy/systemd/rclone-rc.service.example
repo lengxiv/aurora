@@ -8,11 +8,12 @@ Type=simple
 User=aurora
 Group=aurora
 EnvironmentFile=/etc/rclone-rc.env
-ExecStart=/usr/bin/rclone rcd --rc-addr 127.0.0.1:5572 --rc-user=${RCLONE_RC_USER} --rc-pass=${RCLONE_RC_PASS} --config /var/lib/aurora/rclone/rclone.conf
+Environment=HOME=/var/lib/aurora
+ExecStart=/usr/bin/rclone rcd --rc-addr 127.0.0.1:5572 --config /var/lib/aurora/rclone/rclone.conf --log-level ERROR
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/aurora/rclone /var/lib/aurora/media
+ReadWritePaths=/var/lib/aurora/rclone /var/lib/aurora/.cache

@@ -34,8 +34,11 @@ npm --version
 ## 2. 创建运行用户和目录
 
 ```bash
+if ! getent group aurora >/dev/null 2>&1; then
+    groupadd --system aurora
+fi
 if ! id aurora >/dev/null 2>&1; then
-    useradd --system --home-dir /var/lib/aurora --create-home --shell /usr/sbin/nologin aurora
+    useradd --system --gid aurora --home-dir /var/lib/aurora --create-home --shell /usr/sbin/nologin aurora
 fi
 install -d -o aurora -g aurora -m 750 /var/lib/aurora/data
 install -d -o aurora -g aurora -m 750 /srv/aurora/media
@@ -159,6 +162,7 @@ curl -fsS http://127.0.0.1:8787/api/sources
 ```bash
 apt install -y rclone
 install -d -o aurora -g aurora -m 700 /var/lib/aurora/rclone
+install -d -o aurora -g aurora -m 700 /var/lib/aurora/.cache
 runuser -u aurora -- rclone config --config /var/lib/aurora/rclone/rclone.conf
 editor /etc/rclone-rc.env
 chmod 600 /etc/rclone-rc.env
@@ -185,7 +189,7 @@ rclone RC 只监听 127.0.0.1，不要将 5572 直接暴露到公网，也不要
 
 ## 10. 安装每日备份
 
-备份脚本保存账号文件、运行状态、应用配置和必要的服务配置，不保存下载内容和媒体文件。
+备份脚本保存账号文件、运行状态、应用配置、rclone 凭据配置和必要的服务配置，不保存下载内容和媒体文件。归档文件权限为 600，恢复时必须继续按敏感配置处理。
 
 ```bash
 install -d -m 750 /opt/aurora/qbit/config /opt/aurora/qbit/downloads /opt/aurora/jellyfin/config
@@ -226,3 +230,5 @@ curl -fsS http://127.0.0.1:8787/api/health
 ```
 
 如果首页返回登录跳转但 API 健康检查正常，说明后端已经运行，应继续检查 Nginx、DNS 和证书，而不是直接公开 8787 端口。
+
+如果现网使用旧的 `rclone-rcd.service` 单元，也可以继续使用；更新备份脚本后它会同时归档 `rclone-rcd.service` 和文档中的 `rclone-rc.service`（存在才归档）。建议后续将 RC 密码放入 `/etc/rclone-rc.env`，不要直接写入 systemd `ExecStart` 命令行。

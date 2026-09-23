@@ -220,6 +220,87 @@ class TorrentDestinationTests(unittest.TestCase):
                 else:
                     os.environ["AURORA_LOCAL_MOUNT"] = old_mount
 
+    def test_missing_rclone_job_does_not_requeue_upload(self):
+        old_dest_file = providers._TORRENT_DEST_FILE
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        old_qbit = providers._qbit
+        old_rclone = providers._rclone
+
+        class FakeQbit:
+            _last_details_ok = True
+
+            def available(self):
+                return True
+
+            def torrent_details(self):
+                return [{
+                    "hash": "abc", "name": "release", "tags": "aurora-remote-test",
+                    "progress": 1.0, "content_path": "/downloads/release",
+                }]
+
+        class FakeRclone:
+            def available(self):
+                return True
+
+            def transfers(self):
+                return []
+
+            def upload_local(self, *_args):
+                raise AssertionError("a missing job must not start a duplicate upload")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                providers._TORRENT_DEST_FILE = str(Path(td) / "destinations.json")
+                os.environ["AURORA_LOCAL_MOUNT"] = td
+                source = Path(td) / "release"
+                source.mkdir()
+                Path(providers._TORRENT_DEST_FILE).write_text(json.dumps({
+                    "aurora-remote-test": {
+                        "remote": "media", "path": "movies", "status": "uploading",
+                        "detail": "", "hash": "abc", "name": "release",
+                        "local_path": str(source), "transfer_id": "job-lost",
+                        "created": int(time.time()), "finished": 0,
+                    },
+                }))
+                providers._qbit = FakeQbit()
+                providers._rclone = FakeRclone()
+
+                providers._process_torrent_destinations()
+                state = json.loads(Path(providers._TORRENT_DEST_FILE).read_text())["aurora-remote-test"]
+                self.assertEqual(state["status"], "error")
+                self.assertIn("状态已丢失", state["detail"])
+            finally:
+                providers._TORRENT_DEST_FILE = old_dest_file
+                providers._qbit = old_qbit
+                providers._rclone = old_rclone
+                if old_mount is None:
+                    os.environ.pop("AURORA_LOCAL_MOUNT", None)
+                else:
+                    os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+    def test_failed_torrent_destination_can_be_retried(self):
+        old_dest_file = providers._TORRENT_DEST_FILE
+        old_rclone = providers._rclone
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                providers._TORRENT_DEST_FILE = str(Path(td) / "destinations.json")
+                Path(providers._TORRENT_DEST_FILE).write_text(json.dumps({
+                    "aurora-remote-0123456789abcdef": {
+                        "remote": "media", "path": "movies", "status": "error",
+                        "detail": "failed", "transfer_id": "job-1",
+                    },
+                }))
+                providers._rclone = Mock()
+                ok, detail = providers.retry_torrent_destination("aurora-remote-0123456789abcdef")
+                self.assertTrue(ok)
+                self.assertEqual(detail, "")
+                state = json.loads(Path(providers._TORRENT_DEST_FILE).read_text())["aurora-remote-0123456789abcdef"]
+                self.assertEqual(state["status"], "waiting")
+                self.assertEqual(state["transfer_id"], "")
+            finally:
+                providers._TORRENT_DEST_FILE = old_dest_file
+                providers._rclone = old_rclone
+
 
 class TorrentStateTests(unittest.TestCase):
     def test_stalled_download_is_distinguished_from_active_download(self):
@@ -227,6 +308,15 @@ class TorrentStateTests(unittest.TestCase):
 
 
 class RcloneTests(unittest.TestCase):
+    def setUp(self):
+        self._old_transfer_file = providers._RCLONE_TRANSFER_FILE
+        self._transfer_dir = tempfile.TemporaryDirectory()
+        providers._RCLONE_TRANSFER_FILE = str(Path(self._transfer_dir.name) / "transfers.json")
+
+    def tearDown(self):
+        providers._RCLONE_TRANSFER_FILE = self._old_transfer_file
+        self._transfer_dir.cleanup()
+
     def test_s3_provider_is_canonicalized_for_rclone(self):
         rclone = providers.RcloneProvider()
         rclone._req = Mock(return_value={})
@@ -280,6 +370,22 @@ class RcloneTests(unittest.TestCase):
         rclone._req.assert_called_once_with(
             "/config/get", timeout=5.0, method="POST", data="name=r2",
         )
+
+    def test_s3_torrent_destination_requires_bucket_when_not_configured(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(side_effect=[{"remotes": ["r2:"]}, {"type": "s3"}])
+
+        old_buckets_file = providers._RCLONE_BUCKETS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._RCLONE_BUCKETS_FILE = str(Path(td) / "buckets.json")
+            try:
+                ok, path, detail = rclone.validate_destination("r2", "")
+            finally:
+                providers._RCLONE_BUCKETS_FILE = old_buckets_file
+
+        self.assertFalse(ok)
+        self.assertEqual(path, "")
+        self.assertEqual(detail, "S3/R2 目标请填写 bucket 名称或目录")
 
     def test_fixed_s3_bucket_is_used_as_remote_root(self):
         rclone = providers.RcloneProvider()
@@ -497,7 +603,7 @@ class RcloneTests(unittest.TestCase):
         self.assertEqual(payload["srcRemote"], "clip.mp4")
         self.assertTrue(payload["_async"])
 
-    def test_upload_transfer_is_not_retryable_after_staging_cleanup(self):
+    def test_failed_upload_keeps_staging_file_for_retry(self):
         rclone = providers.RcloneProvider()
         rclone._req = Mock(return_value={"jobid": 44})
         with tempfile.TemporaryDirectory() as td:
@@ -510,14 +616,45 @@ class RcloneTests(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertEqual(detail, "")
                 internal = rclone._transfer_jobs[job["id"]]
-                self.assertFalse(internal["retryable"])
+                self.assertTrue(internal["retryable"])
+                self.assertEqual(internal["cleanup"], str(stage))
                 internal["status"] = "error"
+                rclone._req.return_value = {"jobid": 45}
                 ok, retry, detail = rclone.retry_transfer(job["id"])
-                self.assertFalse(ok)
-                self.assertIsNone(retry)
-                self.assertEqual(detail, "该任务无法重试")
+                self.assertTrue(ok)
+                self.assertIsNotNone(retry)
+                self.assertEqual(detail, "")
             finally:
                 providers._DATA_DIR = old_data_dir
+
+    def test_running_transfers_are_not_evicted_by_history_limit(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"finished": False, "transferring": []})
+        for index in range(providers._RCLONE_TRANSFER_LIMIT + 1):
+            rclone._transfer_jobs[f"job-{index}"] = {
+                "id": f"job-{index}", "rcloneJobId": index, "status": "running",
+                "action": "copy", "label": "active", "progress": None,
+                "bytes": 0, "total": None, "speed": 0, "detail": "",
+                "created": index, "finished": 0, "cleanup": "", "retryable": True,
+                "request": {"endpoint": "/sync/copy", "payload": {}},
+            }
+
+        jobs = rclone.transfers()
+
+        self.assertEqual(len(jobs), providers._RCLONE_TRANSFER_LIMIT + 1)
+        self.assertEqual(len(rclone._transfer_jobs), providers._RCLONE_TRANSFER_LIMIT + 1)
+
+    def test_transfer_journal_is_restored_after_provider_restart(self):
+        rclone = providers.RcloneProvider()
+        rclone._req = Mock(return_value={"jobid": 77})
+        ok, job, detail = rclone.copy_remote("media", "clip.mp4", "archive", "backup", False, "copy")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+        restored = providers.RcloneProvider()
+
+        self.assertIn(job["id"], restored._transfer_jobs)
+        self.assertEqual(restored._transfer_jobs[job["id"]]["rcloneJobId"], 77)
 
     def test_remote_file_operations_reject_unsafe_paths_without_request(self):
         rclone = providers.RcloneProvider()

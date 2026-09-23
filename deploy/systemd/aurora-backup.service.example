@@ -8,4 +8,8 @@ Environment=AURORA_STATE_DIR=/var/lib/aurora
 Environment=AURORA_DATA_DIR=/var/lib/aurora/data
 Environment=AURORA_BACKUP_ROOT=/var/backups/aurora
 Environment=AURORA_NGINX_CONF=/etc/nginx/sites-enabled/aurora.conf
+Environment=AURORA_RCLONE_CONFIG=/var/lib/aurora/rclone/rclone.conf
+Environment=AURORA_RCLONE_ENV=/etc/rclone-rc.env
+Environment=AURORA_ENV_FILE=/etc/aurora.env
+Environment=AURORA_RCLONE_SERVICE=/etc/systemd/system/rclone-rc.service
 ExecStart=/opt/aurora/scripts/backup.sh

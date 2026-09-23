@@ -390,6 +390,14 @@ def torrent_action(action: str, body: TorrentAction, _user: str = Depends(requir
     return {"ok": ok, "mode": "demo" if ok else ""}
 
 
+@app.post("/api/torrents/destination/retry")
+def torrent_destination_retry(body: TorrentAction, _user: str = Depends(require_auth)):
+    ok, detail = providers.retry_torrent_destination(body.id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
 @app.get("/api/torrents/peers")
 def torrent_peers(hash: str, _user: str = Depends(require_auth)):
     """某个种子的当前对等方（谁在从我们这里下载）。"""
