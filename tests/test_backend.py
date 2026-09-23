@@ -262,6 +262,115 @@ class QbitQueueTests(unittest.TestCase):
             ))
 
 
+class QbitAdvancedTests(unittest.TestCase):
+    def test_torrent_detail_maps_files_and_trackers(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        info = Mock(status_code=200)
+        info.json.return_value = [{
+            "hash": "a" * 40, "name": "release", "state": "stalledUP",
+            "progress": 1, "size": 1024, "ratio": 2.5, "save_path": "/downloads/movies",
+            "tags": "movie,aurora-remote-deadbeefdeadbeef", "web_ui_password": "secret",
+        }]
+        files = Mock(status_code=200)
+        files.json.return_value = [{"index": 0, "name": "movie.mkv", "size": 1024, "progress": 1, "priority": 6}]
+        trackers = Mock(status_code=200)
+        trackers.json.return_value = [{"url": "https://tracker.example/announce", "status": 2, "num_peers": 3}]
+        session.get.side_effect = [info, files, trackers]
+        qbit._sess = session
+
+        ok, detail, error = qbit.torrent_detail("a" * 40)
+
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        self.assertEqual(detail["files"][0]["name"], "movie.mkv")
+        self.assertEqual(detail["trackers"][0]["num_peers"], 3)
+        self.assertNotIn("web_ui_password", detail)
+
+    def test_advanced_action_uses_allowlisted_endpoint_and_payload(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.return_value = Mock(status_code=200)
+        qbit._sess = session
+
+        ok, detail = qbit.advanced_action("b" * 40, "set_file_priority", file_ids=[0, 2], priority=6)
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(session.post.call_args.args[0].rsplit("/", 1)[-1], "filePrio")
+        self.assertEqual(session.post.call_args.kwargs["data"], {
+            "hashes": "b" * 40, "id": "0,2", "priority": "6",
+        })
+
+    def test_system_tags_cannot_be_created_or_deleted(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        qbit._sess = session
+
+        ok, detail = qbit.create_tags(["aurora-protected"])
+        self.assertFalse(ok)
+        self.assertIn("系统标签", detail)
+        session.post.assert_not_called()
+
+
+class TorrentPolicyTests(unittest.TestCase):
+    def test_policy_preview_and_apply_pause_matching_torrent(self):
+        old_settings = providers._SETTINGS_FILE
+        old_notify = providers._POLICY_NOTIFY_FILE
+        old_qbit = providers._qbit
+        with tempfile.TemporaryDirectory() as td:
+            providers._SETTINGS_FILE = str(Path(td) / "settings.json")
+            providers._POLICY_NOTIFY_FILE = str(Path(td) / "policy-notify.json")
+
+            class FakeQbit:
+                _last_details_ok = True
+                _UP_STATES = providers.QbittorrentProvider._UP_STATES
+
+                def __init__(self):
+                    self.actions = []
+
+                def available(self):
+                    return True
+
+                def torrent_details(self):
+                    return [{
+                        "hash": "c" * 40, "name": "old-release", "state": "stalledUP",
+                        "category": "movies", "tags": "", "ratio": 2.0,
+                        "seeding_time": 7200, "inactive_seeding_time": 0,
+                    }]
+
+                def advanced_action(self, hash_, action, **kwargs):
+                    self.actions.append((hash_, action, kwargs))
+                    return True, ""
+
+            fake = FakeQbit()
+            providers._qbit = fake
+            providers.save_torrent_policies({
+                "enabled": False,
+                "interval": 300,
+                "rules": [{
+                    "id": "policy-one", "name": "电影两小时", "category": "movies", "enabled": True,
+                    "action": "pause", "min_seed_minutes": 60, "max_seed_minutes": 90,
+                    "max_inactive_minutes": -1, "max_ratio": -1,
+                }],
+            })
+
+            ok, preview, detail = providers.preview_torrent_policies()
+            self.assertTrue(ok)
+            self.assertEqual(detail, "")
+            self.assertEqual(len(preview["items"]), 1)
+            self.assertEqual(preview["items"][0]["action"], "pause")
+
+            ok, result, detail = providers.apply_torrent_policies(confirm=True)
+            self.assertTrue(ok)
+            self.assertEqual(detail, "")
+            self.assertEqual(result["applied"], 1)
+            self.assertEqual(fake.actions[0][1], "pause")
+        providers._SETTINGS_FILE = old_settings
+        providers._POLICY_NOTIFY_FILE = old_notify
+        providers._qbit = old_qbit
+
+
 class TorrentDestinationTests(unittest.TestCase):
     def test_completed_torrent_starts_and_finishes_remote_upload(self):
         old_dest_file = providers._TORRENT_DEST_FILE

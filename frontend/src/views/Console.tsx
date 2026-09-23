@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
-import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search, RotateCcw, ChevronUp, Folder } from 'lucide-react'
-import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneFiles, fetchRcloneRemotes, retryTorrentDestination, torrentAction, batchAction, type MediaDir, type RcloneEntry, type RcloneRemote, type Torrent, type MountStatus } from '../lib/api'
+import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search, RotateCcw, ChevronUp, Folder, Settings2, Info, ListRestart, Zap, ArrowUp, ArrowDown, ChevronsUp, ChevronsDown, FileText, Tags, MapPin, Save, CheckCircle2 } from 'lucide-react'
+import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneFiles, fetchRcloneRemotes, retryTorrentDestination, torrentAction, batchAction, fetchTorrentDetail, fetchTorrentPeers, torrentAdvancedAction, fetchTorrentLabels, updateTorrentLabels, type MediaDir, type RcloneEntry, type RcloneRemote, type Torrent, type TorrentDetail, type QbitLabels, type TorrentPeers, type MountStatus } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -49,6 +49,20 @@ export default function ConsoleView() {
   const [msgBad, setMsgBad] = useState(false)
   const [q, setQ] = useState('')
   const [sel, setSel] = useState<Set<string>>(new Set())
+  const [labels, setLabels] = useState<QbitLabels | null>(null)
+  const [detailHash, setDetailHash] = useState('')
+  const [detail, setDetail] = useState<TorrentDetail | null>(null)
+  const [detailPeers, setDetailPeers] = useState<TorrentPeers | null>(null)
+  const [detailBusy, setDetailBusy] = useState(false)
+  const [detailActionBusy, setDetailActionBusy] = useState(false)
+  const [detailCategory, setDetailCategory] = useState('')
+  const [detailTags, setDetailTags] = useState('')
+  const [detailLocation, setDetailLocation] = useState('')
+  const [detailDownloadLimit, setDetailDownloadLimit] = useState(0)
+  const [detailUploadLimit, setDetailUploadLimit] = useState(0)
+  const [deleteFiles, setDeleteFiles] = useState(false)
+  const [addCategory, setAddCategory] = useState('')
+  const [addTags, setAddTags] = useState('')
   const totalReads = data.mounts.reduce((a, m) => a + (m.reads || 0), 0)
   const totalUsed = data.mounts.reduce((a, m) => a + m.usedGb, 0)
   const totalCap = data.mounts.reduce((a, m) => a + m.capGb, 0)
@@ -94,6 +108,7 @@ export default function ConsoleView() {
   useEffect(() => {
     // Preload remotes so the target selector is ready when the dialog opens.
     void loadRcloneRemotes()
+    fetchTorrentLabels().then(setLabels)
   }, [])
 
   useEffect(() => {
@@ -111,7 +126,7 @@ export default function ConsoleView() {
     setOpen(true)
     setDirMsg('')
     setDirMsgBad(false)
-    void Promise.all([loadMediaDirs(), loadRcloneRemotes()])
+    void Promise.all([loadMediaDirs(), loadRcloneRemotes(), fetchTorrentLabels().then(setLabels)])
   }
 
   const closeAdd = () => {
@@ -133,6 +148,8 @@ export default function ConsoleView() {
     setRemoteBrowsePath('')
     setRemoteDirs([])
     setRemotePathMsg('')
+    setAddCategory('')
+    setAddTags('')
   }
 
   const chooseMode = (mode: 'magnet' | 'file') => {
@@ -195,9 +212,10 @@ export default function ConsoleView() {
     setBusy(true); setMsg(''); setMsgBad(false)
     const remote = targetMode === 'remote' ? targetRemote : ''
     const remotePath = targetMode === 'remote' ? targetRemotePath.trim() : ''
+    const userTags = addTags.split(',').map((item) => item.trim()).filter(Boolean)
     const r = addMode === 'magnet'
-      ? await addTorrent(magnet.trim(), savePath, remote, remotePath)
-      : await addTorrentFile(torrentFile!, savePath, remote, remotePath)
+      ? await addTorrent(magnet.trim(), savePath, remote, remotePath, addCategory, userTags)
+      : await addTorrentFile(torrentFile!, savePath, remote, remotePath, addCategory, userTags)
     const target = targetMode === 'remote'
       ? `完成后上传到 ${remote}:${remotePath || '/'}`
       : `本地 · ${savePath || '下载根目录'}`
@@ -210,8 +228,62 @@ export default function ConsoleView() {
     setBusy(false)
   }
 
+  const openDetail = async (hash: string) => {
+    setDetailHash(hash)
+    setDetail(null)
+    setDetailPeers(null)
+    setDetailBusy(true)
+    setDeleteFiles(false)
+    const [next, peers] = await Promise.all([fetchTorrentDetail(hash), fetchTorrentPeers(hash)])
+    if (next) {
+      setDetail(next)
+      setDetailPeers(peers)
+      setDetailCategory(next.category || '')
+      setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
+      setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
+      setDetailDownloadLimit(Math.round((next.download_limit || 0) / 1024))
+      setDetailUploadLimit(Math.round((next.upload_limit || 0) / 1024))
+    } else toast('读取任务详情失败', 'bad')
+    setDetailBusy(false)
+  }
+
+  const refreshDetail = async () => {
+    if (!detailHash) return
+    const [next, peers] = await Promise.all([fetchTorrentDetail(detailHash), fetchTorrentPeers(detailHash)])
+    if (next) {
+      setDetail(next)
+      setDetailPeers(peers)
+      setDetailCategory(next.category || '')
+      setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
+      setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
+      setDetailDownloadLimit(Math.round((next.download_limit || 0) / 1024))
+      setDetailUploadLimit(Math.round((next.upload_limit || 0) / 1024))
+    }
+  }
+
+  const runDetailAction = async (action: string, label: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; priority?: number } = {}) => {
+    if (!detailHash) return
+    if (action === 'remove' && !window.confirm(options.deleteFiles ? '将从 qBittorrent 移除任务并删除本地文件，无法恢复。继续吗？' : '仅从 qBittorrent 移除任务，已下载文件会保留。继续吗？')) return
+    setDetailActionBusy(true)
+    const r = await torrentAdvancedAction(detailHash, action, options)
+    setDetailActionBusy(false)
+    toast(r.ok ? `${label}成功` : `${label}失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+    if (r.ok && action === 'remove') setDetailHash('')
+    else if (r.ok) await refreshDetail()
+  }
+
+  const saveDetailLabels = async () => {
+    if (!detailHash) return
+    setDetailActionBusy(true)
+    const tags = detailTags.split(',').map((item) => item.trim()).filter(Boolean)
+    const r = await updateTorrentLabels(detailHash, detailCategory, tags)
+    setDetailActionBusy(false)
+    toast(r.ok ? '分类标签已保存' : `分类标签保存失败：${r.detail}`, r.ok ? 'ok' : 'bad')
+    if (r.ok && r.torrent) setDetail(r.torrent)
+  }
+
   const qn = q.trim().toLowerCase()
-  const torrents = data.torrents.filter((t) => !qn || t.name.toLowerCase().includes(qn))
+  const torrents = data.torrents.filter((t) => !qn || [t.name, t.category || '', ...(t.tags || [])].join(' ').toLowerCase().includes(qn))
 
   const doAction = async (id: string, action: string, label: string) => {
     if (action === 'remove' && !window.confirm('仅从 qBittorrent 移除任务，已下载文件会保留。继续吗？')) return
@@ -375,8 +447,12 @@ export default function ConsoleView() {
                         {t.state === 'error' ? <AlertTriangle size={15} className="text-rose-300" /> : <GaugeIcon size={15} />}
                       </div>
                       <div className="min-w-0">
-                        <div className="num truncate text-fg" title={t.name}>{t.name}</div>
+                        <button type="button" onClick={() => void openDetail(t.hash)} className="block max-w-full text-left num truncate text-fg hover:text-aurora-1" title="打开任务详情">{t.name}</button>
                         <div className="text-[11px] text-dim">S/L {t.seeders} · P/L {t.leechers}</div>
+                        {(t.category || (t.tags || []).some((item) => !item.startsWith('aurora-'))) && <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[10px] text-dim/80">
+                          {t.category && <span className="truncate">分类 · {t.category}</span>}
+                          {(t.tags || []).filter((item) => !item.startsWith('aurora-')).slice(0, 2).map((item) => <span key={item} className="truncate rounded border border-line bg-white/4 px-1.5 py-0.5">#{item}</span>)}
+                        </div>}
                         {t.destination && <div className={`flex min-w-0 items-center gap-1 text-[10px] ${t.destination.status === 'error' || t.destination.status === 'orphaned' ? 'text-rose-300' : 'text-aurora-1'}`} title={`${t.destination.remote}:${t.destination.path || '/'}`}>
                           <span className="min-w-0 truncate">网盘 · {t.destination.remote}:{t.destination.path || '/'} · {destinationStatus[t.destination.status] ?? t.destination.status}</span>
                           {t.destination.status === 'error' && <button onClick={() => retryDestination(t.destination!.id)} title="重试网盘转存" aria-label="重试网盘转存" className="grid h-5 w-5 shrink-0 place-items-center rounded text-rose-300 hover:bg-rose-400/10 hover:text-rose-200"><RotateCcw size={11} /></button>}
@@ -395,6 +471,7 @@ export default function ConsoleView() {
                   <td className="py-3.5 whitespace-nowrap text-right num text-dim">{fmtGb(t.sizeGb)}</td>
                   <td className="py-3.5 whitespace-nowrap text-right">
                     <div className="flex justify-end gap-1">
+                      <RowBtn onClick={() => void openDetail(t.hash)} title="任务详情"><Info size={12} /></RowBtn>
                       {t.state === 'paused'
                         ? <RowBtn onClick={() => doAction(t.id, 'resume', '恢复')} title="继续"><Play size={12} /></RowBtn>
                         : (t.state === 'downloading' || t.state === 'stalled' || t.state === 'queued' || t.state === 'seeding')
@@ -507,6 +584,19 @@ export default function ConsoleView() {
               )}
               {dirMsg && <div className={`mt-1.5 text-xs ${dirMsgBad ? 'text-rose-300' : 'text-aurora-1'}`}>{dirMsg}</div>}
             </div>
+            {labels?.online && <div className="mt-4 grid gap-2 sm:grid-cols-2">
+              <label className="block text-xs text-dim">分类
+                <select value={addCategory} onChange={(e) => setAddCategory(e.target.value)} disabled={busy}
+                  className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                  <option value="">默认分类</option>
+                  {labels.categories.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+                </select>
+              </label>
+              <label className="block text-xs text-dim">标签（逗号分隔）
+                <input value={addTags} onChange={(e) => setAddTags(e.target.value)} placeholder="电影, 高清" disabled={busy}
+                  className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+              </label>
+            </div>}
             {addMode === 'magnet' ? (
               <textarea value={magnet} onChange={(e) => setMagnet(e.target.value)} rows={3}
                 placeholder="magnet:?xt=urn:btih:…"
@@ -525,6 +615,102 @@ export default function ConsoleView() {
             <div className="mt-4 flex justify-end gap-3">
               <button onClick={closeAdd} disabled={busy} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg disabled:opacity-40">取消</button>
               <button onClick={submit} disabled={busy || remoteBusy || (targetMode === 'remote' && !targetRemote) || (addMode === 'magnet' ? !magnet.trim() : !torrentFile)} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {detailHash && (
+        <div className="fixed inset-0 z-[60] overflow-y-auto bg-black/65 p-4 backdrop-blur-sm" onClick={() => !detailActionBusy && setDetailHash('')}>
+          <div className="ml-auto min-h-full w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="panel my-2 min-h-[calc(100vh-1rem)] px-5 py-5 sm:px-6">
+              <div className="flex items-start justify-between gap-3 border-b border-line pb-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-medium"><Settings2 size={16} className="text-aurora-1" />任务详情</div>
+                  <div className="mt-1 truncate text-xs text-dim">{detail?.name || '正在读取…'}</div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button type="button" onClick={() => void refreshDetail()} disabled={detailBusy || detailActionBusy} title="刷新详情" aria-label="刷新详情" className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><RefreshCw size={14} className={detailBusy ? 'animate-spin' : ''} /></button>
+                  <button type="button" onClick={() => setDetailHash('')} disabled={detailActionBusy} title="关闭" aria-label="关闭" className="grid h-8 w-8 place-items-center rounded-md text-dim hover:bg-white/6 hover:text-fg disabled:opacity-40"><X size={16} /></button>
+                </div>
+              </div>
+              {detailBusy || !detail ? <div className="py-16 text-center text-sm text-dim">正在读取任务详情…</div> : (
+                <div className="mt-4 space-y-4">
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    {[
+                      ['进度', pct(detail.progress)], ['状态', STATE_ZH[detail.state] || detail.state], ['下载', fmtBytes(detail.downloaded)], ['上传', fmtBytes(detail.uploaded)],
+                      ['下载速率', `${fmtBytes(detail.dlspeed)}/s`], ['上传速率', `${fmtBytes(detail.upspeed)}/s`], ['分享率', detail.ratio.toFixed(2)], ['连接', String(detail.connections)],
+                    ].map(([label, value]) => <div key={label} className="rounded-lg border border-line bg-white/3 px-3 py-2"><div className="text-[10px] text-dim">{label}</div><div className="num mt-1 truncate text-sm text-fg">{value}</div></div>)}
+                  </div>
+                  <div className="rounded-lg border border-line bg-white/3 px-4 py-3">
+                    <div className="flex items-center gap-2 text-xs text-dim"><MapPin size={13} />保存路径</div>
+                    <div className="mt-1 break-all num text-xs text-fg">{detail.save_path || '—'}</div>
+                    <div className="mt-1 break-all text-[11px] text-dim/70">内容：{detail.content_path || '—'}</div>
+                  </div>
+                  {detail.error_string && <div className="rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">{detail.error_string}</div>}
+
+                  <section className="rounded-lg border border-line bg-white/3 p-4">
+                    <div className="flex items-center gap-2 text-sm text-fg"><Zap size={14} className="text-aurora-1" />高级操作</div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button type="button" onClick={() => void runDetailAction('force_start', '强制开始')} disabled={detailActionBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><Play size={12} />强制开始</button>
+                      <button type="button" onClick={() => void runDetailAction('force_stop', '取消强制开始')} disabled={detailActionBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><Pause size={12} />取消强制</button>
+                      <button type="button" onClick={() => void runDetailAction('recheck', '重新校验')} disabled={detailActionBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><CheckCircle2 size={12} />重新校验</button>
+                      <button type="button" onClick={() => void runDetailAction('reannounce', '重新汇报')} disabled={detailActionBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><ListRestart size={12} />重新汇报</button>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {([['queue_top', '置顶', ChevronsUp], ['queue_up', '上移', ArrowUp], ['queue_down', '下移', ArrowDown], ['queue_bottom', '置底', ChevronsDown]] as const).map(([action, label, Icon]) => <button type="button" key={action} onClick={() => void runDetailAction(action, `队列${label}`)} disabled={detailActionBusy} title={`队列${label}`} aria-label={`队列${label}`} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-dim hover:text-fg disabled:opacity-40"><Icon size={12} />{label}</button>)}
+                    </div>
+                  </section>
+
+                  <section className="rounded-lg border border-line bg-white/3 p-4">
+                    <div className="flex items-center gap-2 text-sm text-fg"><GaugeIcon size={14} className="text-aurora-1" />速度与路径</div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                      <label className="text-xs text-dim">下载限速 KiB/s（0 为不限）<input type="number" min={0} value={detailDownloadLimit} onChange={(e) => setDetailDownloadLimit(Math.max(0, Number(e.target.value) || 0))} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-sm text-fg focus:outline-none" /></label>
+                      <label className="text-xs text-dim">上传限速 KiB/s（0 为不限）<input type="number" min={0} value={detailUploadLimit} onChange={(e) => setDetailUploadLimit(Math.max(0, Number(e.target.value) || 0))} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-sm text-fg focus:outline-none" /></label>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button type="button" onClick={() => void runDetailAction('set_download_limit', '下载限速', { limitKib: detailDownloadLimit })} disabled={detailActionBusy} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><ArrowDown size={12} />保存下载限速</button>
+                      <button type="button" onClick={() => void runDetailAction('set_upload_limit', '上传限速', { limitKib: detailUploadLimit })} disabled={detailActionBusy} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><ArrowUp size={12} />保存上传限速</button>
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <input value={detailLocation} onChange={(e) => setDetailLocation(e.target.value.replace(/^\/+/, ''))} placeholder="相对下载目录，例如：电影/2026" className="min-w-0 flex-1 rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+                      <button type="button" onClick={() => void runDetailAction('set_location', '移动保存目录', { location: detailLocation })} disabled={detailActionBusy || !detailLocation} title="移动保存目录" aria-label="移动保存目录" className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><MapPin size={13} /></button>
+                    </div>
+                  </section>
+
+                  <section className="rounded-lg border border-line bg-white/3 p-4">
+                    <div className="flex items-center gap-2 text-sm text-fg"><Tags size={14} className="text-aurora-1" />分类与标签</div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                      <select value={detailCategory} onChange={(e) => setDetailCategory(e.target.value)} className="aurora-select rounded-md border border-line px-2 py-1.5 text-xs text-fg focus:outline-none"><option value="">默认分类</option>{labels?.categories.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select>
+                      <input value={detailTags} onChange={(e) => setDetailTags(e.target.value)} placeholder="用户标签，逗号分隔" className="rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+                    </div>
+                    <button type="button" onClick={() => void saveDetailLabels()} disabled={detailActionBusy} className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-fg hover:bg-white/8 disabled:opacity-40"><Save size={12} />保存分类标签</button>
+                  </section>
+
+                  <section className="rounded-lg border border-line bg-white/3 p-4">
+                    <div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-sm text-fg"><ListRestart size={14} className="text-aurora-1" />Tracker 与 Peer</div><span className="text-[10px] text-dim">{detail.trackers.length} 个 Tracker · {detailPeers?.connected ?? 0} 个连接</span></div>
+                    <div className="mt-3 max-h-32 overflow-y-auto rounded-md border border-line">
+                      {detail.trackers.length === 0 ? <div className="p-3 text-xs text-dim">暂无 Tracker 信息</div> : detail.trackers.map((tracker) => <div key={`${tracker.url}-${tracker.tier}`} className="border-b border-line/60 px-2.5 py-2 last:border-0"><div className="truncate text-[11px] text-fg" title={tracker.url}>{tracker.url || '—'}</div><div className="mt-0.5 text-[10px] text-dim">状态 {tracker.status} · S {tracker.num_seeds} · L {tracker.num_leeches} · {tracker.msg || '—'}</div></div>)}
+                    </div>
+                    <div className="mt-3 max-h-40 overflow-y-auto rounded-md border border-line">
+                      {!detailPeers?.peers.length ? <div className="p-3 text-xs text-dim">当前无 Peer 连接</div> : detailPeers.peers.map((peer) => <div key={peer.ip} className="flex items-center gap-2 border-b border-line/60 px-2.5 py-2 last:border-0"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-fg">{peer.client || '未知客户端'}</div><div className="num text-[10px] text-dim">{peer.ip} · {pct(peer.progress)}</div></div><div className="shrink-0 text-right text-[10px] text-teal-300">{fmtBytes(peer.up_speed)}/s</div></div>)}
+                    </div>
+                  </section>
+
+                  <section className="rounded-lg border border-line bg-white/3 p-4">
+                    <div className="flex items-center gap-2 text-sm text-fg"><FileText size={14} className="text-aurora-1" />文件与优先级</div>
+                    <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-line">
+                      {detail.files.length === 0 ? <div className="p-3 text-xs text-dim">暂无文件信息</div> : detail.files.map((file) => <div key={file.index} className="flex items-center gap-2 border-b border-line/60 px-2.5 py-2 last:border-0"><div className="min-w-0 flex-1"><div className="truncate text-xs text-fg" title={file.name}>{file.name}</div><div className="text-[10px] text-dim">{fmtBytes(file.size)} · {pct(file.progress)}</div></div><select defaultValue={file.priority} onChange={(e) => void runDetailAction('set_file_priority', '文件优先级', { fileIds: [file.index], priority: Number(e.target.value) })} disabled={detailActionBusy} className="aurora-select rounded border border-line px-1.5 py-1 text-[10px] text-fg"><option value={0}>跳过</option><option value={1}>低</option><option value={4}>普通</option><option value={6}>高</option><option value={7}>最高</option></select></div>)}
+                    </div>
+                  </section>
+
+                  <section className="rounded-lg border border-rose-400/25 bg-rose-400/5 p-4">
+                    <div className="flex items-center gap-2 text-sm text-rose-200"><Trash2 size={14} />移除任务</div>
+                    <label className="mt-3 flex items-center gap-2 text-xs text-dim"><input type="checkbox" checked={deleteFiles} onChange={(e) => setDeleteFiles(e.target.checked)} className="accent-rose-400" />同时删除本地文件（不可恢复）</label>
+                    <button type="button" onClick={() => void runDetailAction('remove', '移除任务', { deleteFiles })} disabled={detailActionBusy} className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-rose-400/30 bg-rose-400/10 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-400/20 disabled:opacity-40"><Trash2 size={12} />确认移除</button>
+                  </section>
+                </div>
+              )}
             </div>
           </div>
         </div>

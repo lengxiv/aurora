@@ -1294,6 +1294,8 @@ class RcloneProvider:
 
 class QbittorrentProvider:
     name = "qbittorrent"
+    _HASH_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+    _LABEL_RE = re.compile(r"^[^,\x00-\x1f\x7f]{1,64}$")
     _QUEUE_KEYS = (
         "queueing_enabled", "max_active_torrents", "max_active_downloads",
         "max_active_uploads", "max_active_checking_torrents", "add_to_top_of_queue",
@@ -1372,6 +1374,300 @@ class QbittorrentProvider:
             except Exception as exc:
                 return False, {}, str(exc)
 
+    @classmethod
+    def _valid_hash(cls, hash_: str) -> bool:
+        return bool(cls._HASH_RE.fullmatch(str(hash_ or "")))
+
+    @classmethod
+    def _valid_label(cls, value: str) -> bool:
+        value = str(value or "").strip()
+        return bool(cls._LABEL_RE.fullmatch(value)) and value not in (".", "..")
+
+    @classmethod
+    def _clean_labels(cls, values) -> list[str]:
+        if isinstance(values, str):
+            values = values.split(",")
+        out = []
+        for value in values or []:
+            value = str(value or "").strip()
+            if value and cls._valid_label(value) and value not in out:
+                out.append(value)
+        return out[:32]
+
+    @staticmethod
+    def _torrent_fields(t: dict) -> dict:
+        tags = [item.strip() for item in str(t.get("tags") or "").split(",") if item.strip()]
+        return {
+            "hash": str(t.get("hash") or ""),
+            "name": str(t.get("name") or ""),
+            "state": str(t.get("state") or "unknown"),
+            "progress": float(t.get("progress") or 0),
+            "size": max(0, int(t.get("size") or 0)),
+            "downloaded": max(0, int(t.get("downloaded") or 0)),
+            "uploaded": max(0, int(t.get("uploaded") or 0)),
+            "dlspeed": max(0, int(t.get("dlspeed") or 0)),
+            "upspeed": max(0, int(t.get("upspeed") or 0)),
+            "eta": int(t.get("eta") or 0),
+            "ratio": float(t.get("ratio") or 0),
+            "seeders": int(t.get("num_seeds") or 0),
+            "leechers": int(t.get("num_leechs") or 0),
+            "connections": int(t.get("connections_count") or 0),
+            "save_path": str(t.get("save_path") or ""),
+            "content_path": str(t.get("content_path") or ""),
+            "category": str(t.get("category") or ""),
+            "tags": tags,
+            "comment": str(t.get("comment") or ""),
+            "tracker": str(t.get("tracker") or ""),
+            "error": int(t.get("last_seen") or 0) if t.get("state") == "error" else 0,
+            "error_string": str(t.get("error_string") or ""),
+            "added_on": int(t.get("added_on") or 0),
+            "completion_on": int(t.get("completion_on") or 0),
+            "last_activity": int(t.get("last_activity") or 0),
+            "seeding_time": int(t.get("seeding_time") or 0),
+            "inactive_seeding_time": int(t.get("inactive_seeding_time") or 0),
+            "queue_position": int(t.get("priority") or 0),
+            "download_limit": int(t.get("dl_limit") or 0),
+            "upload_limit": int(t.get("up_limit") or 0),
+            "ratio_limit": float(t.get("ratio_limit") or -1),
+            "seeding_time_limit": int(t.get("seeding_time_limit") or -1),
+            "inactive_seeding_time_limit": int(t.get("inactive_seeding_time_limit") or -1),
+        }
+
+    def torrent_detail(self, hash_: str) -> tuple[bool, dict, str]:
+        """Return a safe, useful task view without leaking qBittorrent internals."""
+        if not self._valid_hash(hash_):
+            return False, {}, "种子 Hash 无效"
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                info = s.get(f"{self.base}/api/v2/torrents/info", params={"hash": hash_}, timeout=5)
+                if info.status_code != 200:
+                    return False, {}, f"qBittorrent 任务信息 HTTP {info.status_code}"
+                rows = info.json() or []
+                if not rows:
+                    return False, {}, "任务不存在"
+                torrent = self._torrent_fields(rows[0])
+                files = s.get(f"{self.base}/api/v2/torrents/files", params={"hash": hash_}, timeout=5)
+                trackers = s.get(f"{self.base}/api/v2/torrents/trackers", params={"hash": hash_}, timeout=5)
+                if files.status_code != 200 or trackers.status_code != 200:
+                    return False, {}, "读取任务文件或 Tracker 失败"
+                torrent["files"] = [{
+                    "index": int(item.get("index") or 0),
+                    "name": str(item.get("name") or ""),
+                    "size": max(0, int(item.get("size") or 0)),
+                    "progress": float(item.get("progress") or 0),
+                    "priority": int(item.get("priority") or 0),
+                    "availability": float(item.get("availability") or 0),
+                    "is_seed": bool(item.get("is_seed", False)),
+                } for item in (files.json() or []) if isinstance(item, dict)]
+                torrent["trackers"] = [{
+                    "url": str(item.get("url") or ""),
+                    "status": int(item.get("status") or 0),
+                    "tier": int(item.get("tier") or 0),
+                    "num_peers": int(item.get("num_peers") or 0),
+                    "num_seeds": int(item.get("num_seeds") or 0),
+                    "num_leeches": int(item.get("num_leeches") or 0),
+                    "msg": str(item.get("msg") or ""),
+                } for item in (trackers.json() or []) if isinstance(item, dict)]
+                return True, torrent, ""
+            except Exception as exc:
+                return False, {}, str(exc)
+
+    def labels(self) -> tuple[bool, dict, str]:
+        """Read categories and tags used by the task manager."""
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                categories = s.get(f"{self.base}/api/v2/torrents/categories", timeout=5)
+                tags = s.get(f"{self.base}/api/v2/torrents/tags", timeout=5)
+                if categories.status_code != 200 or tags.status_code != 200:
+                    return False, {}, "读取 qBittorrent 分类或标签失败"
+                raw_categories = categories.json() or {}
+                category_rows = [{
+                    "name": str(name),
+                    "save_path": str((value or {}).get("savePath") or ""),
+                } for name, value in raw_categories.items() if isinstance(value, dict)]
+                category_rows.sort(key=lambda item: item["name"].casefold())
+                raw_tags = tags.json() or []
+                if isinstance(raw_tags, dict):
+                    raw_tags = raw_tags.get("tags") or []
+                tag_rows = sorted({str(item).strip() for item in raw_tags if str(item).strip()}, key=str.casefold)
+                return True, {"categories": category_rows, "tags": tag_rows}, ""
+            except Exception as exc:
+                return False, {}, str(exc)
+
+    def create_category(self, name: str, save_path: str) -> tuple[bool, str]:
+        if not self._valid_label(name):
+            return False, "分类名称无效"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/createCategory",
+                    data={"category": name.strip(), "savePath": save_path}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def edit_category(self, name: str, save_path: str) -> tuple[bool, str]:
+        if not self._valid_label(name):
+            return False, "分类名称无效"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/editCategory",
+                    data={"category": name.strip(), "savePath": save_path}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def delete_category(self, name: str) -> tuple[bool, str]:
+        if not self._valid_label(name):
+            return False, "分类名称无效"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/removeCategories",
+                    data={"categories": name.strip()}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def create_tags(self, tags) -> tuple[bool, str]:
+        values = self._clean_labels(tags)
+        if not values:
+            return False, "标签名称无效"
+        if any(item.startswith("aurora-") for item in values):
+            return False, "aurora- 前缀为系统标签"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/createTags",
+                    data={"tags": ",".join(values)}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def delete_tags(self, tags) -> tuple[bool, str]:
+        values = self._clean_labels(tags)
+        if not values or any(item.startswith("aurora-") for item in values):
+            return False, "不能删除系统标签或无效标签"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/deleteTags",
+                    data={"tags": ",".join(values)}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def update_labels(self, hash_: str, category: str | None = None, tags=None) -> tuple[bool, dict, str]:
+        if not self._valid_hash(hash_):
+            return False, {}, "种子 Hash 无效"
+        if category is not None and category and not self._valid_label(category):
+            return False, {}, "分类名称无效"
+        wanted = None if tags is None else self._clean_labels(tags)
+        if wanted is not None and any(item.startswith("aurora-") for item in wanted):
+            return False, {}, "不能修改系统标签"
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                info = s.get(f"{self.base}/api/v2/torrents/info", params={"hash": hash_}, timeout=5)
+                rows = info.json() if info.status_code == 200 else []
+                if not rows:
+                    return False, {}, "任务不存在"
+                current = [item.strip() for item in str(rows[0].get("tags") or "").split(",") if item.strip()]
+                if category is not None:
+                    r = s.post(f"{self.base}/api/v2/torrents/setCategory", data={"hashes": hash_, "category": category.strip()}, timeout=5)
+                    if r.status_code != 200:
+                        return False, {}, f"设置分类失败：HTTP {r.status_code}"
+                if wanted is not None:
+                    system = [item for item in current if item.startswith("aurora-")]
+                    user_current = [item for item in current if not item.startswith("aurora-")]
+                    remove = [item for item in user_current if item not in wanted]
+                    add = [item for item in wanted if item not in user_current]
+                    if remove:
+                        r = s.post(f"{self.base}/api/v2/torrents/removeTags", data={"hashes": hash_, "tags": ",".join(remove)}, timeout=5)
+                        if r.status_code != 200:
+                            return False, {}, f"移除标签失败：HTTP {r.status_code}"
+                    if add:
+                        r = s.post(f"{self.base}/api/v2/torrents/addTags", data={"hashes": hash_, "tags": ",".join(add)}, timeout=5)
+                        if r.status_code != 200:
+                            return False, {}, f"添加标签失败：HTTP {r.status_code}"
+                    _ = system
+                ok, detail, error = self.torrent_detail(hash_)
+                return ok, detail, error
+            except Exception as exc:
+                return False, {}, str(exc)
+
+    def add_system_tags(self, hash_: str, tags) -> tuple[bool, str]:
+        """Attach Aurora-owned correlation tags without exposing them as user labels."""
+        if not self._valid_hash(hash_):
+            return False, "种子 Hash 无效"
+        values = [str(item or "").strip() for item in (tags or [])]
+        if not values or any(not item.startswith("aurora-") or not self._valid_label(item) for item in values):
+            return False, "系统标签无效"
+        with self._session_lock:
+            try:
+                r = self._ensure().post(
+                    f"{self.base}/api/v2/torrents/addTags",
+                    data={"hashes": hash_, "tags": ",".join(dict.fromkeys(values))}, timeout=5,
+                )
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def advanced_action(self, hash_: str, action: str, *, value: int | None = None,
+                        delete_files: bool = False, location: str = "", file_ids=None,
+                        priority: int | None = None) -> tuple[bool, str]:
+        if not self._valid_hash(hash_):
+            return False, "种子 Hash 无效"
+        endpoints = {
+            "pause": ("stop", {}),
+            "resume": ("start", {}),
+            "force_start": ("setForceStart", {"value": "true"}),
+            "force_stop": ("setForceStart", {"value": "false"}),
+            "recheck": ("recheck", {}),
+            "reannounce": ("reannounce", {}),
+            "queue_top": ("queuePositionTop", {}),
+            "queue_bottom": ("queuePositionBottom", {}),
+            "queue_up": ("queuePositionUp", {}),
+            "queue_down": ("queuePositionDown", {}),
+            "toggle_sequential": ("toggleSequentialDownload", {}),
+            "toggle_first_last": ("toggleFirstLastPiecePrio", {}),
+        }
+        if action == "remove":
+            endpoint, data = "delete", {"deleteFiles": "true" if delete_files else "false"}
+        elif action in ("set_download_limit", "set_upload_limit"):
+            if value is None or not 0 <= int(value) <= 10_000_000 * 1024:
+                return False, "限速必须在 0-10000000 KiB/s 之间"
+            endpoint = "setDownloadLimit" if action == "set_download_limit" else "setUploadLimit"
+            data = {"limit": str(int(value))}
+        elif action == "set_location":
+            if not location or len(location) > 4096 or not location.startswith("/downloads"):
+                return False, "保存目录无效"
+            endpoint, data = "setLocation", {"location": location}
+        elif action == "set_file_priority":
+            ids = [int(item) for item in (file_ids or [])]
+            if not ids or priority is None or not 0 <= int(priority) <= 7:
+                return False, "文件优先级参数无效"
+            endpoint, data = "filePrio", {"id": ",".join(str(item) for item in ids), "priority": str(int(priority))}
+        elif action in endpoints:
+            endpoint, data = endpoints[action]
+        else:
+            return False, "不支持的任务操作"
+        data = {"hashes": hash_, **data}
+        with self._session_lock:
+            try:
+                r = self._ensure().post(f"{self.base}/api/v2/torrents/{endpoint}", data=data, timeout=10)
+                return r.status_code == 200, "" if r.status_code == 200 else f"qBittorrent HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
     def torrent_details(self) -> list[dict]:
         with self._session_lock:
             try:
@@ -1406,6 +1702,11 @@ class QbittorrentProvider:
                 "completion_on": t.get("completion_on", 0) or 0,
                 "upB": t.get("uploaded", 0) or 0,
                 "downB": t.get("downloaded", 0) or 0,
+                "eta": int(t.get("eta") or 0),
+                "savePath": t.get("save_path", ""),
+                "category": t.get("category", ""),
+                "tags": [item.strip() for item in str(t.get("tags") or "").split(",") if item.strip()],
+                "seedingTime": int(t.get("seeding_time") or 0),
             }
             destination = torrent_destination_for_tags(t.get("tags", ""))
             if destination:
@@ -1443,7 +1744,7 @@ class QbittorrentProvider:
             "leechers": d.get("peers_leechers", 0),
         }
 
-    def add(self, magnet: str, save_path: str = "", tag: str = "") -> bool:
+    def add(self, magnet: str, save_path: str = "", tag: str = "", category: str = "", tags=None) -> bool:
         with self._session_lock:
             try:
                 if not magnet.startswith("magnet:"):
@@ -1452,14 +1753,21 @@ class QbittorrentProvider:
                 data = {"urls": magnet}
                 if save_path:
                     data["savepath"] = save_path
-                if tag:
-                    data["tags"] = tag
+                labels = self._clean_labels(tags)
+                if tag and tag not in labels:
+                    labels.append(tag)
+                if labels:
+                    data["tags"] = ",".join(labels)
+                if category:
+                    if not self._valid_label(category):
+                        return False
+                    data["category"] = category.strip()
                 r = s.post(f"{self.base}/api/v2/torrents/add", data=data, timeout=6)
                 return r.status_code in (200, 201)   # 409=已存在/无效 -> False
             except Exception:
                 return False
 
-    def add_file(self, filename: str, content: bytes, save_path: str = "", tag: str = "") -> bool:
+    def add_file(self, filename: str, content: bytes, save_path: str = "", tag: str = "", category: str = "", tags=None) -> bool:
         """Forward one .torrent file to qBittorrent's multipart upload endpoint."""
         with self._session_lock:
             try:
@@ -1469,8 +1777,15 @@ class QbittorrentProvider:
                 data = {}
                 if save_path:
                     data["savepath"] = save_path
-                if tag:
-                    data["tags"] = tag
+                labels = self._clean_labels(tags)
+                if tag and tag not in labels:
+                    labels.append(tag)
+                if labels:
+                    data["tags"] = ",".join(labels)
+                if category:
+                    if not self._valid_label(category):
+                        return False
+                    data["category"] = category.strip()
                 r = s.post(
                     f"{self.base}/api/v2/torrents/add",
                     files={"torrents": (filename, content, "application/x-bittorrent")},
@@ -1704,6 +2019,8 @@ def _save_torrent_destinations(data: dict[str, dict]) -> None:
 
 
 def _tag_list(tags: str) -> list[str]:
+    if isinstance(tags, (list, tuple, set)):
+        return [str(item).strip() for item in tags if str(item).strip()]
     return [item.strip() for item in str(tags or "").split(",") if item.strip()]
 
 
@@ -1951,7 +2268,77 @@ def start_torrent_destination_scheduler() -> None:
 _STATS_FILE = os.path.join(_DATA_DIR, "stats.json")
 _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _NOTIFY_FILE = os.path.join(_DATA_DIR, "torrent_notify.json")
+_POLICY_NOTIFY_FILE = os.path.join(_DATA_DIR, "torrent_policy_notify.json")
 _disk_warned = False
+
+
+_POLICY_ACTIONS = {"pause", "notify", "remove"}
+
+
+def _normalize_policy(raw: dict, index: int = 0) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or f"策略 {index + 1}").strip()[:40]
+    if not name:
+        return None
+    category = str(raw.get("category") or "").strip()[:64]
+    hash_filter = str(raw.get("hash") or "").strip().lower()
+    if hash_filter and not re.fullmatch(r"[0-9a-f]{40}", hash_filter):
+        hash_filter = ""
+    action = str(raw.get("action") or "pause").strip().lower()
+    if action not in _POLICY_ACTIONS | {"transfer"}:
+        action = "pause"
+
+    def integer(key: str, default: int, maximum: int, minimum: int = -1) -> int:
+        try:
+            return min(maximum, max(minimum, int(raw.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    def ratio(key: str, default: float) -> float:
+        try:
+            value = float(raw.get(key, default))
+            return round(min(100000.0, max(-1.0, value)), 3)
+        except (TypeError, ValueError):
+            return default
+
+    policy_id = str(raw.get("id") or uuid.uuid4().hex[:12])
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,40}", policy_id):
+        policy_id = uuid.uuid4().hex[:12]
+    return {
+        "id": policy_id,
+        "name": name,
+        "category": category,
+        "hash": hash_filter,
+        "enabled": bool(raw.get("enabled", True)),
+        "action": action,
+        "min_seed_minutes": integer("min_seed_minutes", 0, 525600, 0),
+        "max_seed_minutes": integer("max_seed_minutes", -1, 525600),
+        "max_inactive_minutes": integer("max_inactive_minutes", -1, 525600),
+        "max_ratio": ratio("max_ratio", -1.0),
+        "allow_delete": bool(raw.get("allow_delete", False)),
+        "delete_files": bool(raw.get("delete_files", False)),
+        "destination_remote": str(raw.get("destination_remote") or "").strip()[:64],
+        "destination_path": str(raw.get("destination_path") or "").strip()[:2048],
+    }
+
+
+def _normalize_policies(raw: dict | None) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    rules = []
+    seen = set()
+    for index, item in enumerate(raw.get("rules") or []):
+        policy = _normalize_policy(item, index)
+        if policy and policy["id"] not in seen:
+            rules.append(policy)
+            seen.add(policy["id"])
+        if len(rules) >= 32:
+            break
+    try:
+        interval = min(86400, max(60, int(raw.get("interval", 300))))
+    except (TypeError, ValueError):
+        interval = 300
+    return {"enabled": bool(raw.get("enabled", False)), "interval": interval, "rules": rules}
 
 
 def _default_settings() -> dict:
@@ -1962,6 +2349,7 @@ def _default_settings() -> dict:
         "alerts": {"torrent": True, "disk": True, "diskWarn": 90.0},
         "daily": {"enabled": False, "time": "21:00"},
         "tg": {"enabled": bool(tokens), "tokens": tokens},
+        "policies": {"enabled": False, "interval": 300, "rules": []},
     }
 
 
@@ -1975,6 +2363,7 @@ def load_settings() -> dict:
                 d[k].update({kk: vv for kk, vv in s[k].items() if kk in d[k]})
         if isinstance(s.get("tg", {}).get("tokens"), list):
             d["tg"]["tokens"] = s["tg"]["tokens"]
+        d["policies"] = _normalize_policies(s.get("policies"))
     except Exception:
         pass
     return d
@@ -1987,6 +2376,7 @@ def save_settings(s: dict):
             d[k].update({kk: vv for kk, vv in s[k].items() if kk in d[k]})
     if isinstance(s.get("tg", {}).get("tokens"), list):
         d["tg"]["tokens"] = s["tg"]["tokens"]
+    d["policies"] = _normalize_policies(s.get("policies"))
     try:
         d["alerts"]["diskWarn"] = min(99.0, max(10.0, float(d["alerts"]["diskWarn"])))
     except (TypeError, ValueError):
@@ -2006,6 +2396,197 @@ def save_settings(s: dict):
     with _DATA_LOCK:
         _atomic_json(_SETTINGS_FILE, d)
     return d
+
+
+def torrent_policies() -> dict:
+    policies = load_settings().get("policies", {})
+    return {"enabled": bool(policies.get("enabled")), "interval": int(policies.get("interval", 300)), "rules": policies.get("rules", [])}
+
+
+def save_torrent_policies(value: dict) -> dict:
+    current = load_settings()
+    current["policies"] = _normalize_policies(value)
+    saved = save_settings(current)
+    _log("torrent.policy.settings", f"{len(saved['policies']['rules'])} 条规则")
+    return saved["policies"]
+
+
+def _load_policy_notifications() -> dict:
+    try:
+        with open(_POLICY_NOTIFY_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_policy_notifications(data: dict) -> None:
+    try:
+        _atomic_json(_POLICY_NOTIFY_FILE, data)
+    except Exception as exc:
+        _LOGGER.warning("torrent policy notification state write failed: %s", exc)
+
+
+def _policy_matches(rule: dict, torrent: dict) -> bool:
+    hash_filter = str(rule.get("hash") or "").strip().lower()
+    if hash_filter and hash_filter != str(torrent.get("hash") or "").strip().lower():
+        return False
+    category = str(rule.get("category") or "").strip()
+    return not category or category == "*" or category == str(torrent.get("category") or "").strip()
+
+
+def _policy_trigger(rule: dict, torrent: dict) -> str:
+    try:
+        seed_minutes = max(0, int(torrent.get("seeding_time") or 0) // 60)
+        inactive_minutes = max(0, int(torrent.get("inactive_seeding_time") or 0) // 60)
+    except (TypeError, ValueError):
+        seed_minutes = inactive_minutes = 0
+    try:
+        ratio_value = float(torrent.get("ratio") or 0)
+    except (TypeError, ValueError):
+        ratio_value = 0.0
+    if seed_minutes < int(rule.get("min_seed_minutes", 0)):
+        return ""
+    if int(rule.get("max_seed_minutes", -1)) >= 0 and seed_minutes >= int(rule["max_seed_minutes"]):
+        return f"做种时间达到 {seed_minutes} 分钟"
+    if int(rule.get("max_inactive_minutes", -1)) >= 0 and inactive_minutes >= int(rule["max_inactive_minutes"]):
+        return f"空闲做种达到 {inactive_minutes} 分钟"
+    if float(rule.get("max_ratio", -1)) >= 0 and ratio_value >= float(rule["max_ratio"]):
+        return f"分享率达到 {ratio_value:.2f}"
+    return ""
+
+
+def _policy_protection(torrent: dict) -> str:
+    tags = _tag_list(torrent.get("tags", ""))
+    if "aurora-protected" in tags:
+        return "任务带有 aurora-protected 保护标签"
+    destination = torrent_destination_for_tags(torrent.get("tags", ""))
+    if destination and destination.get("status") != "done":
+        return "网盘转存尚未完成"
+    return ""
+
+
+def preview_torrent_policies() -> tuple[bool, dict, str]:
+    if not _qbit.available():
+        return False, {}, "qBittorrent 未接入"
+    details = _qbit.torrent_details()
+    if not getattr(_qbit, "_last_details_ok", True):
+        return False, {}, "qBittorrent 任务读取失败"
+    settings = torrent_policies()
+    rules = [rule for rule in settings["rules"] if rule.get("enabled", True)]
+    items = []
+    for torrent in details:
+        state = str(torrent.get("state") or "")
+        if state not in QbittorrentProvider._UP_STATES:
+            continue
+        for rule in rules:
+            if not _policy_matches(rule, torrent):
+                continue
+            reason = _policy_trigger(rule, torrent)
+            if not reason:
+                continue
+            protection = _policy_protection(torrent)
+            items.append({
+                "hash": str(torrent.get("hash") or ""),
+                "name": str(torrent.get("name") or ""),
+                "category": str(torrent.get("category") or ""),
+                "tags": _tag_list(torrent.get("tags", "")),
+                "ratio": float(torrent.get("ratio") or 0),
+                "seeding_minutes": max(0, int(torrent.get("seeding_time") or 0) // 60),
+                "rule_id": rule["id"],
+                "rule_name": rule["name"],
+                "action": rule["action"],
+                "reason": reason,
+                "protected": bool(protection),
+                "protection": protection,
+                "delete_files": bool(rule.get("delete_files")) and bool(rule.get("allow_delete")),
+            })
+            break
+    return True, {"enabled": settings["enabled"], "interval": settings["interval"], "items": items}, ""
+
+
+def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tuple[bool, dict, str]:
+    if not confirm and not automatic:
+        return False, {}, "请先确认应用策略"
+    ok, preview, detail = preview_torrent_policies()
+    if not ok:
+        return False, {}, detail
+    settings = torrent_policies()
+    by_id = {rule["id"]: rule for rule in settings["rules"]}
+    results = []
+    notifications = _load_policy_notifications()
+    today = datetime.now().strftime("%Y-%m-%d")
+    for item in preview["items"]:
+        rule = by_id.get(item["rule_id"], {})
+        action = item["action"]
+        if item["protected"] and action == "remove":
+            results.append({**item, "status": "protected"})
+            continue
+        if automatic and action == "remove" and not rule.get("allow_delete"):
+            results.append({**item, "status": "skipped"})
+            continue
+        if action == "notify":
+            key = f"{today}:{item['rule_id']}:{item['hash']}:{item['reason']}"
+            if notifications.get(key):
+                results.append({**item, "status": "already_notified"})
+                continue
+            message = f"Aurora 做种策略提醒\n{item['name']}\n原因：{item['reason']}"
+            sent = _tg(message)
+            notifications[key] = int(time.time())
+            _log("torrent.policy.notify", f"{item['name']} · {item['reason']}" + (" · 已发送" if sent else ""))
+            results.append({**item, "status": "notified" if sent else "logged"})
+            continue
+        if action == "pause":
+            changed, error = _qbit.advanced_action(item["hash"], "pause")
+        elif action == "transfer":
+            existing = torrent_destination_for_tags(item.get("tags", []))
+            if existing:
+                results.append({**item, "status": "protected", "protection": "已有网盘转存记录"})
+                continue
+            remote = str(rule.get("destination_remote") or "").strip()
+            path = str(rule.get("destination_path") or "").strip()
+            if not remote:
+                results.append({**item, "status": "error", "detail": "策略未配置目标网盘"})
+                continue
+            marker, _path, error = register_torrent_destination(remote, path)
+            if not marker:
+                results.append({**item, "status": "error", "detail": error or "网盘目标无效"})
+                continue
+            changed, error = _qbit.add_system_tags(item["hash"], [marker])
+            if not changed:
+                discard_torrent_destination(marker)
+            else:
+                _log("torrent.policy.transfer", f"{item['name']} -> {remote}:{_path or '/'}")
+        else:
+            delete_files = bool(rule.get("delete_files")) and bool(rule.get("allow_delete"))
+            changed, error = _qbit.advanced_action(item["hash"], "remove", delete_files=delete_files)
+        status = "applied" if changed else "error"
+        _log("torrent.policy.apply", f"{item['name']} · {action} · {item['reason']}" + (f" · {error}" if error else ""))
+        results.append({**item, "status": status, "detail": error})
+    _save_policy_notifications(notifications)
+    return True, {"items": results, "applied": sum(1 for item in results if item["status"] == "applied")}, ""
+
+
+_policy_sched_started = False
+
+
+def start_torrent_policy_scheduler() -> None:
+    global _policy_sched_started
+    if _policy_sched_started:
+        return
+    _policy_sched_started = True
+
+    def loop():
+        while True:
+            settings = torrent_policies()
+            if settings.get("enabled") and settings.get("rules"):
+                try:
+                    apply_torrent_policies(confirm=True, automatic=True)
+                except Exception as exc:
+                    _log("torrent.policy.error", str(exc))
+            time.sleep(max(60, min(3600, int(settings.get("interval", 300)))))
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def _tg_send(token: str, chat_id: str, text: str):

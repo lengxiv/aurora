@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Server, Database, ShieldCheck, LogOut, RefreshCw, Bell, KeyRound, Smartphone, X, ListFilter } from 'lucide-react'
-import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, fetchQbitQueueSettings, saveQbitQueueSettings, type AuthSession, type QbitQueueSettings } from '../lib/api'
+import { Server, Database, ShieldCheck, LogOut, RefreshCw, Bell, KeyRound, Smartphone, X, ListFilter, Tags, Plus, Trash2, Eye, Play, Save, FolderCog } from 'lucide-react'
+import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, fetchQbitQueueSettings, saveQbitQueueSettings, fetchTorrentLabels, createTorrentCategory, deleteTorrentCategory, createTorrentTags, deleteTorrentTags, fetchTorrentPolicies, saveTorrentPolicies, previewTorrentPolicies, applyTorrentPolicies, fetchRcloneRemotes, type AuthSession, type QbitQueueSettings, type QbitLabels, type TorrentPolicies, type TorrentPolicy, type TorrentPolicyPreview, type RcloneRemote } from '../lib/api'
 import { SC_KEY, SC_VAL, Switch } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -16,6 +16,7 @@ interface SettingsT {
   alerts?: { torrent?: boolean; disk?: boolean; diskWarn?: number }
   daily?: { enabled?: boolean; time?: string }
   tg?: { enabled?: boolean; tokens?: { name?: string; token?: string; chat_id?: string }[] }
+  policies?: TorrentPolicies
 }
 
 export default function Settings({ onLogout }: { onLogout: () => void }) {
@@ -27,12 +28,24 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
   const [pw, setPw] = useState({ current: '', next: '', confirm: '' })
   const [qbitQueue, setQbitQueue] = useState<{ online: boolean; settings: QbitQueueSettings | null; detail?: string } | null>(null)
   const [qbitBusy, setQbitBusy] = useState(false)
+  const [qbitLabels, setQbitLabels] = useState<QbitLabels | null>(null)
+  const [labelsBusy, setLabelsBusy] = useState(false)
+  const [newCategory, setNewCategory] = useState('')
+  const [newCategoryPath, setNewCategoryPath] = useState('')
+  const [newTag, setNewTag] = useState('')
+  const [policies, setPolicies] = useState<TorrentPolicies | null>(null)
+  const [policyBusy, setPolicyBusy] = useState(false)
+  const [policyPreview, setPolicyPreview] = useState<TorrentPolicyPreview[] | null>(null)
+  const [policyRemotes, setPolicyRemotes] = useState<RcloneRemote[]>([])
 
   useEffect(() => {
     fetchInfo().then(setInfo)
     fetchSettings().then(setSt)
     fetchSessions().then(setSessions)
     fetchQbitQueueSettings().then(setQbitQueue)
+    fetchTorrentLabels().then(setQbitLabels)
+    fetchTorrentPolicies().then(setPolicies)
+    fetchRcloneRemotes().then((result) => setPolicyRemotes(result?.remotes || []))
   }, [load])
 
   const p = info?.providers || {}
@@ -52,6 +65,68 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
       setQbitQueue((current) => current ? { ...current, online: true, settings: result.settings ?? null } : current)
       toast('qBittorrent 队列设置已保存', 'ok')
     } else toast(result.detail || '保存失败', 'bad')
+  }
+  const reloadLabels = async () => {
+    setLabelsBusy(true)
+    setQbitLabels(await fetchTorrentLabels())
+    setLabelsBusy(false)
+  }
+  const addCategory = async () => {
+    if (!newCategory.trim()) return
+    setLabelsBusy(true)
+    const result = await createTorrentCategory(newCategory.trim(), newCategoryPath.trim())
+    setLabelsBusy(false)
+    toast(result.ok ? '分类已创建' : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) { setNewCategory(''); setNewCategoryPath(''); await reloadLabels() }
+  }
+  const removeCategory = async (name: string) => {
+    if (!window.confirm(`删除分类「${name}」？已有任务不会删除。`)) return
+    setLabelsBusy(true)
+    const result = await deleteTorrentCategory(name)
+    setLabelsBusy(false)
+    toast(result.ok ? '分类已删除' : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) await reloadLabels()
+  }
+  const addTags = async () => {
+    const values = newTag.split(',').map((item) => item.trim()).filter(Boolean)
+    if (!values.length) return
+    setLabelsBusy(true)
+    const result = await createTorrentTags(values)
+    setLabelsBusy(false)
+    toast(result.ok ? '标签已创建' : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) { setNewTag(''); await reloadLabels() }
+  }
+  const removeTag = async (tag: string) => {
+    if (!window.confirm(`删除标签「${tag}」？已有任务上的标签不会自动移除。`)) return
+    setLabelsBusy(true)
+    const result = await deleteTorrentTags([tag])
+    setLabelsBusy(false)
+    toast(result.ok ? '标签已删除' : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) await reloadLabels()
+  }
+  const patchPolicy = (id: string, patch: Partial<TorrentPolicy>) => setPolicies((current) => current ? { ...current, rules: current.rules.map((rule) => rule.id === id ? { ...rule, ...patch } : rule) } : current)
+  const addPolicy = () => setPolicies((current) => current ? { ...current, rules: [...current.rules, { id: `local-${Date.now()}`, name: `新策略 ${current.rules.length + 1}`, category: '', hash: '', enabled: true, action: 'pause', min_seed_minutes: 0, max_seed_minutes: -1, max_inactive_minutes: -1, max_ratio: -1, allow_delete: false, delete_files: false, destination_remote: '', destination_path: '' }] } : current)
+  const savePolicies = async () => {
+    if (!policies) return
+    setPolicyBusy(true)
+    const result = await saveTorrentPolicies(policies)
+    setPolicyBusy(false)
+    if (result.ok && result.policies) { setPolicies(result.policies); toast('做种策略已保存', 'ok') } else toast(result.detail, 'bad')
+  }
+  const previewPolicies = async () => {
+    setPolicyBusy(true)
+    const result = await previewTorrentPolicies()
+    setPolicyBusy(false)
+    setPolicyPreview(result?.items || [])
+    toast(result ? `预览完成：${result.items.length} 个任务命中` : '预览失败', result ? 'ok' : 'bad')
+  }
+  const applyPolicies = async () => {
+    if (!window.confirm('将按当前策略暂停或移除命中任务，删除文件还需策略显式允许。确定继续吗？')) return
+    setPolicyBusy(true)
+    const result = await applyTorrentPolicies()
+    setPolicyBusy(false)
+    toast(result.ok ? `策略已应用，执行 ${result.applied || 0} 项` : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) setPolicyPreview(result.items || [])
   }
 
   return (
@@ -88,6 +163,63 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
               </div>
             ))}
           </div>
+        </section>
+
+        <section className="panel px-6 py-5 lg:col-span-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-medium"><Tags size={16} className="text-aurora-1" /> qBittorrent 分类与标签</div>
+            <button type="button" onClick={() => void reloadLabels()} disabled={labelsBusy} title="刷新分类标签" aria-label="刷新分类标签" className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><RefreshCw size={14} className={labelsBusy ? 'animate-spin' : ''} /></button>
+          </div>
+          {!qbitLabels || !qbitLabels.online ? <div className="mt-4 text-sm text-dim">qBittorrent 未接入，无法管理分类和标签。</div> : <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <div className="rounded-lg border border-line bg-white/3 p-4">
+              <div className="flex items-center gap-2 text-xs text-dim"><FolderCog size={13} />分类</div>
+              <div className="mt-3 flex gap-2">
+                <input value={newCategory} onChange={(e) => setNewCategory(e.target.value)} placeholder="分类名称" className="min-w-0 flex-1 rounded-md border border-line bg-white/4 px-2.5 py-2 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+                <input value={newCategoryPath} onChange={(e) => setNewCategoryPath(e.target.value)} placeholder="保存目录（可选）" className="min-w-0 flex-1 rounded-md border border-line bg-white/4 px-2.5 py-2 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+                <button type="button" onClick={() => void addCategory()} disabled={labelsBusy || !newCategory.trim()} title="创建分类" aria-label="创建分类" className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><Plus size={14} /></button>
+              </div>
+              <div className="mt-3 flex flex-col gap-1.5">
+                {qbitLabels.categories.length === 0 ? <div className="text-xs text-dim/70">暂无分类，任务会使用默认下载目录。</div> : qbitLabels.categories.map((item) => <div key={item.name} className="flex items-center gap-2 rounded-md border border-line/70 bg-white/2 px-2.5 py-2"><div className="min-w-0 flex-1"><div className="truncate text-xs text-fg">{item.name}</div><div className="truncate text-[10px] text-dim">{item.save_path || '/downloads'}</div></div><button type="button" onClick={() => void removeCategory(item.name)} disabled={labelsBusy} title="删除分类" aria-label="删除分类" className="grid h-6 w-6 place-items-center rounded text-dim hover:text-rose-300 disabled:opacity-40"><Trash2 size={12} /></button></div>)}
+              </div>
+            </div>
+            <div className="rounded-lg border border-line bg-white/3 p-4">
+              <div className="flex items-center gap-2 text-xs text-dim"><Tags size={13} />用户标签</div>
+              <div className="mt-3 flex gap-2">
+                <input value={newTag} onChange={(e) => setNewTag(e.target.value)} placeholder="标签，可用逗号分隔" className="min-w-0 flex-1 rounded-md border border-line bg-white/4 px-2.5 py-2 text-xs text-fg placeholder:text-dim/60 focus:outline-none" />
+                <button type="button" onClick={() => void addTags()} disabled={labelsBusy || !newTag.trim()} title="创建标签" aria-label="创建标签" className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><Plus size={14} /></button>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {qbitLabels.tags.length === 0 ? <div className="text-xs text-dim/70">暂无用户标签。</div> : qbitLabels.tags.filter((item) => !item.startsWith('aurora-')).map((tag) => <span key={tag} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2 py-1 text-xs text-fg">{tag}<button type="button" onClick={() => void removeTag(tag)} disabled={labelsBusy} title={`删除标签 ${tag}`} aria-label={`删除标签 ${tag}`} className="text-dim hover:text-rose-300 disabled:opacity-40"><X size={11} /></button></span>)}
+              </div>
+              <div className="mt-3 text-[10px] leading-relaxed text-dim/70">`aurora-` 开头的系统标签由 Aurora 管理，不能删除或覆盖。</div>
+            </div>
+          </div>}
+        </section>
+
+        <section className="panel px-6 py-5 lg:col-span-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-medium"><ListFilter size={16} className="text-aurora-1" /> 做种策略与生命周期</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button type="button" onClick={addPolicy} disabled={!policies || policyBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-dim hover:text-fg disabled:opacity-40"><Plus size={12} />新增规则</button>
+              <button type="button" onClick={() => void previewPolicies()} disabled={!policies || policyBusy} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-xs text-dim hover:text-fg disabled:opacity-40"><Eye size={12} />预览</button>
+              <button type="button" onClick={() => void savePolicies()} disabled={!policies || policyBusy} title="保存做种策略" aria-label="保存做种策略" className="grid h-8 w-8 place-items-center rounded-md grad-bar text-ink disabled:opacity-40"><Save size={13} /></button>
+            </div>
+          </div>
+          {!policies ? <div className="mt-4 text-sm text-dim">正在读取做种策略…</div> : <>
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 py-3">
+              <div><div className="text-sm text-fg">启用后台自动检查</div><div className="text-[11px] text-dim">默认关闭；开启后按间隔检查命中规则。自动删除仍需规则允许。</div></div>
+              <div className="flex items-center gap-3"><label className="flex items-center gap-1.5 text-xs text-dim">间隔 <input type="number" min={60} max={86400} value={policies.interval} onChange={(e) => setPolicies({ ...policies, interval: Math.max(60, Number(e.target.value) || 60) })} className="num w-20 rounded-md border border-line bg-white/4 px-2 py-1 text-right text-xs text-fg focus:outline-none" /> 秒</label><Switch checked={policies.enabled} onChange={(v) => setPolicies({ ...policies, enabled: v })} /></div>
+            </div>
+            {policies.rules.length === 0 ? <div className="py-8 text-center text-sm text-dim">暂无策略。先新增一条规则，再保存或预览。</div> : <div className="mt-3 flex flex-col gap-3">
+              {policies.rules.map((rule) => <div key={rule.id} className="rounded-lg border border-line bg-white/3 p-4">
+                <div className="flex flex-wrap items-center gap-2"><input value={rule.name} onChange={(e) => patchPolicy(rule.id, { name: e.target.value })} className="min-w-[150px] flex-1 rounded-md border border-line bg-white/4 px-2.5 py-1.5 text-sm text-fg focus:outline-none" /><select value={rule.action} onChange={(e) => patchPolicy(rule.id, { action: e.target.value as TorrentPolicy['action'] })} className="aurora-select rounded-md border border-line px-2 py-1.5 text-xs text-fg focus:outline-none"><option value="pause">达到条件后暂停</option><option value="notify">达到条件后通知</option><option value="transfer">达到条件后转存网盘</option><option value="remove">达到条件后移除任务</option></select><Switch checked={rule.enabled} onChange={(v) => patchPolicy(rule.id, { enabled: v })} /><button type="button" onClick={() => setPolicies({ ...policies, rules: policies.rules.filter((item) => item.id !== rule.id) })} title="删除策略" aria-label="删除策略" className="grid h-7 w-7 place-items-center rounded-md text-dim hover:text-rose-300"><Trash2 size={13} /></button></div>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-6"><label className="text-[11px] text-dim">匹配分类<input value={rule.category} onChange={(e) => patchPolicy(rule.id, { category: e.target.value })} placeholder="留空=全部" className="mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none" /></label><label className="text-[11px] text-dim">指定 Hash<input value={rule.hash || ''} onChange={(e) => patchPolicy(rule.id, { hash: e.target.value.trim().toLowerCase() })} placeholder="可选 40 位" className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-[10px] text-fg placeholder:text-dim/60 focus:outline-none" /></label><label className="text-[11px] text-dim">最少做种分钟<input type="number" min={0} value={rule.min_seed_minutes} onChange={(e) => patchPolicy(rule.id, { min_seed_minutes: Math.max(0, Number(e.target.value) || 0) })} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg focus:outline-none" /></label><label className="text-[11px] text-dim">最大做种分钟<input type="number" min={-1} value={rule.max_seed_minutes} onChange={(e) => { const value = Number(e.target.value); patchPolicy(rule.id, { max_seed_minutes: Number.isFinite(value) ? value : -1 }) }} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg focus:outline-none" /></label><label className="text-[11px] text-dim">最大空闲分钟<input type="number" min={-1} value={rule.max_inactive_minutes} onChange={(e) => { const value = Number(e.target.value); patchPolicy(rule.id, { max_inactive_minutes: Number.isFinite(value) ? value : -1 }) }} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg focus:outline-none" /></label><label className="text-[11px] text-dim">最大分享率<input type="number" min={-1} step="0.01" value={rule.max_ratio} onChange={(e) => { const value = Number(e.target.value); patchPolicy(rule.id, { max_ratio: Number.isFinite(value) ? value : -1 }) }} className="num mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg focus:outline-none" /></label></div>
+                {rule.action === 'transfer' && <div className="mt-3 grid gap-2 sm:grid-cols-2"><label className="text-[11px] text-dim">目标网盘<select value={rule.destination_remote || ''} onChange={(e) => patchPolicy(rule.id, { destination_remote: e.target.value })} className="aurora-select mt-1 w-full rounded-md border border-line px-2 py-1.5 text-xs text-fg focus:outline-none"><option value="">选择网盘</option>{policyRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name} · {remote.type || 'remote'}</option>)}</select></label><label className="text-[11px] text-dim">目标目录<input value={rule.destination_path || ''} onChange={(e) => patchPolicy(rule.id, { destination_path: e.target.value })} placeholder="留空=根目录" className="mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg focus:outline-none" /></label></div>}
+                {rule.action === 'remove' && <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-dim"><label className="flex items-center gap-1.5"><input type="checkbox" checked={rule.allow_delete} onChange={(e) => patchPolicy(rule.id, { allow_delete: e.target.checked })} className="accent-rose-400" />允许自动移除任务</label><label className="flex items-center gap-1.5"><input type="checkbox" checked={rule.delete_files} onChange={(e) => patchPolicy(rule.id, { delete_files: e.target.checked })} className="accent-rose-400" />同时删除本地文件</label><span className="text-[10px] text-amber-300">删除文件不可恢复，且网盘转存未完成时始终保护。</span></div>}
+              </div>)}
+            </div>}
+            {policyPreview && <div className="mt-4 rounded-lg border border-line bg-white/3 p-4"><div className="flex items-center justify-between gap-2"><div className="text-xs text-dim">预览命中 <span className="num text-fg">{policyPreview.length}</span> 项</div><button type="button" onClick={() => void applyPolicies()} disabled={policyBusy || !policyPreview.length} className="inline-flex items-center gap-1.5 rounded-md border border-amber-400/30 bg-amber-400/10 px-2.5 py-1.5 text-xs text-amber-200 hover:bg-amber-400/20 disabled:opacity-40"><Play size={12} />应用策略</button></div><div className="mt-2 max-h-44 overflow-y-auto">{policyPreview.map((item) => <div key={`${item.hash}-${item.rule_id}`} className="flex items-center gap-2 border-t border-line/60 py-2 text-xs"><div className="min-w-0 flex-1 truncate text-fg">{item.name}</div><span className="shrink-0 text-dim">{item.rule_name}</span><span className={item.protected ? 'shrink-0 text-amber-300' : 'shrink-0 text-dim'}>{item.protected ? `受保护：${item.protection}` : item.reason}</span></div>)}</div></div>}
+          </>}
         </section>
 
         <section className="panel px-6 py-5 lg:col-span-2">

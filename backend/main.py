@@ -274,6 +274,8 @@ def _startup():
     providers.start_daily_scheduler()
     # 本地下载完成后自动转存到用户选择的网盘目标
     providers.start_torrent_destination_scheduler()
+    # 做种策略默认关闭；开启后仅按设置页中保存的规则执行。
+    providers.start_torrent_policy_scheduler()
 
 
 @app.get("/api/metrics")
@@ -289,11 +291,30 @@ def sources(_user: str = Depends(require_auth)):
         return {"error": str(e)}
 
 
+def _qbit_category(value: str) -> str:
+    value = str(value or "").strip()
+    if value and not providers.QbittorrentProvider._valid_label(value):
+        raise HTTPException(status_code=400, detail="分类名称无效")
+    return value
+
+
+def _qbit_tags(values) -> list[str]:
+    raw = values.split(",") if isinstance(values, str) else (values or [])
+    if len(list(raw)) > 32 or any(str(item or "").strip().startswith("aurora-") for item in raw):
+        raise HTTPException(status_code=400, detail="标签包含保留名称或数量过多")
+    tags = providers.QbittorrentProvider._clean_labels(raw)
+    if any(not providers.QbittorrentProvider._valid_label(item) for item in tags):
+        raise HTTPException(status_code=400, detail="标签名称无效")
+    return tags
+
+
 class AddMagnet(BaseModel):
     magnet: str
     save_path: str = ""
     destination_remote: str = ""
     destination_path: str = ""
+    category: str = ""
+    tags: list[str] = []
 
 
 _MAX_TORRENT_FILE = 20 * 1024 * 1024
@@ -307,17 +328,20 @@ def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
     save_path = _torrent_save_path(body.save_path)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法添加磁力")
+    category = _qbit_category(body.category)
+    tags = _qbit_tags(body.tags)
     marker, destination_path, detail = providers.register_torrent_destination(
         body.destination_remote, body.destination_path,
     )
     if detail:
         raise HTTPException(status_code=400, detail=detail)
-    if not providers._qbit.add(magnet, save_path, marker):
+    if not providers._qbit.add(magnet, save_path, marker, category, tags):
         providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该磁力（链接可能已存在或无效）")
     return {
         "ok": True, "mode": "qbittorrent", "save_path": body.save_path.strip(),
         "destination_remote": body.destination_remote.strip(), "destination_path": destination_path,
+        "category": category, "tags": tags,
     }
 
 
@@ -327,6 +351,8 @@ async def upload_torrent(
     save_path: str = Form(""),
     destination_remote: str = Form(""),
     destination_path: str = Form(""),
+    category: str = Form(""),
+    tags: str = Form(""),
     _user: str = Depends(require_auth),
 ):
     name = Path(file.filename or "").name
@@ -335,6 +361,8 @@ async def upload_torrent(
     qbit_save_path = _torrent_save_path(save_path)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法上传种子")
+    category = _qbit_category(category)
+    tags = _qbit_tags(tags)
     try:
         content = await file.read(_MAX_TORRENT_FILE + 1)
     finally:
@@ -348,12 +376,13 @@ async def upload_torrent(
     )
     if detail:
         raise HTTPException(status_code=400, detail=detail)
-    if not providers._qbit.add_file(name, content, qbit_save_path, marker):
+    if not providers._qbit.add_file(name, content, qbit_save_path, marker, category, tags):
         providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
     return {
         "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_path.strip(),
         "destination_remote": destination_remote.strip(), "destination_path": destination_path,
+        "category": category, "tags": tags,
     }
 
 
@@ -376,6 +405,144 @@ def batch_torrent(body: BatchAction, _user: str = Depends(require_auth)):
         else:
             failed += 1
     return {"ok": True, "done": done, "failed": failed, "mode": "qbittorrent" if qbit else "demo"}
+
+
+class TorrentAdvancedAction(BaseModel):
+    id: str
+    action: str
+    limit_kib: int | None = None
+    location: str = ""
+    delete_files: bool = False
+    file_ids: list[int] = []
+    priority: int | None = None
+
+
+@app.get("/api/torrents/detail")
+def torrent_detail(hash: str, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    ok, detail, error = providers._qbit.torrent_detail(hash)
+    if not ok:
+        raise HTTPException(status_code=404 if error == "任务不存在" else 502, detail=error)
+    return {"online": True, "torrent": detail}
+
+
+@app.post("/api/torrents/advanced")
+def torrent_advanced(body: TorrentAdvancedAction, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    location = ""
+    if body.action == "set_location":
+        location = _torrent_save_path(body.location)
+    if body.action in ("set_download_limit", "set_upload_limit"):
+        if body.limit_kib is None or not 0 <= body.limit_kib <= 10_000_000:
+            raise HTTPException(status_code=400, detail="限速必须在 0-10000000 KiB/s 之间")
+        limit = body.limit_kib * 1024
+    else:
+        limit = None
+    if body.action == "set_file_priority":
+        if not body.file_ids or len(body.file_ids) > 512 or body.priority is None or not 0 <= body.priority <= 7:
+            raise HTTPException(status_code=400, detail="文件优先级参数无效")
+    ok, detail = providers._qbit.advanced_action(
+        body.id, body.action, value=limit, delete_files=body.delete_files, location=location,
+        file_ids=body.file_ids, priority=body.priority,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+class TorrentLabelsBody(BaseModel):
+    id: str
+    category: str | None = None
+    tags: list[str] | None = None
+
+
+@app.get("/api/torrents/labels")
+def torrent_labels(_user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        return {"online": False, "categories": [], "tags": [], "detail": "qBittorrent 未接入"}
+    ok, data, detail = providers._qbit.labels()
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail or "读取分类标签失败")
+    return {"online": True, **data}
+
+
+class TorrentCategoryBody(BaseModel):
+    name: str
+    save_path: str = ""
+
+
+@app.post("/api/torrents/category")
+def create_torrent_category(body: TorrentCategoryBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    name = _qbit_category(body.name)
+    save_path = _torrent_save_path(body.save_path) if body.save_path.strip() else "/downloads"
+    ok, detail = providers._qbit.create_category(name, save_path)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+@app.post("/api/torrents/category/edit")
+def edit_torrent_category(body: TorrentCategoryBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    name = _qbit_category(body.name)
+    save_path = _torrent_save_path(body.save_path) if body.save_path.strip() else "/downloads"
+    ok, detail = providers._qbit.edit_category(name, save_path)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+@app.post("/api/torrents/category/delete")
+def delete_torrent_category(body: TorrentCategoryBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    ok, detail = providers._qbit.delete_category(_qbit_category(body.name))
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+class TorrentTagsBody(BaseModel):
+    tags: list[str]
+
+
+@app.post("/api/torrents/tag")
+def create_torrent_tags(body: TorrentTagsBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    tags = _qbit_tags(body.tags)
+    ok, detail = providers._qbit.create_tags(tags)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+@app.post("/api/torrents/tag/delete")
+def delete_torrent_tags(body: TorrentTagsBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    tags = _qbit_tags(body.tags)
+    ok, detail = providers._qbit.delete_tags(tags)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True}
+
+
+@app.post("/api/torrents/labels")
+def update_torrent_labels(body: TorrentLabelsBody, _user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    category = None if body.category is None else _qbit_category(body.category)
+    tags = None if body.tags is None else _qbit_tags(body.tags)
+    ok, detail, error = providers._qbit.update_labels(body.id, category, tags)
+    if not ok:
+        raise HTTPException(status_code=400, detail=error)
+    return {"ok": True, "torrent": detail}
 
 
 class TorrentAction(BaseModel):
@@ -430,6 +597,48 @@ class SettingsBody(BaseModel):
 @app.post("/api/settings")
 def post_settings(body: SettingsBody, _user: str = Depends(require_auth)):
     return providers.save_settings(body.settings)
+
+
+class TorrentPoliciesBody(BaseModel):
+    enabled: bool = False
+    interval: int = 300
+    rules: list[dict] = []
+
+
+@app.get("/api/torrents/policies")
+def get_torrent_policies(_user: str = Depends(require_auth)):
+    return providers.torrent_policies()
+
+
+@app.post("/api/torrents/policies")
+def post_torrent_policies(body: TorrentPoliciesBody, _user: str = Depends(require_auth)):
+    if body.interval < 60 or body.interval > 86400:
+        raise HTTPException(status_code=400, detail="策略检查间隔必须在 60-86400 秒之间")
+    if len(body.rules) > 32:
+        raise HTTPException(status_code=400, detail="策略最多 32 条")
+    return {"ok": True, "policies": providers.save_torrent_policies(body.model_dump())}
+
+
+@app.get("/api/torrents/policies/preview")
+def preview_torrent_policies(_user: str = Depends(require_auth)):
+    ok, data, detail = providers.preview_torrent_policies()
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
+    return data
+
+
+class TorrentPoliciesApplyBody(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/api/torrents/policies/apply")
+def apply_torrent_policies(body: TorrentPoliciesApplyBody, _user: str = Depends(require_auth)):
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="请明确确认后应用策略")
+    ok, data, detail = providers.apply_torrent_policies(confirm=True)
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
+    return {"ok": True, **data}
 
 
 class QbitQueueBody(BaseModel):
