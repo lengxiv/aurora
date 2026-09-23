@@ -5,6 +5,7 @@
 这是一个可自托管项目。源码仓库不包含账号、token、媒体库、下载内容或服务运行数据；部署配置请参考 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)，发布到 GitHub 请先阅读 [`docs/GITHUB.md`](docs/GITHUB.md) 和 [`docs/SECURITY.md`](docs/SECURITY.md)。
 
 功能总览见 [`FEATURES.md`](FEATURES.md)，按日期整理的变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+开发待办和后续路线见 [`TODO.md`](TODO.md)。
 
 | 模块 | 路径 | 内容 |
 |------|------|------|
