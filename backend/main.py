@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import mimetypes
 import os
+import re
 import secrets
 import threading
 import time
@@ -822,7 +824,92 @@ def media_stream(path: str, _user: str = Depends(require_auth)):
     fp = _media_safe(Path(path))
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(fp)
+    media_type = mimetypes.guess_type(fp.name)[0] or "application/octet-stream"
+    return FileResponse(fp, media_type=media_type)
+
+
+def _subtitle_text(fp: Path) -> str:
+    raw = fp.read_bytes()
+    for encoding in ("utf-8-sig", "gb18030", "utf-16"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _vtt_time(value: str) -> str:
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 2:
+        value = "00:" + value
+    elif len(parts) == 1:
+        value = "00:00:" + value
+    return value
+
+
+def _ass_time(value: str) -> str:
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) != 3:
+        return "00:00:00.000"
+    hours, minutes, seconds = parts
+    try:
+        whole, fraction = (seconds.split(".", 1) + ["0"])[:2]
+        milliseconds = int(float(f"0.{fraction}") * 1000)
+        return f"{int(hours):02d}:{int(minutes):02d}:{int(whole):02d}.{milliseconds:03d}"
+    except ValueError:
+        return "00:00:00.000"
+
+
+def _subtitle_vtt(fp: Path) -> bytes:
+    """Normalize common subtitle formats to WebVTT for browser TextTrack."""
+    text = _subtitle_text(fp).replace("\r\n", "\n").replace("\r", "\n")
+    ext = fp.suffix.lower()
+    if ext == ".vtt":
+        return (text if text.lstrip().startswith("WEBVTT") else "WEBVTT\n\n" + text).encode("utf-8")
+
+    cues: list[tuple[str, str, str]] = []
+    if ext == ".srt":
+        blocks = re.split(r"\n\s*\n", text.strip())
+        for block in blocks:
+            lines = block.split("\n")
+            timing_index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+            if timing_index < 0:
+                continue
+            start, end = (part.strip() for part in lines[timing_index].split("-->", 1))
+            caption = "\n".join(lines[timing_index + 1:]).strip()
+            if caption:
+                cues.append((_vtt_time(start), _vtt_time(end), caption))
+    elif ext in (".ass", ".ssa"):
+        for line in text.split("\n"):
+            if not line.lower().startswith("dialogue:"):
+                continue
+            fields = line.split(":", 1)[1].lstrip().split(",", 9)
+            if len(fields) < 3:
+                continue
+            caption = fields[9] if len(fields) > 9 else ""
+            caption = re.sub(r"\{[^}]*\}", "", caption)
+            caption = caption.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ").strip()
+            if caption:
+                cues.append((_ass_time(fields[1]), _ass_time(fields[2]), caption))
+    else:
+        raise HTTPException(status_code=415, detail="不支持的字幕格式")
+
+    out = ["WEBVTT", ""]
+    for start, end, caption in cues:
+        out.extend([f"{start} --> {end}", caption, ""])
+    return "\n".join(out).encode("utf-8")
+
+
+@app.get("/api/media/subtitle")
+def media_subtitle(path: str, _user: str = Depends(require_auth)):
+    fp = _media_safe(Path(path))
+    if not fp.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    if fp.suffix.lower() not in _SUB_EXT:
+        raise HTTPException(status_code=415, detail="not a subtitle")
+    return Response(content=_subtitle_vtt(fp), media_type="text/vtt; charset=utf-8")
 
 
 @app.post("/api/media/delete")
@@ -1030,6 +1117,7 @@ def jf_library(_user: str = Depends(require_auth)):
 @app.get("/api/jellyfin/image")
 def jf_image(item_id: str, tag: str = "", _user: str = Depends(require_auth)):
     import re as _re
+    import urllib.parse
     if not _re.fullmatch(r"[0-9A-Za-z\-]{1,64}", item_id or ""):
         raise HTTPException(status_code=400, detail="bad item_id")
     import requests
@@ -1037,8 +1125,12 @@ def jf_image(item_id: str, tag: str = "", _user: str = Depends(require_auth)):
     token = providers._jelly.token
     if not token:
         raise HTTPException(status_code=404, detail="jellyfin 未接入")
-    url = f"{base}/Items/{item_id}/Images/Primary" + (f"?tag={tag}" if tag else "")
-    up = requests.get(url, headers={"X-Emby-Token": token}, timeout=10)
+    query = f"?{urllib.parse.urlencode({'tag': tag})}" if tag else ""
+    try:
+        up = requests.get(f"{base}/Items/{item_id}/Images/Primary{query}",
+                          headers={"X-Emby-Token": token}, timeout=10)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail="Jellyfin 海报服务不可用") from exc
     if up.status_code != 200:
         raise HTTPException(status_code=up.status_code, detail="poster not found")
     return Response(content=up.content, media_type=up.headers.get("content-type", "image/jpeg"))
@@ -1058,10 +1150,18 @@ def jf_stream(item_id: str, request: Request, _user: str = Depends(require_auth)
     rng = request.headers.get("range")
     if rng:
         headers["Range"] = rng
-    up = requests.get(f"{base}/Videos/{item_id}/stream?static=true",
-                      headers=headers, stream=True, timeout=10)
+    try:
+        up = requests.get(f"{base}/Videos/{item_id}/stream?static=true",
+                          headers=headers, stream=True, timeout=(5, 60))
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail="Jellyfin 播放服务不可用") from exc
+    if up.status_code >= 400:
+        status = up.status_code if up.status_code < 500 else 502
+        up.close()
+        raise HTTPException(status_code=status, detail="Jellyfin 无法提供媒体流")
     hdr = {}
-    for k in ("content-type", "content-range", "accept-ranges", "content-length", "content-disposition"):
+    for k in ("content-type", "content-range", "accept-ranges", "content-length",
+              "content-disposition", "etag", "last-modified"):
         if k in up.headers:
             hdr[k] = up.headers[k]
 

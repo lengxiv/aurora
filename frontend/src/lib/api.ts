@@ -603,6 +603,7 @@ export async function fetchMedia() {
 
 export const mediaStreamUrl = (p: string) => `/api/media/stream?path=${encodeURIComponent(p)}`
 export const mediaThumbUrl = (p: string) => `/api/media/thumb?path=${encodeURIComponent(p)}`
+export const mediaSubtitleUrl = (p: string) => `/api/media/subtitle?path=${encodeURIComponent(p)}`
 
 export interface JellyfinItem {
   id: string

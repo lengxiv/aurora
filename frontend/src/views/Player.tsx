@@ -1,12 +1,40 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as RPE } from 'react'
-import { FolderOpen, Search, Play, Pause, Film, Music4, Subtitles, Trash2, Pencil, X, File, Image as ImageIcon, ChevronLeft, ChevronRight, Maximize, GripHorizontal, Copy, Loader, LayoutGrid, List as ListIcon, Check, FolderInput, MonitorPlay, WifiOff, FolderPlus, RotateCcw } from 'lucide-react'
-import { fetchMedia, mediaStreamUrl, mediaThumbUrl, deleteMedia, renameMedia, moveMedia, moveSeedMedia, fetchDirs, mkdirMedia, rmdirMedia, fetchJellyfinLibrary, jellyfinImageUrl, jellyfinStreamUrl, fetchTrash, restoreTrash, purgeTrash, type TrashItem, type MediaFile, type JellyfinItem, type MediaDir } from '../lib/api'
+import { FolderOpen, Search, Play, Pause, Film, Music4, Subtitles, Trash2, Pencil, X, File, Image as ImageIcon, ChevronLeft, ChevronRight, Maximize, GripHorizontal, Copy, Loader, LayoutGrid, List as ListIcon, Check, FolderInput, MonitorPlay, WifiOff, FolderPlus, RotateCcw, PictureInPicture, SkipBack, SkipForward } from 'lucide-react'
+import { fetchMedia, mediaStreamUrl, mediaSubtitleUrl, mediaThumbUrl, deleteMedia, renameMedia, moveMedia, moveSeedMedia, fetchDirs, mkdirMedia, rmdirMedia, fetchJellyfinLibrary, jellyfinImageUrl, jellyfinStreamUrl, fetchTrash, restoreTrash, purgeTrash, type TrashItem, type MediaFile, type JellyfinItem, type MediaDir } from '../lib/api'
 import { Skeleton, EmptyState } from '../components/ui'
 import { useToast } from '../toast'
 
 const KIND_LABEL: Record<string, string> = { video: '视频', audio: '音频', sub: '字幕', image: '图片', file: '文件' }
 const KIND_ICON: Record<string, typeof Film> = { video: Film, audio: Music4, sub: Subtitles, image: ImageIcon, file: File }
 const FILTERS = ['all', 'video', 'audio', 'sub', 'image', 'file'] as const
+const PROGRESS_PREFIX = 'aurora:prog:'
+
+function progressKey(kind: 'local' | 'jellyfin', id: string) {
+  return `${PROGRESS_PREFIX}${kind}:${id}`
+}
+
+function restoreProgress(el: HTMLMediaElement, key: string) {
+  const saved = Number(localStorage.getItem(key) || 0)
+  if (saved > 10 && Number.isFinite(el.duration) && el.duration > 0 && saved < el.duration - 5) {
+    el.currentTime = saved
+  } else if (saved >= el.duration - 5 && saved > 10) {
+    localStorage.removeItem(key)
+  }
+}
+
+function subtitleStem(name: string) {
+  return name.replace(/\.(srt|ass|ssa|vtt)$/i, '').toLowerCase()
+}
+
+function subtitleLabel(name: string) {
+  const stem = subtitleStem(name)
+  const suffix = stem.split('.').pop() || ''
+  const labels: Record<string, string> = {
+    zh: '中文', zho: '中文', chi: '中文', chs: '简中', sc: '简中',
+    cht: '繁中', tc: '繁中', en: 'English', eng: 'English',
+  }
+  return labels[suffix] || suffix || '字幕'
+}
 
 function fmtSize(b: number) {
   if (b >= 1073741824) return `${(b / 1073741824).toFixed(2)} GB`
@@ -30,7 +58,11 @@ export default function PlayerView() {
   const [loading, setLoading] = useState(true)
   const [dirsList, setDirsList] = useState<MediaDir[]>([])
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
-  const toggleFold = (path: string) => setCollapsed((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n })
+  const toggleFold = (path: string) => setCollapsed((s) => {
+    const n = new Set(s)
+    if (n.has(path)) n.delete(path); else n.add(path)
+    return n
+  })
   const [moveOpen, setMoveOpen] = useState(false)
   const [moveDest, setMoveDest] = useState('')
   const [moveQuery, setMoveQuery] = useState('')
@@ -39,8 +71,11 @@ export default function PlayerView() {
   const [jf, setJf] = useState<{ online: boolean; items: JellyfinItem[] } | null>(null)
   const [jfPlay, setJfPlay] = useState<JellyfinItem | null>(null)
   const [jfState, setJfState] = useState<'load' | 'ok' | 'err'>('load')
+  const [rate, setRate] = useState(1)
+  const [retry, setRetry] = useState(0)
+  const mediaRef = useRef<HTMLMediaElement | null>(null)
 
-  useEffect(() => { setJfState('load') }, [jfPlay])
+  useEffect(() => { setJfState('load'); setRetry(0) }, [jfPlay])
   useEffect(() => { if (mode === 'trash') fetchTrash().then(setTrash) }, [mode])
 
   const load = useCallback(async () => {
@@ -67,15 +102,25 @@ export default function PlayerView() {
   const shown = files.filter((f) => (!dir || f.dir === dir || f.dir.startsWith(dir + '/')) && (kind === 'all' || f.kind === kind) && (!qn || f.name.toLowerCase().includes(qn)))
   const playFile = playPath ? files.find((f) => f.path === playPath) : null
   const isVideo = !!playFile && playFile.kind === 'video'
-  const vids = shown.filter((f) => f.kind === 'video')
-  const srtPath = playFile && playFile.dir
-    ? files.find((f) => f.kind === 'sub' && f.dir === playFile.dir && (f.name.toLowerCase().includes(playFile.name.split('.').slice(0, -1).join('.').toLowerCase()) || f.dir === playFile.dir))
-    : undefined
+  const playables = shown.filter((f) => f.kind === 'video' || f.kind === 'audio')
+  const subtitleFiles = playFile && isVideo
+    ? files.filter((f) => {
+        if (f.kind !== 'sub' || f.dir !== playFile.dir) return false
+        const videoStem = playFile.name.replace(/\.[^.]+$/, '').toLowerCase()
+        const subStem = subtitleStem(f.name)
+        return subStem === videoStem || subStem.startsWith(videoStem + '.')
+      }).sort((a, b) => {
+        const aZh = /\.(zh|zho|chi|chs|sc|cht|tc)(\.|$)/i.test(subtitleStem(a.name)) ? 0 : 1
+        const bZh = /\.(zh|zho|chi|chs|sc|cht|tc)(\.|$)/i.test(subtitleStem(b.name)) ? 0 : 1
+        return aZh - bZh || a.name.localeCompare(b.name)
+      })
+    : []
   const [vState, setVState] = useState<'load' | 'ok' | 'err'>('load')
-  useEffect(() => { setVState('load') }, [playPath])
+  useEffect(() => { setVState('load'); setRetry(0) }, [playPath])
   const onEnded = () => {
-    const i = vids.findIndex((v) => v.path === playPath)
-    const nx = vids[i + 1]
+    if (playPath) localStorage.removeItem(progressKey('local', playPath))
+    const i = playables.findIndex((v) => v.path === playPath)
+    const nx = playables[i + 1]
     if (nx) { setPlayPath(nx.path); setVState('load') }
   }
   const imgs = shown.filter((f) => f.kind === 'image')
@@ -122,6 +167,23 @@ export default function PlayerView() {
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up)
   }
   const full = () => { if (vref.current) vref.current.requestFullscreen?.() }
+  const pip = async () => {
+    const video = vref.current
+    if (!video) return
+    try {
+      if (document.pictureInPictureElement) await document.exitPictureInPicture()
+      else if (document.pictureInPictureEnabled && video.requestPictureInPicture) await video.requestPictureInPicture()
+    } catch { toast('当前浏览器不支持画中画', 'warn') }
+  }
+  const jump = (delta: number) => {
+    const i = playables.findIndex((f) => f.path === playPath)
+    const next = playables[i + delta]
+    if (next) setPlayPath(next.path)
+  }
+  const setMedia = (node: HTMLMediaElement | null) => {
+    mediaRef.current = node
+    if (node) node.playbackRate = rate
+  }
   const [fz, setFz] = useState<{ w: number } | null>(() => {
     try { const v = JSON.parse(localStorage.getItem(PASS_W) || ''); return v && typeof v.w === 'number' ? v : null } catch { return null }
   })
@@ -142,6 +204,9 @@ export default function PlayerView() {
     if (!playPath || !vref.current) return
     // 续播记忆：仅当浮窗首帧加载时在 onLoadedMetadata 恢复，这里不做
   }, [playPath])
+  useEffect(() => {
+    if (mediaRef.current) mediaRef.current.playbackRate = rate
+  }, [rate, playPath, jfPlay])
 
   const del = async (f: MediaFile) => {
     if (f.seeding) {
@@ -187,7 +252,11 @@ export default function PlayerView() {
     toast(ok ? '目录已创建' : '创建失败（可能已存在或路径非法）', ok ? 'ok' : 'bad')
     if (ok) { setDir(cleaned); load() }
   }
-  const toggleSel = (p: string) => setSel((s) => { const n = new Set(s); n.has(p) ? n.delete(p) : n.add(p); return n })
+  const toggleSel = (p: string) => setSel((s) => {
+    const n = new Set(s)
+    if (n.has(p)) n.delete(p); else n.add(p)
+    return n
+  })
   const batchDel = async () => {
     if (!sel.size) return
     const seedingSel = files.filter((f) => sel.has(f.path) && f.seeding).length
@@ -480,33 +549,60 @@ export default function PlayerView() {
             className="flex items-center gap-2 border-b border-line bg-white/4 px-3 py-2">
             <GripHorizontal size={14} className="shrink-0 text-dim" />
             <span className="min-w-0 flex-1 truncate text-xs text-fg">{playFile ? playFile.name : playPath}</span>
-            <button onClick={() => setPlayPath(null)} className="shrink-0 text-dim hover:text-fg"><X size={14} /></button>
+            {playables.length > 1 && <>
+              <button onClick={() => jump(-1)} disabled={!playables[playables.findIndex((f) => f.path === playPath) - 1]} title="上一项" aria-label="上一项"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg disabled:opacity-30"><SkipBack size={13} /></button>
+              <button onClick={() => jump(1)} disabled={!playables[playables.findIndex((f) => f.path === playPath) + 1]} title="下一项" aria-label="下一项"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg disabled:opacity-30"><SkipForward size={13} /></button>
+            </>}
+            <select value={rate} onChange={(e) => setRate(Number(e.target.value))} title="播放速度" aria-label="播放速度"
+              className="h-7 rounded-md border border-line bg-ink-2 px-1.5 text-[11px] text-fg focus:outline-none">
+              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => <option key={v} value={v}>{v}x</option>)}
+            </select>
+            {isVideo && <button onClick={pip} title="画中画" aria-label="画中画"
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg"><PictureInPicture size={14} /></button>}
+            {isVideo && <button onClick={full} title="全屏" aria-label="全屏" className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg"><Maximize size={14} /></button>}
+            <button onClick={() => setPlayPath(null)} title="关闭播放器" aria-label="关闭播放器" className="grid h-7 w-7 shrink-0 place-items-center text-dim hover:text-fg"><X size={14} /></button>
           </div>
           <div className="p-2">
             {isVideo ? (
               <div className="relative">
-                <video key={playPath} ref={vref} controls autoPlay src={mediaStreamUrl(playPath)}
+                <video key={`${playPath}:${retry}`} ref={(node) => { vref.current = node; setMedia(node) }} controls autoPlay src={mediaStreamUrl(playPath)}
                   onLoadedMetadata={(e) => {
-                    const d = e.currentTarget.duration
-                    const t = Number(localStorage.getItem('aurora:prog:' + playPath) || 0)
-                    if (t > 10 && d > 0 && t < d - 5) e.currentTarget.currentTime = t
+                    restoreProgress(e.currentTarget, progressKey('local', playPath))
                   }}
                   onLoadedData={() => { setVState('ok'); vref.current?.play().catch(() => {}) }}
                   onError={() => setVState('err')}
                   onEnded={onEnded}
-                  onTimeUpdate={(e) => localStorage.setItem('aurora:prog:' + playPath, String(e.currentTarget.currentTime))}
+                  onTimeUpdate={(e) => localStorage.setItem(progressKey('local', playPath), String(e.currentTarget.currentTime))}
                   className="max-h-[58vh] w-full rounded bg-black">
-                  {srtPath && <track kind="subtitles" src={mediaStreamUrl(srtPath.path)} srcLang="zh" label="字幕" default />}
+                  {subtitleFiles.map((sub, i) => <track key={sub.path} kind="subtitles" src={mediaSubtitleUrl(sub.path)} srcLang={/\.(en|eng)(\.|$)/i.test(subtitleStem(sub.name)) ? 'en' : 'zh'} label={subtitleLabel(sub.name)} default={i === 0} />)}
                 </video>
                 {vState !== 'ok' && (
                   <div className="absolute inset-0 grid place-items-center rounded bg-black/50 text-white/80">
-                    {vState === 'err' ? <span className="px-4 text-center text-xs">无法播放该文件</span> : <Loader size={22} className="animate-spin" />}
+                    {vState === 'err' ? (
+                      <div className="flex flex-col items-center gap-3 px-4 text-center text-xs">
+                        <span>无法播放该文件，可能是浏览器不支持此编码</span>
+                        <button onClick={() => { setVState('load'); setRetry((n) => n + 1) }} className="inline-flex items-center gap-1 rounded-md border border-white/20 bg-white/10 px-2.5 py-1.5 text-white hover:bg-white/20"><RotateCcw size={12} />重试</button>
+                      </div>
+                    ) : <Loader size={22} className="animate-spin" />}
                   </div>
                 )}
-                <button onClick={full} className="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-lg bg-black/50 text-white hover:bg-black/80"><Maximize size={15} /></button>
+                <button onClick={full} title="全屏" aria-label="全屏" className="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-lg bg-black/50 text-white hover:bg-black/80"><Maximize size={15} /></button>
               </div>
             ) : (
-              <audio controls autoPlay src={mediaStreamUrl(playPath)} className="w-full" />
+              <div className="relative">
+                <audio key={`${playPath}:${retry}`} ref={setMedia} controls autoPlay src={mediaStreamUrl(playPath)}
+                  onLoadedMetadata={(e) => restoreProgress(e.currentTarget, progressKey('local', playPath))}
+                  onLoadedData={() => setVState('ok')}
+                  onError={() => setVState('err')}
+                  onEnded={onEnded}
+                  onTimeUpdate={(e) => localStorage.setItem(progressKey('local', playPath), String(e.currentTarget.currentTime))}
+                  className="w-full" />
+                {vState !== 'ok' && <div className="absolute inset-0 grid place-items-center rounded bg-ink-2/90 text-white/80">
+                  {vState === 'err' ? <button onClick={() => { setVState('load'); setRetry((n) => n + 1) }} className="inline-flex items-center gap-1 rounded-md border border-white/20 bg-white/10 px-2.5 py-1.5 text-xs text-white hover:bg-white/20"><RotateCcw size={12} />重试</button> : <Loader size={18} className="animate-spin" />}
+                </div>}
+              </div>
             )}
           </div>
           <div onPointerDown={startResize} title="拖拽调整大小"
@@ -544,6 +640,19 @@ export default function PlayerView() {
             <div className="flex items-center justify-between gap-3 border-b border-line bg-white/4 px-4 py-2.5">
               <span className="min-w-0 flex-1 truncate text-sm text-fg">{jfPlay.name}</span>
               <div className="flex shrink-0 items-center gap-1.5">
+                <select value={rate} onChange={(e) => setRate(Number(e.target.value))} title="播放速度" aria-label="播放速度"
+                  className="h-7 rounded-md border border-line bg-ink-2 px-1.5 text-[11px] text-fg focus:outline-none">
+                  {[0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => <option key={v} value={v}>{v}x</option>)}
+                </select>
+                <button onClick={async () => {
+                  const video = vref.current
+                  if (!video) return
+                  try {
+                    if (document.pictureInPictureElement) await document.exitPictureInPicture()
+                    else if (document.pictureInPictureEnabled && video.requestPictureInPicture) await video.requestPictureInPicture()
+                  } catch { toast('当前浏览器不支持画中画', 'warn') }
+                }} title="画中画" aria-label="画中画" className="grid h-7 w-7 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg"><PictureInPicture size={14} /></button>
+                <button onClick={full} title="全屏" aria-label="全屏" className="grid h-7 w-7 place-items-center rounded-md text-dim hover:bg-white/8 hover:text-fg"><Maximize size={14} /></button>
                 {jfPlay.localPath && (
                   <button onClick={() => { setPlayPath(jfPlay.localPath); setJfPlay(null) }}
                     className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-2.5 py-1 text-xs text-dim hover:text-fg">
@@ -554,18 +663,22 @@ export default function PlayerView() {
               </div>
             </div>
             <div className="relative bg-black">
-              <video key={jfPlay.id} controls autoPlay src={jellyfinStreamUrl(jfPlay.id)}
+              <video key={`${jfPlay.id}:${retry}`} ref={(node) => { vref.current = node; setMedia(node) }} controls autoPlay src={jellyfinStreamUrl(jfPlay.id)}
+                onLoadedMetadata={(e) => restoreProgress(e.currentTarget, progressKey('jellyfin', jfPlay.id))}
                 onLoadedData={() => setJfState('ok')}
                 onError={() => setJfState('err')}
+                onTimeUpdate={(e) => localStorage.setItem(progressKey('jellyfin', jfPlay.id), String(e.currentTarget.currentTime))}
+                onEnded={() => localStorage.removeItem(progressKey('jellyfin', jfPlay.id))}
                 className="max-h-[70vh] w-full" />
               {jfState !== 'ok' && (
                 <div className="absolute inset-0 grid place-items-center bg-black/60 text-white/80">
                   {jfState === 'err' ? (
                     <div className="px-6 text-center">
                       <div className="text-sm">Jellyfin 播放失败</div>
+                      <button onClick={() => { setJfState('load'); setRetry((n) => n + 1) }} className="mt-3 inline-flex items-center gap-1 rounded-md border border-white/20 bg-white/10 px-2.5 py-1.5 text-xs hover:bg-white/20"><RotateCcw size={12} />重试</button>
                       {jfPlay.localPath && (
                         <button onClick={() => { setPlayPath(jfPlay.localPath); setJfPlay(null) }}
-                          className="mt-3 rounded-lg border border-line bg-white/10 px-3 py-1.5 text-xs hover:bg-white/20">
+                          className="ml-2 mt-3 rounded-lg border border-line bg-white/10 px-3 py-1.5 text-xs hover:bg-white/20">
                           改用本地播放
                         </button>
                       )}

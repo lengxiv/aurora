@@ -89,6 +89,48 @@ class MediaPathTests(unittest.TestCase):
             os.environ["AURORA_LOCAL_MOUNT"] = old_mount
 
 
+class MediaPlaybackTests(unittest.TestCase):
+    def setUp(self):
+        self.old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["AURORA_LOCAL_MOUNT"] = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        if self.old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = self.old_mount
+
+    def test_media_stream_advertises_mime_and_range_support(self):
+        Path(self.tmp.name, "clip.mp4").write_bytes(b"media")
+        response = main.media_stream("clip.mp4", "admin")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "video/mp4")
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+
+    def test_srt_is_converted_to_webvtt(self):
+        Path(self.tmp.name, "movie.zh.srt").write_text(
+            "1\n00:00:01,000 --> 00:00:03,500\n你好，世界\n", encoding="utf-8"
+        )
+        response = main.media_subtitle("movie.zh.srt", "admin")
+        self.assertEqual(response.media_type, "text/vtt; charset=utf-8")
+        self.assertIn(b"WEBVTT", response.body)
+        self.assertIn(b"00:00:01.000 --> 00:00:03.500", response.body)
+        self.assertIn("你好，世界".encode(), response.body)
+
+    def test_ass_override_tags_are_removed(self):
+        Path(self.tmp.name, "movie.ass").write_text(
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\an8}字幕\\N第二行\n",
+            encoding="utf-8",
+        )
+        body = main.media_subtitle("movie.ass", "admin").body
+        self.assertIn(b"00:00:01.000 --> 00:00:02.500", body)
+        self.assertIn("字幕\n第二行".encode(), body)
+        self.assertNotIn(b"\\an8", body)
+
+
 class SettingsTests(unittest.TestCase):
     def test_settings_are_bounded(self):
         old = providers._SETTINGS_FILE
