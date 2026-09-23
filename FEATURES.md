@@ -17,6 +17,10 @@
 - **任务提交接口**：`/api/torrents/add` 和 `/api/torrents/upload` 支持保存目录参数，磁力与种子文件行为保持一致。
 - **验证结果**：后端 47 项测试通过，前端生产构建和 lint 通过。
 - **队列管理验证**：后端 47 项测试通过，前端生产构建和 lint 通过，qBittorrent 实机队列参数已验证。
+- **P0 任务控制中心**：任务详情抽屉读取真实 qBittorrent 任务、文件、Tracker 和 Peer；支持暂停/继续、强制开始、重新校验、重新汇报、队列调整、单任务限速、保存目录调整、单文件优先级和安全删除。
+- **P0 分类与标签**：设置页支持 qBittorrent 分类目录和用户标签管理；添加磁力/种子及任务详情支持分类、标签编辑，系统关联标签受保护；任务列表可按名称、分类和标签搜索。
+- **P0 做种策略**：设置页支持按 Hash 或分类配置分享率、做种时长、空闲时长，提供预览、手动应用、暂停/通知/网盘转存/移除动作和删除保护；策略默认关闭并写入活动日志。
+- **P0 验证结果**：后端 51 项测试通过，前端生产构建和 lint 通过；真实 qBittorrent 任务详情、文件数、Tracker 数、分类标签接口和策略预览已在线验证。功能提交：`3d8aacf`。
 
 ## 认证与安全
 - 应用层登录页（`/login`），用户名默认为 `admin`，密码由 `AURORA_AUTH_PASS` 或受限状态文件管理
@@ -101,6 +105,9 @@
 - `/api/metrics` `/api/sources` `/api/info` `/api/logs`
 - `/api/torrents/add` `/api/torrents/{action}` `/api/torrents/batch` `/api/torrents/peers?hash=`（对等方明细；添加接口支持 `save_path` 和网盘目标）
 - `/api/torrents/upload`（上传 `.torrent` 文件，支持 `save_path` 和网盘目标）
+- `/api/torrents/detail?hash=` `/api/torrents/advanced`（任务详情与白名单高级操作）
+- `/api/torrents/labels` `/api/torrents/category*` `/api/torrents/tag*`（分类、标签管理与任务关联）
+- `/api/torrents/policies` `/api/torrents/policies/preview` `/api/torrents/policies/apply`（做种策略管理、预览和应用）
 - `/api/qbittorrent/queue`（读取和修改队列调度参数）
 - `/api/media` `/api/media/stream` `/api/media/delete` `/api/media/rename` `/api/media/move`
 - `/api/media/trash` `/api/media/trash/restore` `/api/media/trash/purge`
