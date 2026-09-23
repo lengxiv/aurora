@@ -432,6 +432,50 @@ def post_settings(body: SettingsBody, _user: str = Depends(require_auth)):
     return providers.save_settings(body.settings)
 
 
+class QbitQueueBody(BaseModel):
+    queueing_enabled: bool
+    max_active_torrents: int
+    max_active_downloads: int
+    max_active_uploads: int
+    max_active_checking_torrents: int
+    add_to_top_of_queue: bool
+
+
+def _validate_qbit_queue(body: QbitQueueBody) -> None:
+    # qBittorrent treats zero as no active slots, so Aurora uses 9999 as the
+    # explicit "unlimited" value shown by the settings UI.
+    limits = {
+        "max_active_torrents": (body.max_active_torrents, 1, 9999),
+        "max_active_downloads": (body.max_active_downloads, 1, 9999),
+        "max_active_uploads": (body.max_active_uploads, 1, 9999),
+        "max_active_checking_torrents": (body.max_active_checking_torrents, 1, 64),
+    }
+    for name, (value, minimum, maximum) in limits.items():
+        if not minimum <= value <= maximum:
+            raise HTTPException(status_code=400, detail=f"{name} 必须在 {minimum}-{maximum} 之间")
+
+
+@app.get("/api/qbittorrent/queue")
+def get_qbit_queue(_user: str = Depends(require_auth)):
+    if not providers._qbit.available():
+        return {"online": False, "settings": None, "detail": "qBittorrent 未接入"}
+    ok, settings, detail = providers._qbit.queue_settings()
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail or "读取 qBittorrent 队列设置失败")
+    return {"online": True, "settings": settings}
+
+
+@app.post("/api/qbittorrent/queue")
+def post_qbit_queue(body: QbitQueueBody, _user: str = Depends(require_auth)):
+    _validate_qbit_queue(body)
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    ok, settings, detail = providers._qbit.update_queue_settings(body.model_dump())
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail or "保存 qBittorrent 队列设置失败")
+    return {"ok": True, "settings": settings}
+
+
 class TgTestBody(BaseModel):
     token: str
     chat_id: str

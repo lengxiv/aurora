@@ -342,6 +342,37 @@ export async function saveSettings(settings: Record<string, unknown>) {
   } catch { return null }
 }
 
+export interface QbitQueueSettings {
+  queueing_enabled: boolean
+  max_active_torrents: number
+  max_active_downloads: number
+  max_active_uploads: number
+  max_active_checking_torrents: number
+  add_to_top_of_queue: boolean
+}
+
+export async function fetchQbitQueueSettings(): Promise<{ online: boolean; settings: QbitQueueSettings | null; detail?: string } | null> {
+  try {
+    const r = await fetch('/api/qbittorrent/queue', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    const d = await r.json().catch(() => null)
+    if (!r.ok) return { online: false, settings: null, detail: d?.detail || '读取 qBittorrent 设置失败' }
+    return d as { online: boolean; settings: QbitQueueSettings | null; detail?: string }
+  } catch { return null }
+}
+
+export async function saveQbitQueueSettings(settings: QbitQueueSettings) {
+  try {
+    const r = await fetch('/api/qbittorrent/queue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify(settings),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    const { data: d, detail } = await responseDetail(r, '保存 qBittorrent 队列设置失败')
+    return { ok: r.ok && !!d?.ok, detail, settings: d?.settings as QbitQueueSettings | undefined }
+  } catch { return { ok: false, detail: '网络请求失败', settings: undefined } }
+}
+
 export async function testTelegram(token: string, chatId: string) {
   try {
     const r = await fetch('/api/tg/test', {

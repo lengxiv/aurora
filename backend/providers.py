@@ -1294,6 +1294,10 @@ class RcloneProvider:
 
 class QbittorrentProvider:
     name = "qbittorrent"
+    _QUEUE_KEYS = (
+        "queueing_enabled", "max_active_torrents", "max_active_downloads",
+        "max_active_uploads", "max_active_checking_torrents", "add_to_top_of_queue",
+    )
 
     def __init__(self):
         self.base = os.environ.get("AURORA_QBIT_URL", "http://127.0.0.1:8080").rstrip("/")
@@ -1328,6 +1332,45 @@ class QbittorrentProvider:
                 except Exception:
                     self._sess = None
         return False
+
+    def queue_settings(self) -> tuple[bool, dict, str]:
+        """Read the queue controls exposed by qBittorrent's preferences API."""
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                r = s.get(f"{self.base}/api/v2/app/preferences", timeout=5)
+                if r.status_code != 200:
+                    return False, {}, f"qBittorrent preferences HTTP {r.status_code}"
+                data = r.json() or {}
+                return True, {
+                    "queueing_enabled": bool(data.get("queueing_enabled", True)),
+                    "max_active_torrents": int(data.get("max_active_torrents", 8)),
+                    "max_active_downloads": int(data.get("max_active_downloads", 3)),
+                    "max_active_uploads": int(data.get("max_active_uploads", 3)),
+                    "max_active_checking_torrents": int(data.get("max_active_checking_torrents", 1)),
+                    "add_to_top_of_queue": bool(data.get("add_to_top_of_queue", False)),
+                }, ""
+            except Exception as exc:
+                return False, {}, str(exc)
+
+    def update_queue_settings(self, values: dict) -> tuple[bool, dict, str]:
+        """Update only queue-related preferences, then return qBittorrent's result."""
+        payload = {key: values[key] for key in self._QUEUE_KEYS if key in values}
+        if not payload:
+            return False, {}, "没有可更新的队列参数"
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                r = s.post(
+                    f"{self.base}/api/v2/app/setPreferences",
+                    data={"json": json.dumps(payload, separators=(",", ":"))},
+                    timeout=5,
+                )
+                if r.status_code != 200:
+                    return False, {}, f"qBittorrent setPreferences HTTP {r.status_code}"
+                return self.queue_settings()
+            except Exception as exc:
+                return False, {}, str(exc)
 
     def torrent_details(self) -> list[dict]:
         with self._session_lock:

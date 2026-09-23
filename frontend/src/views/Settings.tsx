@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Server, Database, ShieldCheck, LogOut, RefreshCw, Bell, KeyRound, Smartphone, X } from 'lucide-react'
-import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, type AuthSession } from '../lib/api'
+import { Server, Database, ShieldCheck, LogOut, RefreshCw, Bell, KeyRound, Smartphone, X, ListFilter } from 'lucide-react'
+import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, fetchQbitQueueSettings, saveQbitQueueSettings, type AuthSession, type QbitQueueSettings } from '../lib/api'
 import { SC_KEY, SC_VAL, Switch } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -25,17 +25,33 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
   const [load, trigger] = useState(0)
   const [sessions, setSessions] = useState<AuthSession[]>([])
   const [pw, setPw] = useState({ current: '', next: '', confirm: '' })
+  const [qbitQueue, setQbitQueue] = useState<{ online: boolean; settings: QbitQueueSettings | null; detail?: string } | null>(null)
+  const [qbitBusy, setQbitBusy] = useState(false)
 
   useEffect(() => {
     fetchInfo().then(setInfo)
     fetchSettings().then(setSt)
     fetchSessions().then(setSessions)
+    fetchQbitQueueSettings().then(setQbitQueue)
   }, [load])
 
   const p = info?.providers || {}
   const save = async () => {
     const d = await saveSettings((st || {}) as Record<string, unknown>)
     if (d) { setSt(d); toast('设置已保存') } else { toast('保存失败', 'bad') }
+  }
+  const patchQbitQueue = (patch: Partial<QbitQueueSettings>) => setQbitQueue((current) => current?.settings
+    ? { ...current, settings: { ...current.settings, ...patch } }
+    : current)
+  const saveQueue = async () => {
+    if (!qbitQueue?.settings) return
+    setQbitBusy(true)
+    const result = await saveQbitQueueSettings(qbitQueue.settings)
+    setQbitBusy(false)
+    if (result.ok && result.settings) {
+      setQbitQueue((current) => current ? { ...current, online: true, settings: result.settings ?? null } : current)
+      toast('qBittorrent 队列设置已保存', 'ok')
+    } else toast(result.detail || '保存失败', 'bad')
   }
 
   return (
@@ -72,6 +88,77 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
               </div>
             ))}
           </div>
+        </section>
+
+        <section className="panel px-6 py-5 lg:col-span-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-medium"><ListFilter size={16} className="text-aurora-1" /> qBittorrent 队列</div>
+            {qbitQueue?.online && <span className="text-[11px] text-teal-300">已连接 · 实时配置</span>}
+          </div>
+          {!qbitQueue ? (
+            <div className="mt-4 text-sm text-dim">正在读取 qBittorrent 设置…</div>
+          ) : !qbitQueue.online || !qbitQueue.settings ? (
+            <div className="mt-4 rounded-lg border border-line bg-white/3 px-4 py-3 text-sm text-dim">
+              <div>qBittorrent 未接入</div>
+              <div className="mt-1 text-[11px] text-dim/70">启动并完成鉴权后，这里可以管理活动任务、做种和队列顺序。</div>
+            </div>
+          ) : (() => {
+            const q = qbitQueue.settings
+            return (
+              <div className="mt-4">
+                <div className="flex items-center justify-between rounded-lg border border-line bg-white/3 px-4 py-3">
+                  <div>
+                    <div className="text-sm text-fg">启用队列调度</div>
+                    <div className="text-[11px] text-dim">关闭后 qBittorrent 不再按活动任务上限排队</div>
+                  </div>
+                  <Switch checked={q.queueing_enabled} onChange={(v) => patchQbitQueue({ queueing_enabled: v })} />
+                </div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  <label className="rounded-lg border border-line bg-white/3 px-3 py-2.5">
+                    <span className="block text-[11px] text-dim">最大活动任务</span>
+                    <input type="number" min={1} max={9999} value={q.max_active_torrents} onChange={(e) => patchQbitQueue({ max_active_torrents: Number(e.target.value) })}
+                      className="num mt-1 w-full bg-transparent text-lg text-fg focus:outline-none" />
+                    <span className="text-[10px] text-dim/60">9999 代表不限</span>
+                  </label>
+                  <label className="rounded-lg border border-line bg-white/3 px-3 py-2.5">
+                    <span className="block text-[11px] text-dim">最大下载任务</span>
+                    <input type="number" min={1} max={9999} value={q.max_active_downloads} onChange={(e) => patchQbitQueue({ max_active_downloads: Number(e.target.value) })}
+                      className="num mt-1 w-full bg-transparent text-lg text-fg focus:outline-none" />
+                    <span className="text-[10px] text-dim/60">只限制下载并发</span>
+                  </label>
+                  <label className="rounded-lg border border-line bg-white/3 px-3 py-2.5">
+                    <span className="block text-[11px] text-dim">最大做种任务</span>
+                    <input type="number" min={1} max={9999} value={q.max_active_uploads} onChange={(e) => patchQbitQueue({ max_active_uploads: Number(e.target.value) })}
+                      className="num mt-1 w-full bg-transparent text-lg text-fg focus:outline-none" />
+                    <span className="text-[10px] text-dim/60">9999 代表不限</span>
+                  </label>
+                  <label className="rounded-lg border border-line bg-white/3 px-3 py-2.5">
+                    <span className="block text-[11px] text-dim">最大校验任务</span>
+                    <input type="number" min={1} max={64} value={q.max_active_checking_torrents} onChange={(e) => patchQbitQueue({ max_active_checking_torrents: Number(e.target.value) })}
+                      className="num mt-1 w-full bg-transparent text-lg text-fg focus:outline-none" />
+                    <span className="text-[10px] text-dim/60">避免校验抢占磁盘</span>
+                  </label>
+                </div>
+                <div className="mt-3 flex items-center justify-between rounded-lg border border-line bg-white/3 px-4 py-3">
+                  <div>
+                    <div className="text-sm text-fg">新任务置于队列顶部</div>
+                    <div className="text-[11px] text-dim">新添加的磁力或种子优先获得活动槽位</div>
+                  </div>
+                  <Switch checked={q.add_to_top_of_queue} onChange={(v) => patchQbitQueue({ add_to_top_of_queue: v })} />
+                </div>
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+                  <button onClick={() => patchQbitQueue({ max_active_torrents: 9999, max_active_uploads: 9999 })}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-2 text-xs text-dim hover:text-fg">
+                    <RefreshCw size={13} />不限做种
+                  </button>
+                  <button onClick={saveQueue} disabled={qbitBusy}
+                    className="inline-flex items-center gap-1.5 rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">
+                    <RefreshCw size={14} className={qbitBusy ? 'animate-spin' : ''} />保存队列设置
+                  </button>
+                </div>
+              </div>
+            )
+          })()}
         </section>
 
         <section className="panel px-6 py-5 lg:col-span-2">

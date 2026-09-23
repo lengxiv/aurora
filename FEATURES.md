@@ -3,6 +3,7 @@
 > 记录到 2026-09-23 为止已实现的功能。实际访问地址由部署环境决定（后端 systemd `aurora.service`，FastAPI :8787）。
 
 ## 更新记录（2026-09-23）
+- **qBittorrent 队列管理**：设置页可读取和修改队列调度、最大活动任务、最大下载任务、最大做种任务、最大校验任务和新任务置顶；提供“一键不限做种”，使用 `9999` 表示不限，避免 qBittorrent 的 `0` 造成全部任务排队。
 - **播放功能增强**：本地视频/音频/Jellyfin 统一续播；增加倍速、上下项切换、画中画、失败重试和音频连续播放。
 - **字幕兼容**：按视频同名规则匹配字幕，SRT/ASS/SSA 自动转换为浏览器兼容的 WebVTT，支持同名多字幕切换。
 - **播放流稳定性**：本地流明确 MIME 与 byte-range；Jellyfin 流代理增加上游超时、错误处理和缓存头转发。
@@ -14,7 +15,8 @@
 - **网盘目标选择修复**：添加任务时预加载网盘列表，网盘读取失败可手动刷新，并显示明确的空列表提示。
 - **路径安全校验**：后端仅允许使用本地下载盘内的相对目录，并映射为 qBittorrent 的 `/downloads/...` 路径。
 - **任务提交接口**：`/api/torrents/add` 和 `/api/torrents/upload` 支持保存目录参数，磁力与种子文件行为保持一致。
-- **验证结果**：后端 36 项测试通过，前端生产构建通过。
+- **验证结果**：后端 47 项测试通过，前端生产构建和 lint 通过。
+- **队列管理验证**：后端 47 项测试通过，前端生产构建和 lint 通过，qBittorrent 实机队列参数已验证。
 
 ## 认证与安全
 - 应用层登录页（`/login`），用户名默认为 `admin`，密码由 `AURORA_AUTH_PASS` 或受限状态文件管理
@@ -99,6 +101,7 @@
 - `/api/metrics` `/api/sources` `/api/info` `/api/logs`
 - `/api/torrents/add` `/api/torrents/{action}` `/api/torrents/batch` `/api/torrents/peers?hash=`（对等方明细；添加接口支持 `save_path` 和网盘目标）
 - `/api/torrents/upload`（上传 `.torrent` 文件，支持 `save_path` 和网盘目标）
+- `/api/qbittorrent/queue`（读取和修改队列调度参数）
 - `/api/media` `/api/media/stream` `/api/media/delete` `/api/media/rename` `/api/media/move`
 - `/api/media/trash` `/api/media/trash/restore` `/api/media/trash/purge`
 - `/api/media/dirs`（目录列表） `/api/media/mkdir`（新建目录） `/api/media/rmdir`（删空目录）

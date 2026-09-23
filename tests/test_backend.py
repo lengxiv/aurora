@@ -193,6 +193,75 @@ class TorrentUploadTests(unittest.TestCase):
         session.post.assert_not_called()
 
 
+class QbitQueueTests(unittest.TestCase):
+    def test_queue_settings_reads_only_supported_preferences(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "queueing_enabled": True,
+            "max_active_torrents": 9999,
+            "max_active_downloads": 3,
+            "max_active_uploads": 9999,
+            "max_active_checking_torrents": 1,
+            "add_to_top_of_queue": False,
+            "web_ui_password": "must not escape",
+        }
+        session.get.return_value = response
+        qbit._sess = session
+
+        ok, settings, detail = qbit.queue_settings()
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(settings["max_active_uploads"], 9999)
+        self.assertNotIn("web_ui_password", settings)
+
+    def test_queue_settings_posts_allowlisted_preferences(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.return_value = Mock(status_code=200)
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "queueing_enabled": True,
+            "max_active_torrents": 20,
+            "max_active_downloads": 3,
+            "max_active_uploads": 20,
+            "max_active_checking_torrents": 2,
+            "add_to_top_of_queue": True,
+        }
+        session.get.return_value = response
+        qbit._sess = session
+
+        ok, settings, detail = qbit.update_queue_settings({
+            "queueing_enabled": True,
+            "max_active_torrents": 20,
+            "max_active_downloads": 3,
+            "max_active_uploads": 20,
+            "max_active_checking_torrents": 2,
+            "add_to_top_of_queue": True,
+            "web_ui_password": "must not be sent",
+        })
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(settings["max_active_torrents"], 20)
+        payload = json.loads(session.post.call_args.kwargs["data"]["json"])
+        self.assertNotIn("web_ui_password", payload)
+        self.assertEqual(payload["max_active_uploads"], 20)
+
+    def test_zero_queue_limit_is_rejected(self):
+        with self.assertRaises(main.HTTPException):
+            main._validate_qbit_queue(main.QbitQueueBody(
+                queueing_enabled=True,
+                max_active_torrents=0,
+                max_active_downloads=3,
+                max_active_uploads=9999,
+                max_active_checking_torrents=1,
+                add_to_top_of_queue=False,
+            ))
+
+
 class TorrentDestinationTests(unittest.TestCase):
     def test_completed_torrent_starts_and_finishes_remote_upload(self):
         old_dest_file = providers._TORRENT_DEST_FILE
