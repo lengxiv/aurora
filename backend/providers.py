@@ -1623,7 +1623,7 @@ class QbittorrentProvider:
 
     def advanced_action(self, hash_: str, action: str, *, value: int | None = None,
                         delete_files: bool = False, location: str = "", file_ids=None,
-                        priority: int | None = None) -> tuple[bool, str]:
+                        all_file_ids=None, priority: int | None = None) -> tuple[bool, str]:
         if not self._valid_hash(hash_):
             return False, "种子 Hash 无效"
         endpoints = {
@@ -1651,11 +1651,38 @@ class QbittorrentProvider:
             if not location or len(location) > 4096 or not location.startswith("/downloads"):
                 return False, "保存目录无效"
             endpoint, data = "setLocation", {"location": location}
-        elif action == "set_file_priority":
-            ids = [int(item) for item in (file_ids or [])]
-            if not ids or priority is None or not 0 <= int(priority) <= 7:
+        elif action in ("set_file_priority", "set_file_selection"):
+            try:
+                ids = sorted({int(item) for item in (file_ids or [])})
+                all_ids = sorted({int(item) for item in (all_file_ids or [])})
+            except (TypeError, ValueError):
                 return False, "文件优先级参数无效"
-            endpoint, data = "filePrio", {"id": ",".join(str(item) for item in ids), "priority": str(int(priority))}
+            if not ids or any(item < 0 for item in ids) or len(ids) > 4096:
+                return False, "文件优先级参数无效"
+            if action == "set_file_priority":
+                if priority is None or not 0 <= int(priority) <= 7:
+                    return False, "文件优先级参数无效"
+                endpoint, data = "filePrio", {"id": ",".join(str(item) for item in ids), "priority": str(int(priority))}
+            else:
+                if not all_ids or len(all_ids) > 4096 or any(item < 0 for item in all_ids) or not set(ids).issubset(all_ids):
+                    return False, "文件选择参数无效"
+                unselected = [item for item in all_ids if item not in set(ids)]
+                with self._session_lock:
+                    try:
+                        session = self._ensure()
+                        for target_ids, target_priority in ((unselected, 0), (ids, 1)):
+                            if not target_ids:
+                                continue
+                            response = session.post(
+                                f"{self.base}/api/v2/torrents/filePrio",
+                                data={"hashes": hash_, "id": ",".join(str(item) for item in target_ids), "priority": str(target_priority)},
+                                timeout=10,
+                            )
+                            if response.status_code != 200:
+                                return False, f"qBittorrent HTTP {response.status_code}"
+                        return True, ""
+                    except Exception as exc:
+                        return False, str(exc)
         elif action in endpoints:
             endpoint, data = endpoints[action]
         else:
@@ -2341,6 +2368,48 @@ def _normalize_policies(raw: dict | None) -> dict:
     return {"enabled": bool(raw.get("enabled", False)), "interval": interval, "rules": rules}
 
 
+def _clean_category_mapping_path(value: str) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if not raw or raw == ".":
+        return ""
+    if "\x00" in raw or raw.startswith("/") or any(part == ".." for part in raw.split("/")):
+        return ""
+    clean = posixpath.normpath("/".join(part for part in raw.split("/") if part not in ("", ".")))
+    return "" if clean == "." else clean[:2048]
+
+
+def _normalize_category_mappings(raw) -> dict[str, dict]:
+    if isinstance(raw, list):
+        entries = [(item.get("category", ""), item) for item in raw if isinstance(item, dict)]
+    elif isinstance(raw, dict):
+        entries = [(name, value) for name, value in raw.items()]
+    else:
+        entries = []
+    result = {}
+    for category, value in entries:
+        if not isinstance(value, dict):
+            continue
+        category = str(value.get("category") or category or "").strip()[:64]
+        if not QbittorrentProvider._valid_label(category) or category in result:
+            continue
+        remote = str(value.get("destination_remote") or "").strip()[:64]
+        remote_path = ""
+        if remote:
+            try:
+                remote_path = _clean_rclone_path(value.get("destination_path", ""))
+            except ValueError:
+                remote_path = ""
+        result[category] = {
+            "category": category,
+            "local_path": _clean_category_mapping_path(value.get("local_path", "")),
+            "destination_remote": remote,
+            "destination_path": remote_path,
+        }
+        if len(result) >= 64:
+            break
+    return result
+
+
 def _default_settings() -> dict:
     tok = os.environ.get("AURORA_TG_BOT_TOKEN", "")
     chat = os.environ.get("AURORA_TG_CHAT_ID", "")
@@ -2350,6 +2419,7 @@ def _default_settings() -> dict:
         "daily": {"enabled": False, "time": "21:00"},
         "tg": {"enabled": bool(tokens), "tokens": tokens},
         "policies": {"enabled": False, "interval": 300, "rules": []},
+        "category_mappings": {},
     }
 
 
@@ -2364,6 +2434,7 @@ def load_settings() -> dict:
         if isinstance(s.get("tg", {}).get("tokens"), list):
             d["tg"]["tokens"] = s["tg"]["tokens"]
         d["policies"] = _normalize_policies(s.get("policies"))
+        d["category_mappings"] = _normalize_category_mappings(s.get("category_mappings"))
     except Exception:
         pass
     return d
@@ -2372,7 +2443,9 @@ def load_settings() -> dict:
 def save_settings(s: dict):
     d = _default_settings()
     for k in d:
-        if k in s and isinstance(s[k], dict):
+        if k == "category_mappings":
+            d[k] = _normalize_category_mappings(s.get(k))
+        elif k in s and isinstance(s[k], dict):
             d[k].update({kk: vv for kk, vv in s[k].items() if kk in d[k]})
     if isinstance(s.get("tg", {}).get("tokens"), list):
         d["tg"]["tokens"] = s["tg"]["tokens"]
@@ -2396,6 +2469,37 @@ def save_settings(s: dict):
     with _DATA_LOCK:
         _atomic_json(_SETTINGS_FILE, d)
     return d
+
+
+def torrent_category_mappings() -> list[dict]:
+    mappings = load_settings().get("category_mappings", {})
+    return [mappings[key] for key in sorted(mappings, key=str.casefold)]
+
+
+def save_torrent_category_mappings(value) -> list[dict]:
+    current = load_settings()
+    current["category_mappings"] = _normalize_category_mappings(value)
+    saved = save_settings(current)
+    mappings = saved.get("category_mappings", {})
+    _log("torrent.category_mappings", f"{len(mappings)} 条映射")
+    return [mappings[key] for key in sorted(mappings, key=str.casefold)]
+
+
+def apply_category_mapping(category: str, save_path: str = "", destination_remote: str = "",
+                           destination_path: str = "", apply_destination: bool = True) -> tuple[str, str, str, bool]:
+    """Fill only omitted torrent targets from the selected category mapping."""
+    category = str(category or "").strip()
+    mapping = load_settings().get("category_mappings", {}).get(category)
+    if not isinstance(mapping, dict):
+        return save_path, destination_remote, destination_path, False
+    local = str(save_path or "").strip() or str(mapping.get("local_path") or "")
+    remote = str(destination_remote or "").strip()
+    remote_path = str(destination_path or "").strip()
+    if apply_destination and not remote:
+        remote = str(mapping.get("destination_remote") or "").strip()
+        if remote and not remote_path:
+            remote_path = str(mapping.get("destination_path") or "").strip()
+    return local, remote, remote_path, bool(local != str(save_path or "").strip() or remote != str(destination_remote or "").strip() or remote_path != str(destination_path or "").strip())
 
 
 def torrent_policies() -> dict:

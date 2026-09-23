@@ -185,13 +185,14 @@ export async function createMediaDir(path: string) {
   }
 }
 
-export async function addTorrent(magnet: string, savePath = '', destinationRemote = '', destinationPath = '', category = '', tags: string[] = []) {
+export async function addTorrent(magnet: string, savePath = '', destinationRemote = '', destinationPath = '', category = '', tags: string[] = [], destinationMode: 'local' | 'remote' | 'default' = 'default') {
   try {
     const r = await fetch('/api/torrents/add', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       credentials: 'include', body: JSON.stringify({
         magnet, save_path: savePath,
         destination_remote: destinationRemote, destination_path: destinationPath,
+        destination_mode: destinationMode,
         category, tags,
       }),
     })
@@ -203,13 +204,14 @@ export async function addTorrent(magnet: string, savePath = '', destinationRemot
   }
 }
 
-export async function addTorrentFile(file: File, savePath = '', destinationRemote = '', destinationPath = '', category = '', tags: string[] = []) {
+export async function addTorrentFile(file: File, savePath = '', destinationRemote = '', destinationPath = '', category = '', tags: string[] = [], destinationMode: 'local' | 'remote' | 'default' = 'default') {
   try {
     const body = new FormData()
     body.append('file', file, file.name)
     body.append('save_path', savePath)
     body.append('destination_remote', destinationRemote)
     body.append('destination_path', destinationPath)
+    body.append('destination_mode', destinationMode)
     body.append('category', category)
     body.append('tags', tags.join(','))
     const r = await fetch('/api/torrents/upload', {
@@ -340,6 +342,12 @@ export interface TorrentDetail {
 
 export interface QbitCategory { name: string; save_path: string }
 export interface QbitLabels { online: boolean; categories: QbitCategory[]; tags: string[]; detail?: string }
+export interface TorrentCategoryMapping {
+  category: string
+  local_path: string
+  destination_remote: string
+  destination_path: string
+}
 
 export async function fetchTorrentDetail(hash: string): Promise<TorrentDetail | null> {
   try {
@@ -351,11 +359,11 @@ export async function fetchTorrentDetail(hash: string): Promise<TorrentDetail | 
   } catch { return null }
 }
 
-export async function torrentAdvancedAction(id: string, action: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; priority?: number } = {}) {
+export async function torrentAdvancedAction(id: string, action: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; allFileIds?: number[]; priority?: number } = {}) {
   try {
     const r = await fetch('/api/torrents/advanced', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
-      body: JSON.stringify({ id, action, limit_kib: options.limitKib, location: options.location || '', delete_files: !!options.deleteFiles, file_ids: options.fileIds || [], priority: options.priority }),
+      body: JSON.stringify({ id, action, limit_kib: options.limitKib, location: options.location || '', delete_files: !!options.deleteFiles, file_ids: options.fileIds || [], all_file_ids: options.allFileIds || [], priority: options.priority }),
     })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
     const { detail } = await responseDetail(r, '高级操作失败')
@@ -445,6 +453,23 @@ export async function deleteTorrentTags(tags: string[]) {
   } catch { return { ok: false, detail: '网络请求失败' } }
 }
 
+export async function fetchTorrentMappings(): Promise<TorrentCategoryMapping[]> {
+  const d = await getJson<{ mappings?: TorrentCategoryMapping[] }>('/api/torrents/mappings')
+  return d?.mappings || []
+}
+
+export async function saveTorrentMappings(mappings: TorrentCategoryMapping[]) {
+  try {
+    const r = await fetch('/api/torrents/mappings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ mappings }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '', mappings: [] as TorrentCategoryMapping[] } }
+    const { data: d, detail } = await responseDetail(r, '保存分类映射失败')
+    return { ok: r.ok && !!d?.ok, detail, mappings: (d?.mappings || []) as TorrentCategoryMapping[] }
+  } catch { return { ok: false, detail: '网络请求失败', mappings: [] as TorrentCategoryMapping[] } }
+}
+
 export interface TorrentPolicy {
   id: string
   name: string
@@ -524,17 +549,21 @@ export async function applyTorrentPolicies() {
   } catch { return { ok: false, detail: '网络请求失败', applied: undefined, items: undefined } }
 }
 
-export async function batchAction(ids: string[], action: string) {
+export async function batchAction(ids: string[], action: string, options: { category?: string; limitKib?: number; location?: string; destinationRemote?: string; destinationPath?: string } = {}) {
   try {
     const r = await fetch('/api/torrents/batch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      credentials: 'include', body: JSON.stringify({ action, ids }),
+      credentials: 'include', body: JSON.stringify({
+        action, ids, category: options.category || '', limit_kib: options.limitKib,
+        location: options.location || '', destination_remote: options.destinationRemote || '',
+        destination_path: options.destinationPath || '',
+      }),
     })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { done: 0, failed: 0 } }
     const d = await r.json().catch(() => null)
-    return { ok: r.ok, done: (d && d.done) || 0, failed: (d && d.failed) || 0 }
+    return { ok: r.ok, done: (d && d.done) || 0, failed: (d && d.failed) || 0, detail: (d && d.detail) || '', errors: (d && d.errors) || [] }
   } catch {
-    return { done: 0, failed: 0 }
+    return { ok: false, done: 0, failed: 0, detail: '网络请求失败', errors: [] }
   }
 }
 

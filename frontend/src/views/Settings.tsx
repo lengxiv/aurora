@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Server, Database, ShieldCheck, LogOut, RefreshCw, Bell, KeyRound, Smartphone, X, ListFilter, Tags, Plus, Trash2, Eye, Play, Save, FolderCog } from 'lucide-react'
-import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, fetchQbitQueueSettings, saveQbitQueueSettings, fetchTorrentLabels, createTorrentCategory, deleteTorrentCategory, createTorrentTags, deleteTorrentTags, fetchTorrentPolicies, saveTorrentPolicies, previewTorrentPolicies, applyTorrentPolicies, fetchRcloneRemotes, type AuthSession, type QbitQueueSettings, type QbitLabels, type TorrentPolicies, type TorrentPolicy, type TorrentPolicyPreview, type RcloneRemote } from '../lib/api'
+import { fetchInfo, fetchSettings, saveSettings, testTelegram, fetchSessions, revokeSession, changePassword, fetchQbitQueueSettings, saveQbitQueueSettings, fetchTorrentLabels, createTorrentCategory, deleteTorrentCategory, createTorrentTags, deleteTorrentTags, fetchTorrentMappings, saveTorrentMappings, fetchMediaDirs, fetchTorrentPolicies, saveTorrentPolicies, previewTorrentPolicies, applyTorrentPolicies, fetchRcloneRemotes, type AuthSession, type QbitQueueSettings, type QbitLabels, type TorrentCategoryMapping, type TorrentPolicies, type TorrentPolicy, type TorrentPolicyPreview, type RcloneRemote, type MediaDir } from '../lib/api'
 import { SC_KEY, SC_VAL, Switch } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -30,6 +30,9 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
   const [qbitBusy, setQbitBusy] = useState(false)
   const [qbitLabels, setQbitLabels] = useState<QbitLabels | null>(null)
   const [labelsBusy, setLabelsBusy] = useState(false)
+  const [categoryMappings, setCategoryMappings] = useState<Record<string, TorrentCategoryMapping>>({})
+  const [mappingDirs, setMappingDirs] = useState<MediaDir[]>([])
+  const [mappingBusy, setMappingBusy] = useState(false)
   const [newCategory, setNewCategory] = useState('')
   const [newCategoryPath, setNewCategoryPath] = useState('')
   const [newTag, setNewTag] = useState('')
@@ -44,6 +47,8 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
     fetchSessions().then(setSessions)
     fetchQbitQueueSettings().then(setQbitQueue)
     fetchTorrentLabels().then(setQbitLabels)
+    fetchTorrentMappings().then((items) => setCategoryMappings(Object.fromEntries(items.map((item) => [item.category, item]))))
+    fetchMediaDirs().then(setMappingDirs)
     fetchTorrentPolicies().then(setPolicies)
     fetchRcloneRemotes().then((result) => setPolicyRemotes(result?.remotes || []))
   }, [load])
@@ -70,6 +75,22 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
     setLabelsBusy(true)
     setQbitLabels(await fetchTorrentLabels())
     setLabelsBusy(false)
+  }
+  const patchCategoryMapping = (category: string, patch: Partial<TorrentCategoryMapping>) => setCategoryMappings((current) => ({
+    ...current,
+    [category]: {
+      category,
+      local_path: patch.local_path ?? current[category]?.local_path ?? '',
+      destination_remote: patch.destination_remote ?? current[category]?.destination_remote ?? '',
+      destination_path: patch.destination_path ?? current[category]?.destination_path ?? '',
+    },
+  }))
+  const saveMappings = async () => {
+    setMappingBusy(true)
+    const result = await saveTorrentMappings(Object.values(categoryMappings))
+    setMappingBusy(false)
+    toast(result.ok ? '分类默认映射已保存' : result.detail, result.ok ? 'ok' : 'bad')
+    if (result.ok) setCategoryMappings(Object.fromEntries(result.mappings.map((item) => [item.category, item])))
   }
   const addCategory = async () => {
     if (!newCategory.trim()) return
@@ -163,6 +184,41 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
               </div>
             ))}
           </div>
+        </section>
+
+        <section className="panel px-6 py-5 lg:col-span-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-medium"><FolderCog size={16} className="text-aurora-1" /> 分类默认目标</div>
+              <div className="mt-1 text-[11px] text-dim">添加任务时未手动填写保存目录或网盘目标，自动使用这里的映射。</div>
+            </div>
+            <button type="button" onClick={() => void saveMappings()} disabled={!qbitLabels?.online || mappingBusy} title="保存分类默认映射" aria-label="保存分类默认映射" className="grid h-8 w-8 place-items-center rounded-md grad-bar text-ink disabled:opacity-40"><Save size={13} /></button>
+          </div>
+          {!qbitLabels?.online ? <div className="mt-4 text-sm text-dim">qBittorrent 未接入，无法读取分类。</div> : qbitLabels.categories.length === 0 ? <div className="mt-4 text-sm text-dim">暂无分类。先在上方创建分类，再配置默认目标。</div> : <div className="mt-4 flex flex-col gap-3">
+            {qbitLabels.categories.map((item) => {
+              const mapping = categoryMappings[item.name] || { category: item.name, local_path: '', destination_remote: '', destination_path: '' }
+              return <div key={item.name} className="rounded-lg border border-line bg-white/3 p-4">
+                <div className="flex items-center justify-between gap-2"><div className="text-sm text-fg">{item.name}</div><span className="text-[10px] text-dim">未填写项沿用 qBittorrent/本地默认</span></div>
+                <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                  <label className="text-[11px] text-dim">本地保存目录
+                    <select value={mapping.local_path} onChange={(e) => patchCategoryMapping(item.name, { local_path: e.target.value })} disabled={mappingBusy} className="aurora-select mt-1 w-full rounded-md border border-line px-2 py-1.5 text-xs text-fg focus:outline-none disabled:opacity-60">
+                      <option value="">使用 qBittorrent 分类目录</option>
+                      {mappingDirs.map((dir) => <option key={dir.path} value={dir.path}>{dir.path}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-[11px] text-dim">完成后转存网盘
+                    <select value={mapping.destination_remote} onChange={(e) => patchCategoryMapping(item.name, { destination_remote: e.target.value, destination_path: e.target.value ? mapping.destination_path : '' })} disabled={mappingBusy} className="aurora-select mt-1 w-full rounded-md border border-line px-2 py-1.5 text-xs text-fg focus:outline-none disabled:opacity-60">
+                      <option value="">不自动转存</option>
+                      {policyRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name} · {remote.type || 'remote'}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-[11px] text-dim">网盘目标目录
+                    <input value={mapping.destination_path} onChange={(e) => patchCategoryMapping(item.name, { destination_path: e.target.value })} disabled={mappingBusy || !mapping.destination_remote} placeholder="例如：电影/2026" className="mt-1 w-full rounded-md border border-line bg-white/4 px-2 py-1.5 text-xs text-fg placeholder:text-dim/60 focus:outline-none disabled:opacity-50" />
+                  </label>
+                </div>
+              </div>
+            })}
+          </div>}
         </section>
 
         <section className="panel px-6 py-5 lg:col-span-2">

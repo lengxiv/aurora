@@ -147,6 +147,32 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(len(result["tg"]["tokens"][0]["name"]), 20)
         providers._SETTINGS_FILE = old
 
+    def test_category_mapping_defaults_fill_only_omitted_targets(self):
+        old = providers._SETTINGS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._SETTINGS_FILE = str(Path(td) / "settings.json")
+            providers.save_torrent_category_mappings({
+                "movies": {
+                    "category": "movies",
+                    "local_path": "media/movies",
+                    "destination_remote": "archive",
+                    "destination_path": "films",
+                },
+            })
+            self.assertEqual(
+                providers.apply_category_mapping("movies"),
+                ("media/movies", "archive", "films", True),
+            )
+            self.assertEqual(
+                providers.apply_category_mapping("movies", "custom", "other", "manual"),
+                ("custom", "other", "manual", False),
+            )
+            self.assertEqual(
+                providers.apply_category_mapping("movies", "", "", "", apply_destination=False),
+                ("media/movies", "", "", True),
+            )
+        providers._SETTINGS_FILE = old
+
 
 class TorrentUploadTests(unittest.TestCase):
     def test_qbit_add_posts_savepath(self):
@@ -302,6 +328,25 @@ class QbitAdvancedTests(unittest.TestCase):
             "hashes": "b" * 40, "id": "0,2", "priority": "6",
         })
 
+    def test_file_selection_sets_unselected_files_to_skip(self):
+        qbit = providers.QbittorrentProvider()
+        session = Mock()
+        session.post.side_effect = [Mock(status_code=200), Mock(status_code=200)]
+        qbit._sess = session
+
+        ok, detail = qbit.advanced_action(
+            "d" * 40, "set_file_selection", file_ids=[0, 2], all_file_ids=[0, 1, 2],
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(session.post.call_args_list[0].kwargs["data"], {
+            "hashes": "d" * 40, "id": "1", "priority": "0",
+        })
+        self.assertEqual(session.post.call_args_list[1].kwargs["data"], {
+            "hashes": "d" * 40, "id": "0,2", "priority": "1",
+        })
+
     def test_system_tags_cannot_be_created_or_deleted(self):
         qbit = providers.QbittorrentProvider()
         session = Mock()
@@ -311,6 +356,51 @@ class QbitAdvancedTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("系统标签", detail)
         session.post.assert_not_called()
+
+
+class TorrentBatchTests(unittest.TestCase):
+    def test_batch_location_can_target_all_tasks_in_category(self):
+        old_qbit = providers._qbit
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+
+        class FakeQbit:
+            _last_details_ok = True
+
+            def __init__(self):
+                self.actions = []
+
+            def available(self):
+                return True
+
+            def torrent_details(self):
+                return [
+                    {"hash": "e" * 40, "category": "movies"},
+                    {"hash": "f" * 40, "category": "music"},
+                ]
+
+            def advanced_action(self, hash_, action, **kwargs):
+                self.actions.append((hash_, action, kwargs))
+                return True, ""
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                os.environ["AURORA_LOCAL_MOUNT"] = td
+                Path(td, "archive").mkdir()
+                fake = FakeQbit()
+                providers._qbit = fake
+                result = main.batch_torrent(
+                    main.BatchAction(action="set_location", ids=[], category="movies", location="archive"),
+                    "admin",
+                )
+                self.assertEqual(result["done"], 1)
+                self.assertEqual(fake.actions[0][0], "e" * 40)
+                self.assertEqual(fake.actions[0][2]["location"], "/downloads/archive")
+            finally:
+                providers._qbit = old_qbit
+                if old_mount is None:
+                    os.environ.pop("AURORA_LOCAL_MOUNT", None)
+                else:
+                    os.environ["AURORA_LOCAL_MOUNT"] = old_mount
 
 
 class TorrentPolicyTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
-import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search, RotateCcw, ChevronUp, Folder, Settings2, Info, ListRestart, Zap, ArrowUp, ArrowDown, ChevronsUp, ChevronsDown, FileText, Tags, MapPin, Save, CheckCircle2 } from 'lucide-react'
-import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneFiles, fetchRcloneRemotes, retryTorrentDestination, torrentAction, batchAction, fetchTorrentDetail, fetchTorrentPeers, torrentAdvancedAction, fetchTorrentLabels, updateTorrentLabels, type MediaDir, type RcloneEntry, type RcloneRemote, type Torrent, type TorrentDetail, type QbitLabels, type TorrentPeers, type MountStatus } from '../lib/api'
+import { Cloud, CloudOff, AlertTriangle, ArrowDownToLine, Gauge as GaugeIcon, Plus, RefreshCw, Magnet, FileUp, FolderPlus, X, Play, Pause, Trash2, Search, RotateCcw, ChevronUp, Folder, Settings2, Info, ListRestart, Zap, ArrowUp, ArrowDown, ChevronsUp, ChevronsDown, FileText, Tags, MapPin, Save, CheckCircle2, CheckSquare, SlidersHorizontal } from 'lucide-react'
+import { useMetrics, addTorrent, addTorrentFile, createMediaDir, fetchMediaDirs, fetchRcloneFiles, fetchRcloneRemotes, retryTorrentDestination, torrentAction, batchAction, fetchTorrentDetail, fetchTorrentPeers, torrentAdvancedAction, fetchTorrentLabels, fetchTorrentMappings, updateTorrentLabels, type MediaDir, type RcloneEntry, type RcloneRemote, type Torrent, type TorrentDetail, type QbitLabels, type TorrentPeers, type MountStatus, type TorrentCategoryMapping } from '../lib/api'
 import { StatCard, Bar, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, STATUS_ZH, fmtMountReads, MountLatency } from '../components/ui'
 import { useToast } from '../toast'
 
@@ -50,9 +50,12 @@ export default function ConsoleView() {
   const [q, setQ] = useState('')
   const [sel, setSel] = useState<Set<string>>(new Set())
   const [labels, setLabels] = useState<QbitLabels | null>(null)
+  const [categoryMappings, setCategoryMappings] = useState<TorrentCategoryMapping[]>([])
+  const [categoryFilter, setCategoryFilter] = useState('')
   const [detailHash, setDetailHash] = useState('')
   const [detail, setDetail] = useState<TorrentDetail | null>(null)
   const [detailPeers, setDetailPeers] = useState<TorrentPeers | null>(null)
+  const [detailSelectedFiles, setDetailSelectedFiles] = useState<Set<number>>(new Set())
   const [detailBusy, setDetailBusy] = useState(false)
   const [detailActionBusy, setDetailActionBusy] = useState(false)
   const [detailCategory, setDetailCategory] = useState('')
@@ -63,6 +66,13 @@ export default function ConsoleView() {
   const [deleteFiles, setDeleteFiles] = useState(false)
   const [addCategory, setAddCategory] = useState('')
   const [addTags, setAddTags] = useState('')
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchBusy, setBatchBusy] = useState(false)
+  const [batchType, setBatchType] = useState<'set_download_limit' | 'set_upload_limit' | 'set_location' | 'transfer'>('set_download_limit')
+  const [batchLimitKib, setBatchLimitKib] = useState(0)
+  const [batchLocation, setBatchLocation] = useState('')
+  const [batchRemote, setBatchRemote] = useState('')
+  const [batchRemotePath, setBatchRemotePath] = useState('')
   const totalReads = data.mounts.reduce((a, m) => a + (m.reads || 0), 0)
   const totalUsed = data.mounts.reduce((a, m) => a + m.usedGb, 0)
   const totalCap = data.mounts.reduce((a, m) => a + m.capGb, 0)
@@ -109,6 +119,7 @@ export default function ConsoleView() {
     // Preload remotes so the target selector is ready when the dialog opens.
     void loadRcloneRemotes()
     fetchTorrentLabels().then(setLabels)
+    fetchTorrentMappings().then(setCategoryMappings)
   }, [])
 
   useEffect(() => {
@@ -214,8 +225,8 @@ export default function ConsoleView() {
     const remotePath = targetMode === 'remote' ? targetRemotePath.trim() : ''
     const userTags = addTags.split(',').map((item) => item.trim()).filter(Boolean)
     const r = addMode === 'magnet'
-      ? await addTorrent(magnet.trim(), savePath, remote, remotePath, addCategory, userTags)
-      : await addTorrentFile(torrentFile!, savePath, remote, remotePath, addCategory, userTags)
+      ? await addTorrent(magnet.trim(), savePath, remote, remotePath, addCategory, userTags, targetMode)
+      : await addTorrentFile(torrentFile!, savePath, remote, remotePath, addCategory, userTags, targetMode)
     const target = targetMode === 'remote'
       ? `完成后上传到 ${remote}:${remotePath || '/'}`
       : `本地 · ${savePath || '下载根目录'}`
@@ -238,6 +249,7 @@ export default function ConsoleView() {
     if (next) {
       setDetail(next)
       setDetailPeers(peers)
+      setDetailSelectedFiles(new Set(next.files.filter((item) => item.priority > 0).map((item) => item.index)))
       setDetailCategory(next.category || '')
       setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
       setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
@@ -253,6 +265,7 @@ export default function ConsoleView() {
     if (next) {
       setDetail(next)
       setDetailPeers(peers)
+      setDetailSelectedFiles(new Set(next.files.filter((item) => item.priority > 0).map((item) => item.index)))
       setDetailCategory(next.category || '')
       setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
       setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
@@ -261,7 +274,7 @@ export default function ConsoleView() {
     }
   }
 
-  const runDetailAction = async (action: string, label: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; priority?: number } = {}) => {
+  const runDetailAction = async (action: string, label: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; allFileIds?: number[]; priority?: number } = {}) => {
     if (!detailHash) return
     if (action === 'remove' && !window.confirm(options.deleteFiles ? '将从 qBittorrent 移除任务并删除本地文件，无法恢复。继续吗？' : '仅从 qBittorrent 移除任务，已下载文件会保留。继续吗？')) return
     setDetailActionBusy(true)
@@ -282,8 +295,19 @@ export default function ConsoleView() {
     if (r.ok && r.torrent) setDetail(r.torrent)
   }
 
+  const applyFileSelection = async () => {
+    if (!detailHash || !detail?.files.length) return
+    if (!detailSelectedFiles.size) {
+      toast('至少选择一个文件', 'warn')
+      return
+    }
+    await runDetailAction('set_file_selection', '选择性下载', {
+      fileIds: [...detailSelectedFiles], allFileIds: detail.files.map((item) => item.index),
+    })
+  }
+
   const qn = q.trim().toLowerCase()
-  const torrents = data.torrents.filter((t) => !qn || [t.name, t.category || '', ...(t.tags || [])].join(' ').toLowerCase().includes(qn))
+  const torrents = data.torrents.filter((t) => (!categoryFilter || t.category === categoryFilter) && (!qn || [t.name, t.category || '', ...(t.tags || [])].join(' ').toLowerCase().includes(qn)))
 
   const doAction = async (id: string, action: string, label: string) => {
     if (action === 'remove' && !window.confirm('仅从 qBittorrent 移除任务，已下载文件会保留。继续吗？')) return
@@ -302,13 +326,70 @@ export default function ConsoleView() {
     else next.add(id)
     return next
   })
-  const toggleAll = () => setSel(torrents.length === sel.size ? new Set() : new Set(torrents.map((t) => t.id)))
+  const toggleAll = () => {
+    const visibleIds = torrents.map((t) => t.id)
+    const allVisible = visibleIds.length > 0 && visibleIds.every((id) => sel.has(id))
+    setSel((current) => {
+      const next = new Set(current)
+      visibleIds.forEach((id) => allVisible ? next.delete(id) : next.add(id))
+      return next
+    })
+  }
   const doBatch = async (action: string, label: string) => {
     if (sel.size === 0) return
     if (action === 'remove' && !window.confirm(`仅移除选中的 ${sel.size} 个任务，已下载文件会保留。继续吗？`)) return
     const r = await batchAction([...sel], action)
     toast(r.failed ? `${label}：成功 ${r.done} / 失败 ${r.failed}` : `${label}成功 ${r.done} 项`, r.failed ? 'warn' : 'ok')
     setSel(new Set())
+  }
+
+  const openBatch = async () => {
+    if (sel.size === 0 && !categoryFilter) return
+    setBatchOpen(true)
+    setBatchLocation('')
+    setBatchRemote(rcloneRemotes[0]?.name || '')
+    setBatchRemotePath('')
+    await loadMediaDirs()
+  }
+
+  const doBatchAdvanced = async () => {
+    if (sel.size === 0 && !categoryFilter) return
+    if (batchType === 'set_location' && !batchLocation) {
+      toast('请选择移动目录', 'warn')
+      return
+    }
+    if (batchType === 'transfer' && !batchRemote) {
+      toast('请选择目标网盘', 'warn')
+      return
+    }
+    const countText = categoryFilter && sel.size === 0 ? `分类「${categoryFilter}」中的全部任务` : `选中的 ${sel.size} 个任务`
+    if (!window.confirm(`将对${countText}执行批量操作，继续吗？`)) return
+    setBatchBusy(true)
+    const result = await batchAction([...sel], batchType, {
+      category: categoryFilter,
+      limitKib: batchLimitKib,
+      location: batchLocation,
+      destinationRemote: batchRemote,
+      destinationPath: batchRemotePath,
+    })
+    setBatchBusy(false)
+    if (result.ok) {
+      toast(result.failed ? `完成：成功 ${result.done}，失败 ${result.failed}` : `批量操作成功 ${result.done} 项`, result.failed ? 'warn' : 'ok')
+      setSel(new Set())
+      setBatchOpen(false)
+    } else toast(result.detail || '批量操作失败', 'bad')
+  }
+
+  const selectAddCategory = (category: string) => {
+    setAddCategory(category)
+    const mapping = categoryMappings.find((item) => item.category === category)
+    if (!mapping) return
+    if (mapping.local_path) setSavePath(mapping.local_path)
+    if (mapping.destination_remote) {
+      setTargetMode('remote')
+      setTargetRemote(mapping.destination_remote)
+      setTargetRemotePath(mapping.destination_path)
+    }
   }
 
   return (
@@ -401,6 +482,11 @@ export default function ConsoleView() {
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="筛选磁力…"
                 className="w-36 rounded-lg border border-line bg-white/4 py-1.5 pl-7 pr-2 text-xs text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none sm:w-48" />
             </div>
+            {labels?.online && <select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)} aria-label="按分类筛选"
+              className="aurora-select max-w-[150px] rounded-lg border border-line px-2 py-1.5 text-xs text-fg focus:border-aurora-2/50 focus:outline-none">
+              <option value="">全部分类</option>
+              {labels.categories.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+            </select>}
             <button onClick={openAdd} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8">
               <Plus size={13} /> 新增
             </button>
@@ -413,8 +499,15 @@ export default function ConsoleView() {
               <button onClick={() => doBatch('pause', '暂停')} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8"><Pause size={12} />暂停</button>
               <button onClick={() => doBatch('resume', '续传')} className="inline-flex items-center gap-1 rounded-md border border-line bg-white/4 px-3 py-1.5 text-xs text-fg hover:bg-white/8"><Play size={12} />续传</button>
               <button onClick={() => doBatch('remove', '删除')} className="inline-flex items-center gap-1 rounded-md border border-rose-400/30 bg-rose-400/10 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-400/20"><Trash2 size={12} />删除</button>
+              <button onClick={() => void openBatch()} className="inline-flex items-center gap-1 rounded-md border border-aurora-2/30 bg-aurora-2/10 px-3 py-1.5 text-xs text-aurora-1 hover:bg-aurora-2/20"><SlidersHorizontal size={12} />批量管理</button>
               <button onClick={() => setSel(new Set())} className="px-1 text-xs text-dim hover:text-fg">取消</button>
             </div>
+          </div>
+        )}
+        {sel.size === 0 && categoryFilter && (
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-aurora-2/30 bg-aurora-2/5 px-3 py-2">
+            <span className="text-xs text-fg">当前分类「{categoryFilter}」共 {torrents.length} 项</span>
+            <button onClick={() => void openBatch()} className="inline-flex items-center gap-1 rounded-md border border-aurora-2/30 bg-aurora-2/10 px-3 py-1.5 text-xs text-aurora-1 hover:bg-aurora-2/20"><SlidersHorizontal size={12} />按分类批量管理</button>
           </div>
         )}
         {torrents.length === 0 && (
@@ -425,7 +518,7 @@ export default function ConsoleView() {
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wider text-dim">
                 <th className="w-8 pb-3 pr-1 font-normal">
-                  <input type="checkbox" checked={torrents.length > 0 && sel.size === torrents.length} onChange={toggleAll} className="accent-[#a78bfa]" />
+                  <input type="checkbox" checked={torrents.length > 0 && torrents.every((item) => sel.has(item.id))} onChange={toggleAll} className="accent-[#a78bfa]" />
                 </th>
                 <th className="pb-3 pr-4 font-normal">任务</th>
                 <th className="pb-3 pr-4 whitespace-nowrap font-normal">状态</th>
@@ -586,7 +679,7 @@ export default function ConsoleView() {
             </div>
             {labels?.online && <div className="mt-4 grid gap-2 sm:grid-cols-2">
               <label className="block text-xs text-dim">分类
-                <select value={addCategory} onChange={(e) => setAddCategory(e.target.value)} disabled={busy}
+                <select value={addCategory} onChange={(e) => selectAddCategory(e.target.value)} disabled={busy}
                   className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
                   <option value="">默认分类</option>
                   {labels.categories.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
@@ -596,6 +689,7 @@ export default function ConsoleView() {
                 <input value={addTags} onChange={(e) => setAddTags(e.target.value)} placeholder="电影, 高清" disabled={busy}
                   className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
               </label>
+              {addCategory && categoryMappings.some((item) => item.category === addCategory) && <div className="sm:col-span-2 text-[11px] text-aurora-1">该分类已配置默认目标；下面未手动指定的目录会在提交时自动补齐。</div>}
             </div>}
             {addMode === 'magnet' ? (
               <textarea value={magnet} onChange={(e) => setMagnet(e.target.value)} rows={3}
@@ -615,6 +709,55 @@ export default function ConsoleView() {
             <div className="mt-4 flex justify-end gap-3">
               <button onClick={closeAdd} disabled={busy} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg disabled:opacity-40">取消</button>
               <button onClick={submit} disabled={busy || remoteBusy || (targetMode === 'remote' && !targetRemote) || (addMode === 'magnet' ? !magnet.trim() : !torrentFile)} className="rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40">{busy ? '处理中…' : '加入队列'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {batchOpen && (
+        <div className="fixed inset-0 z-[55] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" onClick={() => !batchBusy && setBatchOpen(false)}>
+          <div className="panel w-full max-w-lg px-5 py-5 sm:px-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm font-medium"><SlidersHorizontal size={16} className="text-aurora-1" />批量管理</div>
+              <button type="button" onClick={() => setBatchOpen(false)} disabled={batchBusy} title="关闭" aria-label="关闭" className="text-dim hover:text-fg disabled:opacity-40"><X size={16} /></button>
+            </div>
+            <div className="mt-1 text-xs text-dim">{categoryFilter && sel.size === 0 ? `分类「${categoryFilter}」中的全部任务` : `已选 ${sel.size} 个任务`}</div>
+            <label className="mt-4 block text-xs text-dim">操作
+              <select value={batchType} onChange={(e) => setBatchType(e.target.value as typeof batchType)} disabled={batchBusy}
+                className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                <option value="set_download_limit">设置下载限速</option>
+                <option value="set_upload_limit">设置上传限速</option>
+                <option value="set_location">移动保存目录</option>
+                <option value="transfer">转存到网盘</option>
+              </select>
+            </label>
+            {(batchType === 'set_download_limit' || batchType === 'set_upload_limit') && <label className="mt-3 block text-xs text-dim">限速 KiB/s（0 为不限）
+              <input type="number" min={0} value={batchLimitKib} onChange={(e) => setBatchLimitKib(Math.max(0, Number(e.target.value) || 0))} disabled={batchBusy}
+                className="num mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+            </label>}
+            {batchType === 'set_location' && <label className="mt-3 block text-xs text-dim">移动到
+              <select value={batchLocation} onChange={(e) => setBatchLocation(e.target.value)} disabled={batchBusy || dirsBusy}
+                className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                <option value="">请选择下载目录</option>
+                {mediaDirs.map((dir) => <option key={dir.path} value={dir.path}>{dir.path}</option>)}
+              </select>
+            </label>}
+            {batchType === 'transfer' && <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <label className="text-xs text-dim">目标网盘
+                <select value={batchRemote} onChange={(e) => setBatchRemote(e.target.value)} disabled={batchBusy || remoteBusy || !rcloneRemotes.length}
+                  className="aurora-select mt-1.5 w-full rounded-lg border border-line px-3 py-2 text-sm text-fg focus:border-aurora-2/50 focus:outline-none disabled:opacity-60">
+                  <option value="">请选择网盘</option>
+                  {rcloneRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name} · {remote.type || 'remote'}</option>)}
+                </select>
+              </label>
+              <label className="text-xs text-dim">目标目录
+                <input value={batchRemotePath} onChange={(e) => setBatchRemotePath(e.target.value)} placeholder="例如：电影/2026" disabled={batchBusy}
+                  className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none disabled:opacity-60" />
+              </label>
+            </div>}
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" onClick={() => setBatchOpen(false)} disabled={batchBusy} className="rounded-lg border border-line bg-white/4 px-4 py-2 text-sm text-dim hover:text-fg disabled:opacity-40">取消</button>
+              <button type="button" onClick={() => void doBatchAdvanced()} disabled={batchBusy || (batchType === 'transfer' && !rcloneRemotes.length)} className="inline-flex items-center gap-1.5 rounded-lg grad-bar px-4 py-2 text-sm font-medium text-ink disabled:opacity-40"><CheckSquare size={14} />{batchBusy ? '处理中…' : '执行批量操作'}</button>
             </div>
           </div>
         </div>
@@ -698,9 +841,10 @@ export default function ConsoleView() {
                   </section>
 
                   <section className="rounded-lg border border-line bg-white/3 p-4">
-                    <div className="flex items-center gap-2 text-sm text-fg"><FileText size={14} className="text-aurora-1" />文件与优先级</div>
+                    <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2 text-sm text-fg"><FileText size={14} className="text-aurora-1" />文件与优先级</div><button type="button" onClick={() => void applyFileSelection()} disabled={detailActionBusy || !detail.files.length} className="inline-flex items-center gap-1.5 rounded-md border border-aurora-2/30 bg-aurora-2/10 px-2.5 py-1.5 text-xs text-aurora-1 hover:bg-aurora-2/20 disabled:opacity-40"><CheckSquare size={12} />应用选择性下载</button></div>
+                    <div className="mt-2 text-[11px] text-dim">勾选要下载的文件，未勾选文件会设置为跳过；文件优先级仍可单独调整。</div>
                     <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-line">
-                      {detail.files.length === 0 ? <div className="p-3 text-xs text-dim">暂无文件信息</div> : detail.files.map((file) => <div key={file.index} className="flex items-center gap-2 border-b border-line/60 px-2.5 py-2 last:border-0"><div className="min-w-0 flex-1"><div className="truncate text-xs text-fg" title={file.name}>{file.name}</div><div className="text-[10px] text-dim">{fmtBytes(file.size)} · {pct(file.progress)}</div></div><select defaultValue={file.priority} onChange={(e) => void runDetailAction('set_file_priority', '文件优先级', { fileIds: [file.index], priority: Number(e.target.value) })} disabled={detailActionBusy} className="aurora-select rounded border border-line px-1.5 py-1 text-[10px] text-fg"><option value={0}>跳过</option><option value={1}>低</option><option value={4}>普通</option><option value={6}>高</option><option value={7}>最高</option></select></div>)}
+                      {detail.files.length === 0 ? <div className="p-3 text-xs text-dim">暂无文件信息</div> : detail.files.map((file) => <div key={file.index} className="flex items-center gap-2 border-b border-line/60 px-2.5 py-2 last:border-0"><input type="checkbox" checked={detailSelectedFiles.has(file.index)} onChange={() => setDetailSelectedFiles((current) => { const next = new Set(current); if (next.has(file.index)) next.delete(file.index); else next.add(file.index); return next })} disabled={detailActionBusy} className="accent-[#a78bfa]" /><div className="min-w-0 flex-1"><div className="truncate text-xs text-fg" title={file.name}>{file.name}</div><div className="text-[10px] text-dim">{fmtBytes(file.size)} · {pct(file.progress)}</div></div><select value={file.priority} onChange={(e) => void runDetailAction('set_file_priority', '文件优先级', { fileIds: [file.index], priority: Number(e.target.value) })} disabled={detailActionBusy} className="aurora-select rounded border border-line px-1.5 py-1 text-[10px] text-fg"><option value={0}>跳过</option><option value={1}>低</option><option value={4}>普通</option><option value={6}>高</option><option value={7}>最高</option></select></div>)}
                     </div>
                   </section>
 

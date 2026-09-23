@@ -308,11 +308,45 @@ def _qbit_tags(values) -> list[str]:
     return tags
 
 
+def _torrent_mapping_payload(values) -> dict[str, dict]:
+    if not isinstance(values, list) or len(values) > 64:
+        raise HTTPException(status_code=400, detail="分类映射最多 64 条")
+    result = {}
+    for item in values:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="分类映射格式无效")
+        category = _qbit_category(item.get("category", ""))
+        if not category or category in result:
+            raise HTTPException(status_code=400, detail="分类映射名称重复或无效")
+        local_path = str(item.get("local_path") or "").strip()
+        if local_path:
+            qbit_path = _torrent_save_path(local_path)
+            local_path = qbit_path[len("/downloads"):].lstrip("/")
+        remote = str(item.get("destination_remote") or "").strip()
+        remote_path = str(item.get("destination_path") or "").strip()
+        if remote:
+            if not providers._rclone.available():
+                raise HTTPException(status_code=503, detail="网盘服务未接入，无法保存默认转存目标")
+            ok, remote_path, detail = providers._rclone.validate_destination(remote, remote_path)
+            if not ok:
+                raise HTTPException(status_code=400, detail=detail or "默认网盘目标无效")
+        elif remote_path:
+            raise HTTPException(status_code=400, detail="未选择网盘时不能填写网盘目录")
+        result[category] = {
+            "category": category,
+            "local_path": local_path,
+            "destination_remote": remote,
+            "destination_path": remote_path,
+        }
+    return result
+
+
 class AddMagnet(BaseModel):
     magnet: str
     save_path: str = ""
     destination_remote: str = ""
     destination_path: str = ""
+    destination_mode: str = "default"
     category: str = ""
     tags: list[str] = []
 
@@ -325,13 +359,19 @@ def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
     magnet = body.magnet.strip()
     if not magnet.startswith("magnet:"):
         raise HTTPException(status_code=400, detail="not a magnet link")
-    save_path = _torrent_save_path(body.save_path)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法添加磁力")
     category = _qbit_category(body.category)
     tags = _qbit_tags(body.tags)
+    if body.destination_mode not in ("default", "local", "remote"):
+        raise HTTPException(status_code=400, detail="下载目标模式无效")
+    save_input, remote_input, path_input, mapping_applied = providers.apply_category_mapping(
+        category, body.save_path, body.destination_remote, body.destination_path,
+        apply_destination=body.destination_mode != "local",
+    )
+    save_path = _torrent_save_path(save_input)
     marker, destination_path, detail = providers.register_torrent_destination(
-        body.destination_remote, body.destination_path,
+        remote_input, path_input,
     )
     if detail:
         raise HTTPException(status_code=400, detail=detail)
@@ -339,9 +379,9 @@ def add_torrent(body: AddMagnet, _user: str = Depends(require_auth)):
         providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该磁力（链接可能已存在或无效）")
     return {
-        "ok": True, "mode": "qbittorrent", "save_path": body.save_path.strip(),
-        "destination_remote": body.destination_remote.strip(), "destination_path": destination_path,
-        "category": category, "tags": tags,
+        "ok": True, "mode": "qbittorrent", "save_path": save_input.strip(),
+        "destination_remote": remote_input, "destination_path": destination_path,
+        "category": category, "tags": tags, "mapping_applied": mapping_applied,
     }
 
 
@@ -351,6 +391,7 @@ async def upload_torrent(
     save_path: str = Form(""),
     destination_remote: str = Form(""),
     destination_path: str = Form(""),
+    destination_mode: str = Form("default"),
     category: str = Form(""),
     tags: str = Form(""),
     _user: str = Depends(require_auth),
@@ -358,11 +399,17 @@ async def upload_torrent(
     name = Path(file.filename or "").name
     if not name or name == ".torrent" or not name.lower().endswith(".torrent"):
         raise HTTPException(status_code=400, detail="仅支持 .torrent 文件")
-    qbit_save_path = _torrent_save_path(save_path)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法上传种子")
     category = _qbit_category(category)
     tags = _qbit_tags(tags)
+    if destination_mode not in ("default", "local", "remote"):
+        raise HTTPException(status_code=400, detail="下载目标模式无效")
+    save_input, remote_input, path_input, mapping_applied = providers.apply_category_mapping(
+        category, save_path, destination_remote, destination_path,
+        apply_destination=destination_mode != "local",
+    )
+    qbit_save_path = _torrent_save_path(save_input)
     try:
         content = await file.read(_MAX_TORRENT_FILE + 1)
     finally:
@@ -372,7 +419,7 @@ async def upload_torrent(
     if len(content) > _MAX_TORRENT_FILE:
         raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
     marker, destination_path, detail = providers.register_torrent_destination(
-        destination_remote, destination_path,
+        remote_input, path_input,
     )
     if detail:
         raise HTTPException(status_code=400, detail=detail)
@@ -380,31 +427,91 @@ async def upload_torrent(
         providers.discard_torrent_destination(marker)
         raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
     return {
-        "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_path.strip(),
-        "destination_remote": destination_remote.strip(), "destination_path": destination_path,
-        "category": category, "tags": tags,
+        "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_input.strip(),
+        "destination_remote": remote_input, "destination_path": destination_path,
+        "category": category, "tags": tags, "mapping_applied": mapping_applied,
     }
 
 
 class BatchAction(BaseModel):
     action: str
     ids: list[str]
+    category: str = ""
+    limit_kib: int | None = None
+    location: str = ""
+    destination_remote: str = ""
+    destination_path: str = ""
 
 
 @app.post("/api/torrents/batch")
 def batch_torrent(body: BatchAction, _user: str = Depends(require_auth)):
-    if body.action not in ("remove", "pause", "resume"):
+    advanced_actions = {"set_download_limit", "set_upload_limit", "set_location", "transfer"}
+    if body.action not in {"remove", "pause", "resume"} | advanced_actions:
         raise HTTPException(status_code=400, detail="unknown action")
     qbit = providers._qbit.available()
+    if body.action in advanced_actions and not qbit:
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+    if body.category and not providers.QbittorrentProvider._valid_label(body.category):
+        raise HTTPException(status_code=400, detail="分类名称无效")
+    if body.action in ("set_download_limit", "set_upload_limit"):
+        if body.limit_kib is None or not 0 <= body.limit_kib <= 10_000_000:
+            raise HTTPException(status_code=400, detail="限速必须在 0-10000000 KiB/s 之间")
+        value = body.limit_kib * 1024
+    else:
+        value = None
+    location = _torrent_save_path(body.location) if body.action == "set_location" else ""
+    if body.action == "set_location" and not body.location.strip():
+        raise HTTPException(status_code=400, detail="请选择移动目录")
+    if body.action == "transfer":
+        if not body.destination_remote.strip():
+            raise HTTPException(status_code=400, detail="请选择目标网盘")
+        if not providers._rclone.available():
+            raise HTTPException(status_code=503, detail="网盘服务未接入")
+        valid, normalized_path, detail = providers._rclone.validate_destination(
+            body.destination_remote.strip(), body.destination_path.strip(),
+        )
+        if not valid:
+            raise HTTPException(status_code=400, detail=detail or "网盘目标无效")
+    else:
+        normalized_path = ""
+
+    ids = [str(item).strip() for item in body.ids if str(item).strip()]
+    if qbit and body.category:
+        details = providers._qbit.torrent_details()
+        if not getattr(providers._qbit, "_last_details_ok", True):
+            raise HTTPException(status_code=502, detail="读取 qBittorrent 任务失败")
+        category_ids = {str(item.get("hash") or "") for item in details if str(item.get("category") or "").strip() == body.category}
+        ids = [item for item in (ids or sorted(category_ids)) if item in category_ids]
+    if not ids:
+        raise HTTPException(status_code=400, detail="没有可操作的任务")
     done = failed = 0
-    for tid in body.ids:
-        if qbit and providers._qbit.action(tid, body.action):
-            done += 1
-        elif providers.mutate(tid, body.action):
+    errors = []
+    for tid in ids:
+        if qbit and body.action in advanced_actions:
+            if body.action == "transfer":
+                marker, _path, reserve_error = providers.register_torrent_destination(
+                    body.destination_remote.strip(), normalized_path,
+                )
+                changed, error = (False, reserve_error or "网盘目标无效")
+                if marker:
+                    changed, error = providers._qbit.add_system_tags(tid, [marker])
+                    if not changed:
+                        providers.discard_torrent_destination(marker)
+            else:
+                changed, error = providers._qbit.advanced_action(tid, body.action, value=value, location=location)
+        elif qbit and providers._qbit.action(tid, body.action):
+            changed, error = True, ""
+        elif not qbit and providers.mutate(tid, body.action):
+            changed, error = True, ""
+        else:
+            changed, error = False, "任务操作失败"
+        if changed:
             done += 1
         else:
             failed += 1
-    return {"ok": True, "done": done, "failed": failed, "mode": "qbittorrent" if qbit else "demo"}
+            if len(errors) < 20:
+                errors.append({"id": tid, "detail": error})
+    return {"ok": True, "done": done, "failed": failed, "errors": errors, "mode": "qbittorrent" if qbit else "demo"}
 
 
 class TorrentAdvancedAction(BaseModel):
@@ -414,6 +521,7 @@ class TorrentAdvancedAction(BaseModel):
     location: str = ""
     delete_files: bool = False
     file_ids: list[int] = []
+    all_file_ids: list[int] = []
     priority: int | None = None
 
 
@@ -440,12 +548,16 @@ def torrent_advanced(body: TorrentAdvancedAction, _user: str = Depends(require_a
         limit = body.limit_kib * 1024
     else:
         limit = None
-    if body.action == "set_file_priority":
-        if not body.file_ids or len(body.file_ids) > 512 or body.priority is None or not 0 <= body.priority <= 7:
+    if body.action in ("set_file_priority", "set_file_selection"):
+        if not body.file_ids or len(body.file_ids) > 4096:
             raise HTTPException(status_code=400, detail="文件优先级参数无效")
+        if body.action == "set_file_priority" and (body.priority is None or not 0 <= body.priority <= 7):
+            raise HTTPException(status_code=400, detail="文件优先级参数无效")
+        if body.action == "set_file_selection" and (not body.all_file_ids or len(body.all_file_ids) > 4096):
+            raise HTTPException(status_code=400, detail="文件选择参数无效")
     ok, detail = providers._qbit.advanced_action(
         body.id, body.action, value=limit, delete_files=body.delete_files, location=location,
-        file_ids=body.file_ids, priority=body.priority,
+        file_ids=body.file_ids, all_file_ids=body.all_file_ids, priority=body.priority,
     )
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
@@ -456,6 +568,21 @@ class TorrentLabelsBody(BaseModel):
     id: str
     category: str | None = None
     tags: list[str] | None = None
+
+
+class TorrentMappingsBody(BaseModel):
+    mappings: list[dict] = []
+
+
+@app.get("/api/torrents/mappings")
+def torrent_mappings(_user: str = Depends(require_auth)):
+    return {"mappings": providers.torrent_category_mappings()}
+
+
+@app.post("/api/torrents/mappings")
+def save_torrent_mappings(body: TorrentMappingsBody, _user: str = Depends(require_auth)):
+    mappings = _torrent_mapping_payload(body.mappings)
+    return {"ok": True, "mappings": providers.save_torrent_category_mappings(mappings)}
 
 
 @app.get("/api/torrents/labels")
