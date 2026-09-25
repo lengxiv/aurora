@@ -21,7 +21,7 @@ export interface Mount {
 export interface Torrent {
   id: string
   name: string
-  state: 'downloading' | 'stalled' | 'seeding' | 'queued' | 'error' | 'done' | 'paused'
+  state: 'downloading' | 'stalled' | 'seeding' | 'queued' | 'error' | 'done' | 'paused' | 'unknown'
   progress: number
   speed: number
   sizeGb: number
@@ -100,10 +100,10 @@ export interface MediaDir {
   name: string
 }
 
-async function getJson<T>(url: string): Promise<T | null> {
+async function getJson<T>(url: string, timeoutMs = 2500): Promise<T | null> {
   try {
     const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), 2500)
+    const t = setTimeout(() => ctrl.abort(), timeoutMs)
     const res = await fetch(url, { signal: ctrl.signal, credentials: 'include' })
     clearTimeout(t)
     if (res.status === 401) {
@@ -137,7 +137,8 @@ export function MetricsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let on = true
     const tick = async () => {
-      const live = await getJson<Metrics>('/api/metrics')
+      // metrics 是仪表盘命脉：比默认 2.5s 放宽到 6s，链路稍慢时不至于闪回空态
+      const live = await getJson<Metrics>('/api/metrics', 6000)
       if (!on) return
       if (live && live.mounts) {
         setData(live)
@@ -145,9 +146,12 @@ export function MetricsProvider({ children }: { children: ReactNode }) {
         const s = (live as Metrics & { sources?: Record<string, string> }).sources
         if (s) setSources(s)
       } else {
-        // API 不可用时保持诚实空态，不注入假读数
+        // API 不可用时保持诚实空态，不注入假读数；
+        // 同时清空数据源徽标，否则界面继续显示"qBittorrent 真实"等陈旧来源，
+        // 让用户误以为任务丢了而不是后端断了
         setData(mockMetrics())
         setSource('mock')
+        setSources({})
       }
     }
     tick()
@@ -157,7 +161,7 @@ export function MetricsProvider({ children }: { children: ReactNode }) {
   return createElement(MetricsCtx.Provider, { value: { data, source, sources } }, children)
 }
 
-export function useMetrics(_pollMs = 4000) {
+export function useMetrics() {
   return useContext(MetricsCtx)
 }
 
@@ -246,26 +250,40 @@ export interface AuthSession {
 }
 
 export async function fetchSessions(): Promise<AuthSession[]> {
-  const r = await fetch('/api/auth/sessions', { credentials: 'include' })
-  if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
-  if (!r.ok) return []
-  return (await r.json()).sessions || []
+  try {
+    const r = await fetch('/api/auth/sessions', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
+    if (!r.ok) return []
+    return (await r.json()).sessions || []
+  } catch {
+    return []
+  }
 }
 
 export async function revokeSession(id: string) {
-  const r = await fetch('/api/auth/sessions/revoke', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ id }),
-  })
-  const { detail } = await responseDetail(r, '撤销失败')
-  return { ok: r.ok, detail }
+  try {
+    const r = await fetch('/api/auth/sessions/revoke', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ id }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    const { detail } = await responseDetail(r, '撤销失败')
+    return { ok: r.ok, detail }
+  } catch {
+    return { ok: false, detail: '网络请求失败' }
+  }
 }
 
 export async function changePassword(current: string, next: string) {
-  const r = await fetch('/api/auth/password', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ current, new: next }),
-  })
-  const { detail } = await responseDetail(r, '修改失败')
-  return { ok: r.ok, detail }
+  try {
+    const r = await fetch('/api/auth/password', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ current, new: next }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    const { detail } = await responseDetail(r, '修改失败')
+    return { ok: r.ok, detail }
+  } catch {
+    return { ok: false, detail: '网络请求失败' }
+  }
 }
 
 export async function torrentAction(id: string, action: string) {
@@ -844,7 +862,7 @@ export async function uploadRcloneFile(
       }
       resolve({
         ok: xhr.status >= 200 && xhr.status < 300 && !!data?.ok,
-        detail: data?.detail || (xhr.status >= 200 && xhr.status < 300 ? '上传失败' : '上传失败'),
+        detail: data?.detail || (xhr.status >= 200 && xhr.status < 300 ? '上传失败' : `上传失败（HTTP ${xhr.status}）`),
         job: data?.job || null,
       })
     }
@@ -977,18 +995,27 @@ export async function deleteMedia(path: string) {
 export interface TrashItem { id: string; path: string; name: string; size: number; deleted: number }
 
 export async function fetchTrash(): Promise<TrashItem[]> {
-  const r = await fetch('/api/media/trash', { credentials: 'include' })
-  if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
-  if (!r.ok) return []
-  return (await r.json()).items || []
+  try {
+    const r = await fetch('/api/media/trash', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
+    if (!r.ok) return []
+    return (await r.json()).items || []
+  } catch {
+    return []
+  }
 }
 
 async function trashAction(action: 'restore' | 'purge', id: string) {
-  const r = await fetch(`/api/media/trash/${action}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ path: id }),
-  })
-  const { detail } = await responseDetail(r, action === 'restore' ? '恢复失败' : '删除失败')
-  return { ok: r.ok, detail }
+  try {
+    const r = await fetch(`/api/media/trash/${action}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ path: id }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    const { detail } = await responseDetail(r, action === 'restore' ? '恢复失败' : '删除失败')
+    return { ok: r.ok, detail }
+  } catch {
+    return { ok: false, detail: '网络请求失败' }
+  }
 }
 
 export const restoreTrash = (id: string) => trashAction('restore', id)
@@ -1004,8 +1031,6 @@ export async function renameMedia(path: string, newName: string) {
     return r.ok
   } catch { return false }
 }
-
-export interface MediaDir { path: string; name: string }
 
 export async function fetchDirs(): Promise<MediaDir[] | null> {
   try {

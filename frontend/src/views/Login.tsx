@@ -22,6 +22,11 @@ export default function Login() {
         window.location.assign('/')
         return
       }
+      // 429 是服务端按 IP 的失败锁定（5 次/300s），继续重试只会延长锁定
+      if (res.status === 429) {
+        setError('尝试次数过多，已临时锁定，请约 5 分钟后再试')
+        return
+      }
       setError('账号或密码不正确')
     } catch {
       setError('登录服务不可用')

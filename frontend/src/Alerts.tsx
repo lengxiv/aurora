@@ -3,7 +3,7 @@ import { useMetrics, fetchSettings } from './lib/api'
 import { useToast } from './toast'
 
 export default function Alerts() {
-  const { data } = useMetrics(4000)
+  const { data } = useMetrics()
   const toast = useToast()
   const prev = useRef<Record<string, string>>({})
   const [enabled, setEnabled] = useState(true)

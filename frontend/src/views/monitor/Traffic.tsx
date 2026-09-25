@@ -5,7 +5,7 @@ import { fmtRate } from '../../components/ui'
 const MAX_POINTS = 12
 
 export function Traffic() {
-  const { data } = useMetrics(2000)
+  const { data } = useMetrics()
   const [hist, setHist] = useState<{ in: number; out: number }[]>([])
   useEffect(() => {
     if (data.bandwidth) {

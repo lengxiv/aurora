@@ -3,7 +3,7 @@ import { fmtRate, pct, Skeleton, EmptyState, STATE_ZH } from '../../components/u
 import { ArrowDownToLine } from 'lucide-react'
 
 export function TorrentCarpet() {
-  const { data, source } = useMetrics(2000)
+  const { data, source } = useMetrics()
   const dl = data.torrents.filter((t) => t.state === 'downloading')
   const speed = dl.reduce((a, t) => a + t.speed, 0)
   return (

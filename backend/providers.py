@@ -19,7 +19,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,11 +60,20 @@ _TORRENT_DEST_RETENTION = 7 * 24 * 60 * 60
 
 def _atomic_json(path: str, data) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    # tmp 名带上 pid/线程：多进程或多线程并发写同一状态文件时互不踩踏
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())   # 断电时避免 ext4 延迟分配留下 0 字节文件
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 try:
@@ -420,11 +429,16 @@ def _rclone_fs(name: str, path: str = "") -> str:
 
 _QBIT_STATES = {
     "downloading": "downloading", "stalledDL": "stalled", "forcedDL": "downloading",
-    "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding", "stoppedUP": "seeding",
+    "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding",
     "queuedDL": "queued", "queuedUP": "queued",
     "error": "error", "missingFiles": "error", "unknown": "error",
     "pausedUP": "done", "pausedDL": "done", "checkingDL": "done", "checkingUP": "done",
     "stoppedUP": "paused", "stoppedDL": "paused",   # qBittorrent 5.x stop/start
+    # 4.x/5.x 其余过渡态：不能回退成 done，否则刚添加、正在拉元数据的种子会在 UI 显示"已完成"
+    "metaDL": "downloading", "metadataDL": "downloading",
+    "forcedMetaDL": "downloading", "forcedMetaDownload": "downloading",
+    "allocating": "downloading", "moving": "queued", "checkingResumeData": "queued",
+    "drunning": "downloading", "dstopped": "paused",
 }
 
 
@@ -436,6 +450,9 @@ class RcloneProvider:
         self.base = os.environ.get("AURORA_RCLONE_RC", "http://127.0.0.1:5572").rstrip("/")
         # rc 启用 Basic Auth 时提供凭据（用户:密码，纯回环仍建议开，公网反代必须开）
         self.auth = os.environ.get("AURORA_RCLONE_RC_AUTH", "")
+        # 探测失败退避：metrics 每 2s 轮询，rclone 掉线时若每次都打满探测超时，
+        # 持锁的 metrics 计算会让所有并发请求排队
+        self._down_until = 0.0
         self._transfer_lock = threading.RLock()
         self._transfer_jobs: dict[str, dict] = {}
         self._load_transfer_jobs()
@@ -488,7 +505,12 @@ class RcloneProvider:
 
     def available(self) -> bool:
         # rclone rcd 的 rc API 只接受 POST（--rc-serve 仅 serve 命令支持）
-        return _probe(f"{self.base}/core/version", method="POST", auth=self.auth or None) == 200
+        if time.monotonic() < self._down_until:
+            return False
+        ok = _probe(f"{self.base}/core/version", method="POST", auth=self.auth or None) == 200
+        # 只缓存"掉线"结论 15s：在线路径每次真实探测，恢复感知不受影响
+        self._down_until = 0.0 if ok else time.monotonic() + 15.0
+        return ok
 
     def mounts(self):
         remotes = self._req("/config/listremotes", timeout=3.0, method="POST")
@@ -820,25 +842,28 @@ class RcloneProvider:
     def cancel_transfer(self, transfer_id: str) -> tuple[bool, str]:
         with self._transfer_lock:
             job = self._transfer_jobs.get(transfer_id)
-        if not job:
-            return False, "传输任务不存在"
-        if job.get("status") in ("done", "error", "canceled"):
-            return True, ""
+            if not job:
+                return False, "传输任务不存在"
+            if job.get("status") in ("done", "error", "canceled"):
+                return True, ""
         try:
             self._req(
                 "/job/stop", timeout=5.0, method="POST",
                 data=json.dumps({"jobid": job["rcloneJobId"]}),
                 headers={"Content-Type": "application/json"},
             )
+        except Exception as e:
+            return False, str(e).strip()[:180] or "取消传输失败"
+        with self._transfer_lock:
+            # 网络调用期间 _refresh_transfer 可能已把它标成 done/error，以先到者为准
+            if job.get("status") in ("done", "error", "canceled"):
+                return True, ""
             job["status"] = "canceled"
             job["detail"] = "已取消"
             job["finished"] = int(time.time())
             self._cleanup_transfer(job)
-            with self._transfer_lock:
-                self._persist_transfer_jobs_locked()
-            return True, ""
-        except Exception as e:
-            return False, str(e).strip()[:180] or "取消传输失败"
+            self._persist_transfer_jobs_locked()
+        return True, ""
 
     def retry_transfer(self, transfer_id: str) -> tuple[bool, dict | None, str]:
         with self._transfer_lock:
@@ -908,7 +933,12 @@ class RcloneProvider:
         except Exception as e:
             return False, None, _friendly_remote_error(name, str(e), write=True) or "删除失败"
 
-    def rename_remote(self, name: str, path: str, new_name: str, is_dir: bool) -> tuple[bool, dict | None, str]:
+    def rename_remote_entry(self, name: str, path: str, new_name: str, is_dir: bool) -> tuple[bool, dict | None, str]:
+        """Rename a file/directory entry inside a remote.
+
+        之前与本类的 rename_remote(name, new_name)（remote 改名）同名，
+        后定义者覆盖前者，导致 /api/rclone/files/rename 必然 TypeError。
+        """
         try:
             name, path = self._validate_name_path(name, path, allow_empty=False)
             new_name = str(new_name or "").strip()
@@ -1114,7 +1144,7 @@ class RcloneProvider:
             return False, {}, str(e).strip()[:180] or "读取网盘配置失败"
 
     def rename_remote(self, name: str, new_name: str) -> tuple[bool, str]:
-        """Rename a remote by recreating its complete config under a new name."""
+        """Rename a remote (its config) by recreating it under a new name."""
         import re as _re
         name = str(name or "").strip()
         new_name = str(new_name or "").strip()
@@ -1307,6 +1337,10 @@ class QbittorrentProvider:
         self.pw = os.environ.get("AURORA_QBIT_PASS", "")
         self._session_lock = threading.RLock()
         self._last_details_ok = False
+        # 探测连续失败后的退避：metrics 每 2s 轮询一次 available()，
+        # 若密码错误或 qbit 掉线还每次都打登录接口，会触发 qBittorrent 的
+        # 失败封禁（默认 5 次封 IP），把 Aurora 自己和反代后的用户一起封出去
+        self._auth_backoff_until = 0.0
 
     def _ensure(self):
         if getattr(self, "_sess", None) is None:
@@ -1325,14 +1359,18 @@ class QbittorrentProvider:
         cookie expired), drop it and rebuild so we don't silently fall back to
         demo data until the whole service is restarted."""
         with self._session_lock:
+            if time.monotonic() < self._auth_backoff_until:
+                return False
             for _ in range(2):
                 try:
                     s = self._ensure()
                     if s.get(f"{self.base}/api/v2/app/version", timeout=4).status_code == 200:
+                        self._auth_backoff_until = 0.0
                         return True
                     self._sess = None        # stale/reused connection -> force re-login
                 except Exception:
                     self._sess = None
+                    self._auth_backoff_until = time.monotonic() + 60.0
         return False
 
     def queue_settings(self) -> tuple[bool, dict, str]:
@@ -1713,7 +1751,7 @@ class QbittorrentProvider:
         out = []
         data = self.torrent_details()
         for t in data or []:
-            st = _QBIT_STATES.get(t.get("state", "unknown"), "done")
+            st = _QBIT_STATES.get(t.get("state", "unknown"), "unknown")
             row = {
                 "id": t.get("hash", ""), "name": t.get("name", "?"), "state": st,
                 "progress": t.get("progress", 0),
@@ -1920,9 +1958,14 @@ class JellyfinProvider:
     def __init__(self):
         self.base = os.environ.get("AURORA_JELLYFIN", "http://127.0.0.1:8096").rstrip("/")
         self.token = os.environ.get("AURORA_JELLYFIN_TOKEN", "")
+        self._down_until = 0.0   # 同 rclone：掉线结论缓存 15s，避免 2s 轮询打满探测超时
 
     def available(self) -> bool:
-        return _probe(f"{self.base}/System/Info/Public") == 200
+        if time.monotonic() < self._down_until:
+            return False
+        ok = _probe(f"{self.base}/System/Info/Public") == 200
+        self._down_until = 0.0 if ok else time.monotonic() + 15.0
+        return ok
 
     def streams(self):
         if not self.token:
@@ -2027,22 +2070,44 @@ _jelly = JellyfinProvider()
 _local = LocalMountProvider()
 
 
+_DEST_CACHE: dict[str, dict] = {}
+_DEST_CACHE_STAMP: object = object()   # 哨兵：首次调用必然未命中
+
+
 def _load_torrent_destinations() -> dict[str, dict]:
+    """Read the destination state file, cached by (mtime, size).
+
+    metrics 每 2s 会对每个种子调用 torrent_destination_for_tags（N+1），
+    按文件指纹缓存后一个轮询周期只解析一次；写入路径在保存后主动失效。
+    调用方需持有 _TORRENT_DEST_LOCK（写路径均已如此）。
+    """
+    global _DEST_CACHE, _DEST_CACHE_STAMP
+    try:
+        st = os.stat(_TORRENT_DEST_FILE)
+        stamp: object = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp == _DEST_CACHE_STAMP:
+        return _DEST_CACHE
     try:
         with open(_TORRENT_DEST_FILE) as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            return {}
-        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        parsed = {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
     except Exception:
-        return {}
+        parsed = {}
+    _DEST_CACHE = parsed
+    _DEST_CACHE_STAMP = stamp
+    return parsed
 
 
 def _save_torrent_destinations(data: dict[str, dict]) -> None:
+    global _DEST_CACHE_STAMP
     try:
         _atomic_json(_TORRENT_DEST_FILE, data)
     except Exception:
         pass
+    # 写入后强制下一次 load 重新读盘（含写失败场景，避免缓存与磁盘分叉）
+    _DEST_CACHE_STAMP = object()
 
 
 def _tag_list(tags: str) -> list[str]:
@@ -2159,6 +2224,9 @@ def _process_torrent_destinations() -> None:
         return
     with _TORRENT_DEST_LOCK:
         destinations = _load_torrent_destinations()
+    # 浅拷贝隔离：调度线程会在锁外逐字段修改 entry，不能让缓存里的对象
+    # 被并发读者看到中间状态
+    destinations = {k: dict(v) for k, v in destinations.items()}
     if not destinations:
         return
     jobs = {str(job.get("id")): job for job in _rclone.transfers()}
@@ -2168,7 +2236,7 @@ def _process_torrent_destinations() -> None:
         for tag in _tag_list(torrent.get("tags", "")):
             if tag in destinations:
                 by_marker[tag] = torrent
-    changed = False
+    touched: set[str] = set()   # 本轮实际修改/移除的 marker，写回时按键合并
     for marker, entry in list(destinations.items()):
         status = str(entry.get("status") or "waiting")
         if status == "done":
@@ -2183,19 +2251,19 @@ def _process_torrent_destinations() -> None:
                 entry["status"] = "done"
                 entry["detail"] = ""
                 entry["finished"] = now
-                changed = True
+                touched.add(marker)
                 continue
             if job and job.get("status") == "error":
                 entry["status"] = "error"
                 entry["detail"] = job.get("detail") or "网盘上传失败"
                 entry["finished"] = now
-                changed = True
+                touched.add(marker)
                 continue
             if job and job.get("status") == "canceled":
                 entry["status"] = "error"
                 entry["detail"] = "网盘上传已取消，请点击重试"
                 entry["finished"] = now
-                changed = True
+                touched.add(marker)
                 continue
             if job:
                 continue
@@ -2204,7 +2272,7 @@ def _process_torrent_destinations() -> None:
             entry["status"] = "error"
             entry["detail"] = "网盘转存任务状态已丢失，请点击重试"
             entry["finished"] = now
-            changed = True
+            touched.add(marker)
             continue
 
         torrent = by_marker.get(marker)
@@ -2217,10 +2285,10 @@ def _process_torrent_destinations() -> None:
                 entry["status"] = "orphaned"
                 entry["detail"] = "qBittorrent 任务已不存在，请确认任务后再重试"
                 entry["finished"] = now
-                changed = True
+                touched.add(marker)
             elif status == "orphaned" and age >= _TORRENT_DEST_RETENTION:
                 destinations.pop(marker, None)
-                changed = True
+                touched.add(marker)
             continue
 
         for key, value in (("hash", torrent.get("hash", "")),
@@ -2228,7 +2296,7 @@ def _process_torrent_destinations() -> None:
                            ("last_seen", now)):
             if entry.get(key) != value:
                 entry[key] = value
-                changed = True
+                touched.add(marker)
         if status in ("error", "orphaned"):
             continue
         if float(torrent.get("progress", 0) or 0) < 0.999999:
@@ -2237,20 +2305,20 @@ def _process_torrent_destinations() -> None:
         if not local_path or not os.path.exists(local_path):
             if entry.get("detail") != "等待本地下载文件就绪":
                 entry["detail"] = "等待本地下载文件就绪"
-                changed = True
+                touched.add(marker)
             continue
         item_name = os.path.basename(local_path.rstrip(os.sep))
         if not item_name:
             entry["status"] = "error"
             entry["detail"] = "无法确定本地下载文件名"
-            changed = True
+            touched.add(marker)
             continue
         try:
             target = _join_rclone_path(entry.get("path", ""), item_name)
         except ValueError:
             entry["status"] = "error"
             entry["detail"] = "网盘目标路径无效"
-            changed = True
+            touched.add(marker)
             continue
         ok, job, detail = _rclone.upload_local(entry["remote"], local_path, target)
         if ok and job:
@@ -2263,10 +2331,19 @@ def _process_torrent_destinations() -> None:
             entry["status"] = "error"
             entry["detail"] = detail or "网盘上传失败"
         entry["finished"] = 0 if ok else now
-        changed = True
-    if changed:
+        touched.add(marker)
+    if touched:
         with _TORRENT_DEST_LOCK:
-            _save_torrent_destinations(destinations)
+            # 写回前重读最新状态、只按本轮处理过的 marker 合并：处理过程在锁外
+            # 做了秒级网络调用，期间 register/discard/retry 可能已写入别的条目，
+            # 把整份旧快照覆盖回去会静默抹掉它们（丢单且 UI 无任何报错）。
+            current = _load_torrent_destinations()
+            for marker in touched:
+                if marker in destinations:
+                    current[marker] = destinations[marker]
+                else:
+                    current.pop(marker, None)   # 本轮因保留期到期被移除的孤儿
+            _save_torrent_destinations(current)
 
 
 _destination_sched_started = False
@@ -2440,6 +2517,21 @@ def load_settings() -> dict:
     return d
 
 
+# 设置接口对 secret 字段的回显掩码：前端原样回传表示"未修改"，
+# save_settings 用磁盘上的原值替换，避免把掩码存成真实 token
+_TOKEN_MASK = "__aurora_masked__"
+
+
+def _mask_tokens(settings: dict) -> dict:
+    tg = settings.get("tg")
+    if isinstance(tg, dict) and isinstance(tg.get("tokens"), list):
+        tg["tokens"] = [
+            {**t, "token": _TOKEN_MASK} if isinstance(t, dict) and t.get("token") else t
+            for t in tg["tokens"]
+        ]
+    return settings
+
+
 def save_settings(s: dict):
     d = _default_settings()
     for k in d:
@@ -2456,19 +2548,31 @@ def save_settings(s: dict):
         d["alerts"]["diskWarn"] = 90.0
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(d["daily"].get("time", ""))):
         d["daily"]["time"] = "21:00"
+    # 掩码值按槽位还原为磁盘上的原 token；用户清空输入则真正删除 token
+    stored_tokens: dict[int, dict] = {}
+    try:
+        with open(_SETTINGS_FILE) as f:
+            stored = json.load(f)
+        if isinstance(stored, dict) and isinstance(stored.get("tg", {}).get("tokens"), list):
+            stored_tokens = {i: t for i, t in enumerate(stored["tg"]["tokens"]) if isinstance(t, dict)}
+    except Exception:
+        pass
     clean_tokens = []
-    for token in d["tg"].get("tokens", [])[:2]:
+    for idx, token in enumerate(d["tg"].get("tokens", [])[:2]):
         if not isinstance(token, dict):
             continue
+        token_value = str(token.get("token", ""))[:256]
+        if token_value == _TOKEN_MASK:
+            token_value = str(stored_tokens.get(idx, {}).get("token", ""))[:256]
         clean_tokens.append({
             "name": str(token.get("name", ""))[:20],
-            "token": str(token.get("token", ""))[:256],
+            "token": token_value,
             "chat_id": str(token.get("chat_id", ""))[:128],
         })
     d["tg"]["tokens"] = clean_tokens
     with _DATA_LOCK:
         _atomic_json(_SETTINGS_FILE, d)
-    return d
+    return _mask_tokens(d)
 
 
 def torrent_category_mappings() -> list[dict]:
@@ -2477,9 +2581,12 @@ def torrent_category_mappings() -> list[dict]:
 
 
 def save_torrent_category_mappings(value) -> list[dict]:
-    current = load_settings()
-    current["category_mappings"] = _normalize_category_mappings(value)
-    saved = save_settings(current)
+    # load → modify → save 必须整体持锁：与 save_torrent_policies 并发时，
+    # 无锁读到的旧快照整体覆盖写回会丢掉对方刚保存的区块
+    with _DATA_LOCK:
+        current = load_settings()
+        current["category_mappings"] = _normalize_category_mappings(value)
+        saved = save_settings(current)
     mappings = saved.get("category_mappings", {})
     _log("torrent.category_mappings", f"{len(mappings)} 条映射")
     return [mappings[key] for key in sorted(mappings, key=str.casefold)]
@@ -2508,9 +2615,10 @@ def torrent_policies() -> dict:
 
 
 def save_torrent_policies(value: dict) -> dict:
-    current = load_settings()
-    current["policies"] = _normalize_policies(value)
-    saved = save_settings(current)
+    with _DATA_LOCK:   # 同 save_torrent_category_mappings：读改写整体持锁
+        current = load_settings()
+        current["policies"] = _normalize_policies(value)
+        saved = save_settings(current)
     _log("torrent.policy.settings", f"{len(saved['policies']['rules'])} 条规则")
     return saved["policies"]
 
@@ -2636,8 +2744,10 @@ def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tu
                 continue
             message = f"Aurora 做种策略提醒\n{item['name']}\n原因：{item['reason']}"
             sent = _tg(message)
-            notifications[key] = int(time.time())
-            _log("torrent.policy.notify", f"{item['name']} · {item['reason']}" + (" · 已发送" if sent else ""))
+            if sent:
+                notifications[key] = int(time.time())
+            # 发送失败不记录：下一轮检查会重试，避免"通知失败却永远不再发"
+            _log("torrent.policy.notify", f"{item['name']} · {item['reason']}" + (" · 已发送" if sent else " · 发送失败，待重试"))
             results.append({**item, "status": "notified" if sent else "logged"})
             continue
         if action == "pause":
@@ -2667,6 +2777,10 @@ def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tu
         status = "applied" if changed else "error"
         _log("torrent.policy.apply", f"{item['name']} · {action} · {item['reason']}" + (f" · {error}" if error else ""))
         results.append({**item, "status": status, "detail": error})
+    # 键以 "YYYY-MM-DD:" 开头：按日期裁剪，避免文件随运行时间无限膨胀
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    notifications = {k: v for k, v in notifications.items()
+                     if str(k).split(":", 1)[0] >= cutoff}
     _save_policy_notifications(notifications)
     return True, {"items": results, "applied": sum(1 for item in results if item["status"] == "applied")}, ""
 
@@ -2741,10 +2855,15 @@ def _save_notify_state(st: dict):
 def _check_torrent_notify(torrents: list):
     if not load_settings().get("alerts", {}).get("torrent", True):
         return
+    # qBittorrent 掉线时 torrents 为空：直接跳过。绝不能在这里清空基线，
+    # 否则恢复后"首次运行基线"会把掉线期间完成/失败的种子全部静默吞掉
+    if not torrents:
+        return
     st = _load_notify_state()
     # 首次运行（修复上线）：用当前已完成的种子做基线，只记录不补发，避免老种子轰炸
     baseline = not st
     cur = {t["id"]: t for t in torrents}
+    changed = False
     for tid, t in cur.items():
         done_ts = t.get("completion_on") or 0
         if done_ts > 0:
@@ -2752,14 +2871,19 @@ def _check_torrent_notify(torrents: list):
             if not baseline and prev != done_ts:
                 _log("torrent.done", t["name"])
                 _tg(f"下载完成：{t['name']}")
-            st[tid] = done_ts
+            if prev != done_ts:
+                st[tid] = done_ts
+                changed = True
         elif t.get("state") == "error" and st.get(tid) != "error":
             _log("torrent.error", t["name"])
             _tg(f"下载失败：{t['name']}")
             st[tid] = "error"
+            changed = True
     # 清掉已删除种子的记录（重加同种子时 completion_on 会变，仍能触发通知）
-    st = {k: v for k, v in st.items() if k in cur}
-    _save_notify_state(st)
+    removed = any(k not in cur for k in st)
+    if changed or removed:
+        st = {k: v for k, v in st.items() if k in cur}
+        _save_notify_state(st)
 
 
 # ---------------------------------------------------------------------------
@@ -2803,7 +2927,7 @@ def _build_daily_text(torrents: list, now: datetime) -> str:
         })
     rows.sort(key=lambda r: r["delta"], reverse=True)
     seeding = [r for r in rows if r["state"] == "seeding"]
-    up_rate = sum(t.get("upspeed", 0) or 0 for t in torrents) * 1048576  # MB/s -> B/s
+    up_rate = sum(t.get("upspeed", 0) or 0 for t in torrents) * 1000000  # MB/s(1e6) -> B/s
     total_up = sum(t.get("upB", 0) or 0 for t in torrents)
     total_down = sum(t.get("downB", 0) or 0 for t in torrents)
     if total_down > 0:
@@ -2842,7 +2966,11 @@ def _send_daily_report(now: datetime | None = None) -> tuple[bool, str]:
     today = now.strftime("%Y-%m-%d")
     if snap.get("date") == today:
         return False, "今日已发送"
-    torrents = _qbit.torrents() if _qbit.available() else []
+    if not _qbit.available():
+        # qbit 掉线时宁可缺一天日报：空数据会生成"当前无做种任务"的错误日报，
+        # 且空基线写入快照后，次日"今日上传"会全部按 0 基线计算而虚高
+        return False, "qBittorrent 未接入，跳过今日日报"
+    torrents = _qbit.torrents()
     text = _build_daily_text(torrents, now)
     if not _tg(text):
         return False, "Telegram 发送失败"
@@ -2995,7 +3123,27 @@ def metrics() -> dict:
         result = _metrics_uncached()
         _METRICS_CACHE = result
         _METRICS_CACHE_TS = time.monotonic()
-        return result
+    # 通知/告警必须在锁外执行：TG 发送单通道超时 8s、双通道 16s，放在锁内
+    # 会让所有并发 metrics 请求排队假死。_AFTER_LOCK 串行化，保证并发 tick
+    # 不会对同一个完成事件重复发送
+    _notify_after_metrics(result)
+    return result
+
+
+_AFTER_LOCK = threading.Lock()
+
+
+def _notify_after_metrics(result: dict) -> None:
+    with _AFTER_LOCK:
+        try:
+            _check_torrent_notify(result.get("torrents") or [])
+        except Exception as exc:
+            _LOGGER.warning("torrent notify check failed: %s", exc)
+        try:
+            disk = result.get("disk") or {}
+            _check_disk_warn(disk.get("usedGb", 0.0), disk.get("capGb", 0.0))
+        except Exception as exc:
+            _LOGGER.warning("disk warn check failed: %s", exc)
 
 
 def _metrics_uncached() -> dict:
@@ -3039,8 +3187,8 @@ def _metrics_uncached() -> dict:
 
     disk = _sys.disk()
     _record_stats()
-    _check_torrent_notify(torrents)
-    _check_disk_warn(disk["usedGb"], disk["capGb"])
+    # 通知与磁盘告警由 metrics() 在锁外触发（_notify_after_metrics），
+    # 这里不再同步执行 TG 发送
     return {
         "mounts": mounts,
         "torrents": torrents,

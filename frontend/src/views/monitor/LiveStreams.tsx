@@ -5,7 +5,7 @@ import { Tag, Skeleton, EmptyState, STREAM_ZH, CLIENT_ZH } from '../../component
 const clientIcon = { tv: Tv, ios: Smartphone, android: Smartphone, web: Laptop }
 
 export function LiveStreams() {
-  const { data, source } = useMetrics(2000)
+  const { data, source } = useMetrics()
   return (
     <div className="panel px-5 py-5">
       <div className="text-[11px] uppercase tracking-[0.2em] text-dim">在线播放</div>

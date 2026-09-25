@@ -3,7 +3,7 @@ import { useMetrics } from '../../lib/api'
 import { Bar, Tag, Skeleton, EmptyState, STATUS_ZH, fmtMountReads, MountLatency } from '../../components/ui'
 
 export function MountRack() {
-  const { data, source } = useMetrics(2000)
+  const { data, source } = useMetrics()
   return (
     <div className="panel px-5 py-5">
       <div className="text-[11px] uppercase tracking-[0.2em] text-dim">挂载状态</div>

@@ -1,19 +1,27 @@
 import type { ReactNode } from 'react'
 
 // ---- formatting helpers ----
+// 非有限数值（0/0、缺字段等）一律显示占位符，而不是 "NaN%" / "NaN GiB"
+function finite(n: number): boolean {
+  return Number.isFinite(n)
+}
 export function fmtGb(n: number): string {
+  if (!finite(n)) return '—'
   return n >= 1000 ? `${(n / 1000).toFixed(2)} TiB` : `${n.toFixed(n < 10 ? 1 : 0)} GiB`
 }
 export function fmtBytes(n: number): string {
+  if (!finite(n)) return '—'
   if (n >= 1024 * 1024 * 1024) return `${(n / 1e9).toFixed(1)} GB`
   if (n >= 1024 * 1024) return `${(n / 1e6).toFixed(1)} MB`
   return `${n.toFixed(0)} B`
 }
 export function fmtRate(mbps: number): string {
+  if (!finite(mbps)) return '—'
   if (mbps >= 1000) return `${(mbps / 1000).toFixed(1)} Gb/s`
   return `${mbps.toFixed(1)} Mb/s`
 }
 export function pct(n: number): string {
+  if (!finite(n)) return '—'
   return `${(n * 100).toFixed(n >= 1 ? 0 : 1)}%`
 }
 
@@ -118,7 +126,7 @@ export function Switch({ checked, onChange }: { checked: boolean; onChange: (v: 
 
 export function Spark({ data, w = 120, h = 34, className = '' }: { data: number[]; w?: number; h?: number; className?: string }) {
   const max = Math.max(...data, 1)
-  const step = w / (data.length - 1)
+  const step = data.length > 1 ? w / (data.length - 1) : 0
   const pts = data.map((v, i) => [i * step, h - (v / max) * (h - 4) - 2])
   const line = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p[0]},${p[1]}`).join(' ')
   const fill = `M0,${h} L${pts.map((p) => `${p[0]},${p[1]}`).join(' L')} L${w},${h} Z`

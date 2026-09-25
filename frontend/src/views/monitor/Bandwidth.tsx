@@ -4,7 +4,7 @@ import { useMetrics } from '../../lib/api'
 import { fmtRate, Spark } from '../../components/ui'
 
 export function Bandwidth() {
-  const { data } = useMetrics(2000)
+  const { data } = useMetrics()
   const [hist, setHist] = useState<{ in: number; out: number }[]>([])
 
   useEffect(() => {

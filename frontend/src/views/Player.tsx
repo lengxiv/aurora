@@ -22,6 +22,32 @@ function restoreProgress(el: HTMLMediaElement, key: string) {
   }
 }
 
+const progressSavedAt = new Map<string, number>()
+
+function saveProgress(key: string, value: string) {
+  // onTimeUpdate 每秒约 4 次：节流到 5s 一次，避免持续播放时写爆 localStorage
+  const now = Date.now()
+  if (now - (progressSavedAt.get(key) || 0) < 5000) return
+  progressSavedAt.set(key, now)
+  try {
+    localStorage.setItem(key, value)
+    pruneProgressKeys()
+  } catch { /* 进度记录非关键数据，存储异常时静默 */ }
+}
+
+function pruneProgressKeys() {
+  // 键按文件路径累积且正常播完才删除：限制总量防止长期使用后无上限增长
+  try {
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith(PROGRESS_PREFIX)) keys.push(k)
+    }
+    if (keys.length <= 300) return
+    for (const k of keys.slice(0, keys.length - 200)) localStorage.removeItem(k)
+  } catch { /* ignore */ }
+}
+
 function subtitleStem(name: string) {
   return name.replace(/\.(srt|ass|ssa|vtt)$/i, '').toLowerCase()
 }
@@ -574,7 +600,7 @@ export default function PlayerView() {
                   onLoadedData={() => { setVState('ok'); vref.current?.play().catch(() => {}) }}
                   onError={() => setVState('err')}
                   onEnded={onEnded}
-                  onTimeUpdate={(e) => localStorage.setItem(progressKey('local', playPath), String(e.currentTarget.currentTime))}
+                  onTimeUpdate={(e) => saveProgress(progressKey('local', playPath), String(e.currentTarget.currentTime))}
                   className="max-h-[58vh] w-full rounded bg-black">
                   {subtitleFiles.map((sub, i) => <track key={sub.path} kind="subtitles" src={mediaSubtitleUrl(sub.path)} srcLang={/\.(en|eng)(\.|$)/i.test(subtitleStem(sub.name)) ? 'en' : 'zh'} label={subtitleLabel(sub.name)} default={i === 0} />)}
                 </video>
@@ -597,7 +623,7 @@ export default function PlayerView() {
                   onLoadedData={() => setVState('ok')}
                   onError={() => setVState('err')}
                   onEnded={onEnded}
-                  onTimeUpdate={(e) => localStorage.setItem(progressKey('local', playPath), String(e.currentTarget.currentTime))}
+                  onTimeUpdate={(e) => saveProgress(progressKey('local', playPath), String(e.currentTarget.currentTime))}
                   className="w-full" />
                 {vState !== 'ok' && <div className="absolute inset-0 grid place-items-center rounded bg-ink-2/90 text-white/80">
                   {vState === 'err' ? <button onClick={() => { setVState('load'); setRetry((n) => n + 1) }} className="inline-flex items-center gap-1 rounded-md border border-white/20 bg-white/10 px-2.5 py-1.5 text-xs text-white hover:bg-white/20"><RotateCcw size={12} />重试</button> : <Loader size={18} className="animate-spin" />}
@@ -667,7 +693,7 @@ export default function PlayerView() {
                 onLoadedMetadata={(e) => restoreProgress(e.currentTarget, progressKey('jellyfin', jfPlay.id))}
                 onLoadedData={() => setJfState('ok')}
                 onError={() => setJfState('err')}
-                onTimeUpdate={(e) => localStorage.setItem(progressKey('jellyfin', jfPlay.id), String(e.currentTarget.currentTime))}
+                onTimeUpdate={(e) => saveProgress(progressKey('jellyfin', jfPlay.id), String(e.currentTarget.currentTime))}
                 onEnded={() => localStorage.removeItem(progressKey('jellyfin', jfPlay.id))}
                 className="max-h-[70vh] w-full" />
               {jfState !== 'ok' && (

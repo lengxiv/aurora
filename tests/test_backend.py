@@ -10,6 +10,12 @@ from unittest.mock import Mock
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
 sys.path.insert(0, str(BACKEND))
 
+# main 在 import 时就会生成 .auth/.secret、providers 会写活动日志：
+# 必须在 import 前重定向状态/数据目录，否则本地跑测试会污染源码树。
+# CI 已显式设置这三个变量，setdefault 不会覆盖。
+os.environ.setdefault("AURORA_STATE_DIR", tempfile.mkdtemp(prefix="aurora-test-state-"))
+os.environ.setdefault("AURORA_DATA_DIR", tempfile.mkdtemp(prefix="aurora-test-data-"))
+
 import main
 import providers
 
@@ -1100,6 +1106,352 @@ class RcloneTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(detail, "目标名称已存在")
         rclone._req.assert_called_once_with("/config/listremotes", timeout=5.0, method="POST")
+
+
+class AuthHardeningTests(unittest.TestCase):
+    def test_consteq_handles_non_ascii(self):
+        # hmac.compare_digest 对非 ASCII str 抛 TypeError；曾经会让登录 500、
+        # 甚至设置非 ASCII 密码后把自己永久锁死
+        self.assertTrue(main._consteq("密码口令十二位", "密码口令十二位"))
+        self.assertFalse(main._consteq("密码口令十二位", "另一个密码十二"))
+
+    def test_client_ip_ignores_client_controlled_forwarded_for(self):
+        # X-Forwarded-For 第一段由客户端控制：采信它会让失败计数永远记不满
+        req = Mock()
+        req.client.host = "127.0.0.1"
+        req.headers = {"x-forwarded-for": "203.0.113.9"}
+        self.assertEqual(main._client_ip(req), "127.0.0.1")
+        req.headers = {"x-real-ip": "198.51.100.7", "x-forwarded-for": "203.0.113.9"}
+        self.assertEqual(main._client_ip(req), "198.51.100.7")
+
+    def test_lock_table_overflow_keeps_existing_counts(self):
+        now = time.time()
+        main._FAILS.clear()
+        try:
+            main._FAILS["victim"] = [now] * main.FAIL_LIMIT
+            for i in range(6000):
+                main._FAILS[f"10.{i // 256}.{i % 256}.1"] = [now - 10]
+            # 洪泛不能整表清空：新条目被淘汰，victim 的失败记录必须保留
+            self.assertTrue(main._locked("victim"))
+            self.assertIn("victim", main._FAILS)
+        finally:
+            main._FAILS.clear()
+
+
+class MediaSafetyTests(unittest.TestCase):
+    def test_media_paths_cannot_reach_trash(self):
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            trash = Path(td, ".aurora-trash")
+            trash.mkdir()
+            (trash / "f.txt").write_text("deleted")
+            with self.assertRaises(main.HTTPException):
+                main._media_safe(Path(".aurora-trash/f.txt"))
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+    def test_media_delete_rolls_back_when_metadata_write_fails(self):
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        old_trash = providers._TRASH_FILE
+        old_add = providers.trash_add
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            providers._TRASH_FILE = str(Path(td) / "trash-meta.json")
+            source = Path(td) / "sample.txt"
+            source.write_text("test")
+            providers.trash_add = Mock(side_effect=OSError("disk full"))
+            try:
+                with self.assertRaises(main.HTTPException) as ctx:
+                    main.media_delete(main.media_path_body(path="sample.txt"), "admin")
+                self.assertEqual(ctx.exception.status_code, 503)
+                # 元数据写失败必须回滚：文件回到原位，不能变成回收站里看不见的幽灵
+                self.assertTrue(source.exists())
+                self.assertEqual(source.read_text(), "test")
+            finally:
+                providers.trash_add = old_add
+        providers._TRASH_FILE = old_trash
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+
+class QbitAdapterTests(unittest.TestCase):
+    def test_unknown_state_falls_back_to_unknown_not_done(self):
+        qbit = providers.QbittorrentProvider()
+        qbit.torrent_details = Mock(return_value=[
+            {"hash": "a" * 40, "name": "mystery", "state": "brandNewState", "progress": 0.5},
+        ])
+        rows = qbit.torrents()
+        self.assertEqual(rows[0]["state"], "unknown")
+
+    def test_metadata_download_state_is_not_done(self):
+        self.assertEqual(providers._QBIT_STATES["metaDL"], "downloading")
+        self.assertEqual(providers._QBIT_STATES["metadataDL"], "downloading")
+
+    def test_available_backs_off_after_failures(self):
+        qbit = providers.QbittorrentProvider()
+        qbit._ensure = Mock(side_effect=RuntimeError("qbit down"))
+        self.assertFalse(qbit.available())
+        self.assertEqual(qbit._ensure.call_count, 2)   # 单轮探测最多两次
+        self.assertFalse(qbit.available())             # 退避期内不再探测
+        self.assertEqual(qbit._ensure.call_count, 2)
+        qbit._auth_backoff_until = 0.0
+        self.assertFalse(qbit.available())
+        self.assertEqual(qbit._ensure.call_count, 4)   # 退避结束恢复探测
+
+
+class RcloneRenameTests(unittest.TestCase):
+    def setUp(self):
+        self.rclone = providers.RcloneProvider()
+        self.rclone._start_job = Mock(return_value={"id": "job-1"})
+        self.old_bucket = providers._rclone_bucket
+        providers._rclone_bucket = lambda name: ""
+
+    def tearDown(self):
+        providers._rclone_bucket = self.old_bucket
+
+    def test_rename_remote_entry_moves_file(self):
+        ok, job, detail = self.rclone.rename_remote_entry("media", "dir/file.txt", "renamed.txt", False)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(job, {"id": "job-1"})
+        path, payload = self.rclone._start_job.call_args[0]
+        self.assertEqual(path, "/operations/movefile")
+        self.assertEqual(payload["srcFs"], "media:")
+        self.assertEqual(payload["srcRemote"], "dir/file.txt")
+        self.assertEqual(payload["dstRemote"], "dir/renamed.txt")
+
+    def test_rename_remote_entry_moves_dir(self):
+        ok, job, detail = self.rclone.rename_remote_entry("media", "dir", "dir2", True)
+
+        self.assertTrue(ok, detail)
+        path, payload = self.rclone._start_job.call_args[0]
+        self.assertEqual(path, "/sync/move")
+        self.assertEqual(payload["srcFs"], "media:dir")
+        self.assertEqual(payload["dstFs"], "media:dir2")
+
+    def test_rename_remote_entry_rejects_bad_name(self):
+        ok, job, detail = self.rclone.rename_remote_entry("media", "dir/f.txt", "../escape", False)
+
+        self.assertFalse(ok)
+        self.assertIsNone(job)
+        self.rclone._start_job.assert_not_called()
+
+
+class TorrentDestinationMergeTests(unittest.TestCase):
+    def test_write_back_merges_with_concurrent_registration(self):
+        """调度线程处理期间并发登记的转存目标不能被旧快照覆盖掉。"""
+        old_dest = providers._TORRENT_DEST_FILE
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        old_qbit, old_rclone = providers._qbit, providers._rclone
+        with tempfile.TemporaryDirectory() as td:
+            providers._TORRENT_DEST_FILE = str(Path(td) / "dest.json")
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            item = Path(td) / "item"
+            item.write_text("data")
+            marker = "aurora-remote-" + "a" * 16
+            providers._save_torrent_destinations({marker: {
+                "remote": "media", "path": "dest", "status": "waiting",
+                "created": int(time.time()),
+            }})
+
+            def fake_upload(remote, local, target):
+                # 模拟并发：上传期间另一个请求登记了新的转存目标
+                with providers._TORRENT_DEST_LOCK:
+                    data = providers._load_torrent_destinations()
+                    data["aurora-remote-" + "b" * 16] = {
+                        "remote": "other", "path": "x", "status": "waiting",
+                        "created": int(time.time()),
+                    }
+                    providers._save_torrent_destinations(data)
+                return True, {"id": "job-1"}, ""
+
+            qbit, rclone = Mock(), Mock()
+            qbit.available.return_value = True
+            qbit.torrent_details.return_value = [{
+                "hash": "c" * 40, "name": "item", "tags": marker,
+                "progress": 1.0, "save_path": "/downloads", "content_path": "",
+            }]
+            rclone.available.return_value = True
+            rclone.transfers.return_value = []
+            rclone.upload_local = Mock(side_effect=fake_upload)
+            providers._qbit, providers._rclone = qbit, rclone
+            try:
+                providers._process_torrent_destinations()
+                data = providers._load_torrent_destinations()
+                self.assertEqual(data[marker]["status"], "uploading")
+                self.assertEqual(data[marker]["transfer_id"], "job-1")
+                # 回归点：并发登记的新条目必须存活
+                self.assertIn("aurora-remote-" + "b" * 16, data)
+            finally:
+                providers._qbit, providers._rclone = old_qbit, old_rclone
+        providers._TORRENT_DEST_FILE = old_dest
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+
+class NotifyStateTests(unittest.TestCase):
+    def test_empty_probe_preserves_baseline(self):
+        """qbit 掉线（torrents 为空）时不得清空通知基线。"""
+        old_notify = providers._NOTIFY_FILE
+        old_settings = providers._SETTINGS_FILE
+        with tempfile.TemporaryDirectory() as td:
+            providers._NOTIFY_FILE = str(Path(td) / "notify.json")
+            providers._SETTINGS_FILE = str(Path(td) / "settings.json")
+            Path(providers._NOTIFY_FILE).write_text(json.dumps({"abc" * 10: 123}))
+            providers._check_torrent_notify([])
+            self.assertEqual(
+                json.loads(Path(providers._NOTIFY_FILE).read_text()),
+                {"abc" * 10: 123},
+            )
+        providers._NOTIFY_FILE = old_notify
+        providers._SETTINGS_FILE = old_settings
+
+
+class AtomicJsonTests(unittest.TestCase):
+    def test_atomic_json_writes_and_leaves_no_tmp(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "state.json")
+            providers._atomic_json(path, {"a": 1})
+            self.assertEqual(json.loads(Path(path).read_text()), {"a": 1})
+            leftovers = [p.name for p in Path(td).iterdir() if p.name != "state.json"]
+            self.assertEqual(leftovers, [])
+
+
+class HttpLayerTests(unittest.TestCase):
+    """HTTP 层测试（TestClient）：认证依赖、登录限流、CSRF 中间件、
+    会话撤销端点、改密全链路、回收站冲突——此前全部零覆盖。"""
+
+    PASSWORD = "http-test-pass-123"
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        cls._old_pass = main._AUTH_PASS
+        main._AUTH_PASS = cls.PASSWORD   # _consteq 在请求时读模块全局，可安全替换
+        main._FAILS.clear()
+        # 不进入上下文管理器：避免触发 startup 里启动的常驻调度线程
+        cls.client = TestClient(main.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        main._AUTH_PASS = cls._old_pass
+        main._FAILS.clear()
+
+    def setUp(self):
+        main._FAILS.clear()
+        self.client.cookies.clear()
+
+    def _login(self):
+        r = self.client.post("/api/auth/login",
+                             json={"username": main._AUTH_USER, "password": self.PASSWORD})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r
+
+    def test_protected_endpoint_requires_auth(self):
+        r = self.client.get("/api/metrics")
+        self.assertEqual(r.status_code, 401)
+
+    def test_login_sets_httponly_session_cookie(self):
+        r = self._login()
+        cookie = r.headers.get("set-cookie", "").lower()
+        self.assertIn("aurora_sid=", cookie)
+        self.assertIn("httponly", cookie)
+        self.assertIn("samesite=lax", cookie)
+        me = self.client.get("/api/auth/me")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.json()["user"], main._AUTH_USER)
+
+    def test_login_rate_limit_locks_then_recovers(self):
+        for _ in range(main.FAIL_LIMIT):
+            r = self.client.post("/api/auth/login",
+                                 json={"username": main._AUTH_USER, "password": "definitely-wrong"})
+            self.assertEqual(r.status_code, 401)
+        # 达到上限后，正确密码也被锁定
+        r = self.client.post("/api/auth/login",
+                             json={"username": main._AUTH_USER, "password": self.PASSWORD})
+        self.assertEqual(r.status_code, 429)
+        main._FAILS.clear()   # 模拟锁定窗口（300s）过去
+        r = self.client.post("/api/auth/login",
+                             json={"username": main._AUTH_USER, "password": self.PASSWORD})
+        self.assertEqual(r.status_code, 200)
+
+    def test_cross_site_post_is_rejected(self):
+        r = self.client.post("/api/auth/logout", headers={"sec-fetch-site": "cross-site"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_session_revoke_endpoint_rules(self):
+        self._login()
+        rows = self.client.get("/api/auth/sessions").json()["sessions"]
+        self.assertTrue(any(x["current"] for x in rows))
+        current = next(x for x in rows if x["current"])
+        # 当前会话必须走退出登录，不允许自撤销
+        r = self.client.post("/api/auth/sessions/revoke", json={"id": current["id"]})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post("/api/auth/sessions/revoke", json={"id": "nonexistent"})
+        self.assertEqual(r.status_code, 404)
+
+    @unittest.skipIf(os.environ.get("AURORA_AUTH_PASS"), "密码由环境变量管理时禁用在线改密")
+    def test_change_password_full_flow(self):
+        self._login()
+        r = self.client.post("/api/auth/password",
+                             json={"current": "wrong-current-pass", "new": "brand-new-pass-456"})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post("/api/auth/password",
+                             json={"current": self.PASSWORD, "new": "brand-new-pass-456"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(main._AUTH_PASS, "brand-new-pass-456")
+        self.client.cookies.clear()
+        r = self.client.post("/api/auth/login",
+                             json={"username": main._AUTH_USER, "password": self.PASSWORD})
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post("/api/auth/login",
+                             json={"username": main._AUTH_USER, "password": "brand-new-pass-456"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_media_restore_conflict_returns_409(self):
+        old = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            try:
+                self._login()
+                source = Path(td) / "movie.txt"
+                source.write_text("v1")
+                r = self.client.post("/api/media/delete", json={"path": "movie.txt"})
+                self.assertEqual(r.status_code, 200, r.text)
+                trash_id = r.json()["trash_id"]
+                self.assertFalse(source.exists())
+                source.write_text("v2")   # 原路径出现同名新文件
+                r2 = self.client.post("/api/media/trash/restore", json={"path": trash_id})
+                self.assertEqual(r2.status_code, 409)
+                r3 = self.client.post("/api/media/trash/purge", json={"path": trash_id})
+                self.assertEqual(r3.status_code, 200)
+                self.assertEqual(providers.trash_list(), [])
+            finally:
+                if old is None:
+                    os.environ.pop("AURORA_LOCAL_MOUNT", None)
+                else:
+                    os.environ["AURORA_LOCAL_MOUNT"] = old
+
+    def test_metrics_falls_back_without_adapters(self):
+        """qbit/rclone/jellyfin 都探测不到时，metrics 仍返回 200 并标注来源回退。"""
+        self._login()
+        r = self.client.get("/api/metrics")
+        self.assertEqual(r.status_code, 200, r.text)
+        sources = r.json().get("sources", {})
+        self.assertIn(sources.get("torrents"), ("none", "qbittorrent"))
+        self.assertEqual(sources.get("disk"), "system")
+
+    def test_api_docs_are_hidden(self):
+        r = self.client.get("/docs")
+        # static 未构建时 FastAPI 兜底 404；构建后 SPA 兜底把未登录访问重定向到 /login
+        self.assertIn(r.status_code, (404, 307))
 
 
 if __name__ == "__main__":

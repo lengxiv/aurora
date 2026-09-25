@@ -4,7 +4,7 @@ import { fmtGb, fmtRate, pct, fmtBytes, Skeleton, EmptyState, flagFor, peerIsoCo
 import { Upload, Users } from 'lucide-react'
 
 export function SeedingCard() {
-  const { data, source } = useMetrics(2000)
+  const { data, source } = useMetrics()
   const [peers, setPeers] = useState<TorrentPeers | null>(null)
 
   const seeding = useMemo(
@@ -20,17 +20,21 @@ export function SeedingCard() {
     return seeding.reduce((a, b) => ((b.upspeed || 0) > (a.upspeed || 0) ? b : a))
   }, [seeding])
 
+  const topHash = top?.hash || ''
+
   useEffect(() => {
-    if (!top) { setPeers(null); return }
+    if (!topHash) { setPeers(null); return }
     let on = true
     const tick = async () => {
-      const p = await fetchTorrentPeers(top.hash)
+      const p = await fetchTorrentPeers(topHash)
       if (on) setPeers(p)
     }
     tick()
     const id = setInterval(tick, 4000)
     return () => { on = false; clearInterval(id) }
-  }, [top])
+    // 依赖 hash 字符串而不是 top 对象：data 每 2s 轮询都会产生新数组，
+    // 依赖对象身份会让本 effect 每 2s 被拆毁重建、interval 从未真正生效
+  }, [topHash])
 
   const pulling = (peers?.peers || []).filter((p) => p.up_speed > 0)
 

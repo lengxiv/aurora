@@ -3,6 +3,9 @@ Description=Backup Aurora configuration and metadata
 
 [Service]
 Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=read-only
 Environment=AURORA_ROOT=/opt/aurora
 Environment=AURORA_STATE_DIR=/var/lib/aurora
 Environment=AURORA_DATA_DIR=/var/lib/aurora/data

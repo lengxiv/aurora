@@ -46,6 +46,7 @@ const rcTypes: Record<string, { label: string; desc: string; fields: { k: string
 export default function NetdiskView() {
   const toast = useToast()
   const [rc, setRc] = useState<{ online: boolean; remotes: RcloneRemote[] } | null>(null)
+  const [rcTried, setRcTried] = useState(false)   // 区分"加载中"与"读取失败"，避免失败后永久骨架屏
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
   const [editName, setEditName] = useState<string | null>(null)
@@ -58,7 +59,7 @@ export default function NetdiskView() {
   const [testing, setTesting] = useState<string | null>(null)
   const nameRef = useRef<HTMLInputElement>(null)
 
-  const reload = () => { setBusy(true); fetchRcloneRemotes().then((d) => { setRc(d); setBusy(false) }) }
+  const reload = () => { setBusy(true); fetchRcloneRemotes().then((d) => { setRc(d); setRcTried(true); setBusy(false) }) }
   useEffect(() => { reload() }, [])
 
   // Auto-focus name input when dialog opens
@@ -190,7 +191,9 @@ export default function NetdiskView() {
 
       <main className="min-w-0 flex-1 md:overflow-y-auto px-4 py-5 md:px-10 md:py-8">
         {!rc ? (
-          <div className="flex flex-col gap-2"><div className="skeleton h-16 rounded-xl" /><div className="skeleton h-16 rounded-xl" /></div>
+          rcTried
+            ? <EmptyState icon={<Cloud size={20} />} title="读取失败" hint="无法连接后端接口，请检查 Aurora 服务后重试" />
+            : <div className="flex flex-col gap-2"><div className="skeleton h-16 rounded-xl" /><div className="skeleton h-16 rounded-xl" /></div>
         ) : !rc.online ? (
           <EmptyState icon={<Cloud size={20} />} title="rclone 服务未运行" hint="systemctl start rclone-rcd 后自动显示" />
         ) : rc.remotes.length === 0 ? (

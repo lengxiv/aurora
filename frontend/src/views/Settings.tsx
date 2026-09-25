@@ -27,6 +27,7 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
   const [sessions, setSessions] = useState<AuthSession[]>([])
   const [pw, setPw] = useState({ current: '', next: '', confirm: '' })
   const [qbitQueue, setQbitQueue] = useState<{ online: boolean; settings: QbitQueueSettings | null; detail?: string } | null>(null)
+  const [queueTried, setQueueTried] = useState(false)
   const [qbitBusy, setQbitBusy] = useState(false)
   const [qbitLabels, setQbitLabels] = useState<QbitLabels | null>(null)
   const [labelsBusy, setLabelsBusy] = useState(false)
@@ -37,6 +38,7 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
   const [newCategoryPath, setNewCategoryPath] = useState('')
   const [newTag, setNewTag] = useState('')
   const [policies, setPolicies] = useState<TorrentPolicies | null>(null)
+  const [policiesTried, setPoliciesTried] = useState(false)   // 区分"加载中"与"加载失败"，避免永久卡在加载文案
   const [policyBusy, setPolicyBusy] = useState(false)
   const [policyPreview, setPolicyPreview] = useState<TorrentPolicyPreview[] | null>(null)
   const [policyRemotes, setPolicyRemotes] = useState<RcloneRemote[]>([])
@@ -45,17 +47,20 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
     fetchInfo().then(setInfo)
     fetchSettings().then(setSt)
     fetchSessions().then(setSessions)
-    fetchQbitQueueSettings().then(setQbitQueue)
+    fetchQbitQueueSettings().then((v) => { setQbitQueue(v); setQueueTried(true) })
     fetchTorrentLabels().then(setQbitLabels)
     fetchTorrentMappings().then((items) => setCategoryMappings(Object.fromEntries(items.map((item) => [item.category, item]))))
     fetchMediaDirs().then(setMappingDirs)
-    fetchTorrentPolicies().then(setPolicies)
+    fetchTorrentPolicies().then((v) => { setPolicies(v); setPoliciesTried(true) })
     fetchRcloneRemotes().then((result) => setPolicyRemotes(result?.remotes || []))
   }, [load])
 
   const p = info?.providers || {}
   const save = async () => {
-    const d = await saveSettings((st || {}) as Record<string, unknown>)
+    // 设置未加载成功时禁止保存：提交 {} 会被后端按默认值重建，
+    // 等于把 Telegram token、告警开关、日报时间全部重置
+    if (!st) { toast('设置尚未加载，无法保存', 'bad'); return }
+    const d = await saveSettings(st as Record<string, unknown>)
     if (d) { setSt(d); toast('设置已保存') } else { toast('保存失败', 'bad') }
   }
   const patchQbitQueue = (patch: Partial<QbitQueueSettings>) => setQbitQueue((current) => current?.settings
@@ -261,7 +266,7 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
               <button type="button" onClick={() => void savePolicies()} disabled={!policies || policyBusy} title="保存做种策略" aria-label="保存做种策略" className="grid h-8 w-8 place-items-center rounded-md grad-bar text-ink disabled:opacity-40"><Save size={13} /></button>
             </div>
           </div>
-          {!policies ? <div className="mt-4 text-sm text-dim">正在读取做种策略…</div> : <>
+          {!policies ? <div className="mt-4 text-sm text-dim">{policiesTried ? '读取失败：后端未连接或 qBittorrent 未接入' : '正在读取做种策略…'}</div> : <>
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 py-3">
               <div><div className="text-sm text-fg">启用后台自动检查</div><div className="text-[11px] text-dim">默认关闭；开启后按间隔检查命中规则。自动删除仍需规则允许。</div></div>
               <div className="flex items-center gap-3"><label className="flex items-center gap-1.5 text-xs text-dim">间隔 <input type="number" min={60} max={86400} value={policies.interval} onChange={(e) => setPolicies({ ...policies, interval: Math.max(60, Number(e.target.value) || 60) })} className="num w-20 rounded-md border border-line bg-white/4 px-2 py-1 text-right text-xs text-fg focus:outline-none" /> 秒</label><Switch checked={policies.enabled} onChange={(v) => setPolicies({ ...policies, enabled: v })} /></div>
@@ -284,7 +289,7 @@ export default function Settings({ onLogout }: { onLogout: () => void }) {
             {qbitQueue?.online && <span className="text-[11px] text-teal-300">已连接 · 实时配置</span>}
           </div>
           {!qbitQueue ? (
-            <div className="mt-4 text-sm text-dim">正在读取 qBittorrent 设置…</div>
+            <div className="mt-4 text-sm text-dim">{queueTried ? '读取失败：后端未连接' : '正在读取 qBittorrent 设置…'}</div>
           ) : !qbitQueue.online || !qbitQueue.settings ? (
             <div className="mt-4 rounded-lg border border-line bg-white/3 px-4 py-3 text-sm text-dim">
               <div>qBittorrent 未接入</div>

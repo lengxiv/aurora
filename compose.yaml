@@ -1,5 +1,9 @@
 services:
   qbittorrent:
+    # 可复现部署建议钉住具体版本（如 5.x.y 或 5.x.y-lsNNN）：
+    # 在部署机执行 `docker exec qbittorrent appVersion` 或查
+    # hub.docker.com/r/linuxserver/qbittorrent/tags 确认当前版本后再固定，
+    # 避免跟随 :latest 漂移破坏 API 兼容（qbit 5.x 曾移除 pause/resume 接口）。
     image: linuxserver/qbittorrent:latest
     container_name: qbittorrent
     restart: unless-stopped
@@ -10,6 +14,9 @@ services:
       WEBUI_PORT: "8080"
     ports:
       - "127.0.0.1:8080:8080"
+      # BT 对等端口。qBittorrent 的会话监听端口没有环境变量可设：
+      # 首次启动后需在 WebUI「设置→连接」把传入端口改为 39876
+      # （或 qBittorrent.conf 中 Session\Port=39876），否则此处映射是死端口。
       - "39876:39876/tcp"
       - "39876:39876/udp"
     volumes:

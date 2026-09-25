@@ -12,6 +12,7 @@ from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 import providers
 
@@ -56,9 +57,11 @@ def _load_credentials() -> tuple[str, str]:
         import stat
         pw = secrets.token_urlsafe(18)
         AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        AUTH_FILE.write_text(f"{user}:{pw}\n")
-        AUTH_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        print(f"[aurora] generated credentials -> {AUTH_FILE} ({user}:{pw})")
+        tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
+        tmp.write_text(f"{user}:{pw}\n")
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        tmp.replace(AUTH_FILE)
+        print(f"[aurora] 已生成初始密码并写入 {AUTH_FILE}（权限 600），请从该文件读取；日志不打印密码")
     return user, pw
 
 
@@ -73,28 +76,48 @@ _SESSION_LOCK = threading.Lock()
 FAIL_LIMIT = 5
 FAIL_LOCK = 300
 _FAILS: dict[str, list[float]] = {}
+_FAILS_LOCK = threading.Lock()   # sync 路由跑线程池：check 与 append 之间的竞态会漏记失败
 
 
 def _client_ip(request: Request) -> str:
     peer = request.client.host if request.client else "?"
     if peer in ("127.0.0.1", "::1"):
-        return (request.headers.get("x-real-ip")
-                or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-                or peer)
+        # 只信任可信反代强制覆盖的 X-Real-IP（deploy/nginx 示例会覆盖该头）。
+        # X-Forwarded-For 的第一段完全由客户端控制，可被轮换伪造，
+        # 一旦采信，失败计数永远记不到 FAIL_LIMIT，锁定形同虚设。
+        return request.headers.get("x-real-ip", "").strip() or peer
     return peer
+
+
+def _record_fail(ip: str) -> None:
+    with _FAILS_LOCK:
+        lst = [t for t in _FAILS.get(ip, []) if time.time() - t < FAIL_LOCK]
+        lst.append(time.time())
+        _FAILS[ip] = lst
+
+
+def _clear_fail(ip: str) -> None:
+    with _FAILS_LOCK:
+        _FAILS.pop(ip, None)
 
 
 def _locked(ip: str) -> bool:
     now = time.time()
-    # cap the table so a flood of distinct IPs can't grow memory unbounded
-    if len(_FAILS) > 5000:
-        for k in list(_FAILS):
-            if now - (_FAILS[k][-1] if _FAILS[k] else 0) > FAIL_LOCK:
-                del _FAILS[k]
-    if len(_FAILS) > 5000:
-        _FAILS.clear()
-    _FAILS[ip] = [t for t in _FAILS.get(ip, []) if now - t < FAIL_LOCK]
-    return len(_FAILS[ip]) >= FAIL_LIMIT
+    with _FAILS_LOCK:
+        # cap the table so a flood of distinct IPs can't grow memory unbounded
+        if len(_FAILS) > 5000:
+            for k in list(_FAILS):
+                if now - (_FAILS[k][-1] if _FAILS[k] else 0) > FAIL_LOCK:
+                    del _FAILS[k]
+        if len(_FAILS) > 5000:
+            # 仍然超限：只淘汰最旧的条目。不能整表 clear()——那会一次性清掉
+            # 所有攻击者的失败记录，等价于免费解锁。
+            oldest = sorted(_FAILS.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
+            for k, _ in oldest[:len(_FAILS) - 5000]:
+                _FAILS.pop(k, None)
+        recent = [t for t in _FAILS.get(ip, []) if now - t < FAIL_LOCK]
+        _FAILS[ip] = recent
+        return len(recent) >= FAIL_LIMIT
 
 
 def _new_sid(user: str, ip: str = "?", user_agent: str = "") -> str:
@@ -160,20 +183,26 @@ def require_auth(sid: str | None = Cookie(default=None, alias=_COOKIE)) -> str:
     return user
 
 
+def _consteq(a: str, b: str) -> bool:
+    """Timing-safe comparison that tolerates non-ASCII input.
+
+    hmac.compare_digest raises TypeError on non-ASCII str, which turned any
+    Unicode password attempt into a 500 — and a non-ASCII password saved via
+    /api/auth/password would have locked the admin out permanently.
+    """
+    return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+
+
 @app.post("/api/auth/login")
 def login(body: Login, request: Request):
     ip = _client_ip(request)
     if _locked(ip):
         raise HTTPException(status_code=429, detail="too many attempts")
-    match = hmac.compare_digest(body.username, _AUTH_USER) and hmac.compare_digest(
-        body.password, _AUTH_PASS
-    )
+    match = _consteq(body.username, _AUTH_USER) and _consteq(body.password, _AUTH_PASS)
     if not match:
-        lst = _FAILS.setdefault(ip, [])
-        lst.append(time.time())
-        _FAILS[ip] = [t for t in lst if time.time() - t < FAIL_LOCK]
+        _record_fail(ip)
         raise HTTPException(status_code=401, detail="bad credentials")
-    _FAILS.pop(ip, None)
+    _clear_fail(ip)
     secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").startswith("https")
     resp = JSONResponse({"ok": True, "user": body.username})
     resp.set_cookie(_COOKIE, _new_sid(body.username, ip, request.headers.get("user-agent", "")), max_age=_AGE,
@@ -238,15 +267,17 @@ def change_password(body: ChangePassword, _user: str = Depends(require_auth), si
     global _AUTH_PASS
     if os.environ.get("AURORA_AUTH_PASS"):
         raise HTTPException(status_code=409, detail="密码由环境变量管理，无法在线修改")
-    if not hmac.compare_digest(body.current, _AUTH_PASS):
+    if not _consteq(body.current, _AUTH_PASS):
         raise HTTPException(status_code=400, detail="当前密码不正确")
     if len(body.new) < 12 or len(body.new) > 128:
         raise HTTPException(status_code=400, detail="新密码长度须为 12-128 位")
-    if hmac.compare_digest(body.new, body.current):
+    if _consteq(body.new, body.current):
         raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    AUTH_FILE.write_text(f"{_AUTH_USER}:{body.new}\n")
-    AUTH_FILE.chmod(0o600)
+    tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
+    tmp.write_text(f"{_AUTH_USER}:{body.new}\n")
+    tmp.chmod(0o600)
+    tmp.replace(AUTH_FILE)
     _AUTH_PASS = body.new
     with _SESSION_LOCK:
         for token in list(_SESSIONS):
@@ -285,10 +316,11 @@ def metrics(_user: str = Depends(require_auth)):
 
 @app.get("/api/sources")
 def sources(_user: str = Depends(require_auth)):
+    # 探测失败与"正常无数据"必须可区分，否则前端无法告警
     try:
         return providers.metrics().get("sources", {})
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=503, detail=str(e).strip()[:180] or "sources unavailable")
 
 
 def _qbit_category(value: str) -> str:
@@ -399,17 +431,6 @@ async def upload_torrent(
     name = Path(file.filename or "").name
     if not name or name == ".torrent" or not name.lower().endswith(".torrent"):
         raise HTTPException(status_code=400, detail="仅支持 .torrent 文件")
-    if not providers._qbit.available():
-        raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法上传种子")
-    category = _qbit_category(category)
-    tags = _qbit_tags(tags)
-    if destination_mode not in ("default", "local", "remote"):
-        raise HTTPException(status_code=400, detail="下载目标模式无效")
-    save_input, remote_input, path_input, mapping_applied = providers.apply_category_mapping(
-        category, save_path, destination_remote, destination_path,
-        apply_destination=destination_mode != "local",
-    )
-    qbit_save_path = _torrent_save_path(save_input)
     try:
         content = await file.read(_MAX_TORRENT_FILE + 1)
     finally:
@@ -418,19 +439,36 @@ async def upload_torrent(
         raise HTTPException(status_code=400, detail="种子文件为空")
     if len(content) > _MAX_TORRENT_FILE:
         raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
-    marker, destination_path, detail = providers.register_torrent_destination(
-        remote_input, path_input,
-    )
-    if detail:
-        raise HTTPException(status_code=400, detail=detail)
-    if not providers._qbit.add_file(name, content, qbit_save_path, marker, category, tags):
-        providers.discard_torrent_destination(marker)
-        raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
-    return {
-        "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_input.strip(),
-        "destination_remote": remote_input, "destination_path": destination_path,
-        "category": category, "tags": tags, "mapping_applied": mapping_applied,
-    }
+
+    # available()/register_torrent_destination/add_file 都是阻塞网络调用，
+    # 必须放进线程池，否则 qbit/rclone 卡顿时整个事件循环一起停摆。
+    def _submit() -> dict:
+        if not providers._qbit.available():
+            raise HTTPException(status_code=503, detail="qBittorrent 未接入，无法上传种子")
+        category_ = _qbit_category(category)
+        tags_ = _qbit_tags(tags)
+        if destination_mode not in ("default", "local", "remote"):
+            raise HTTPException(status_code=400, detail="下载目标模式无效")
+        save_input, remote_input, path_input, mapping_applied = providers.apply_category_mapping(
+            category_, save_path, destination_remote, destination_path,
+            apply_destination=destination_mode != "local",
+        )
+        qbit_save_path = _torrent_save_path(save_input)
+        marker, destination_path_, detail = providers.register_torrent_destination(
+            remote_input, path_input,
+        )
+        if detail:
+            raise HTTPException(status_code=400, detail=detail)
+        if not providers._qbit.add_file(name, content, qbit_save_path, marker, category_, tags_):
+            providers.discard_torrent_destination(marker)
+            raise HTTPException(status_code=502, detail="qBittorrent 拒绝该种子文件")
+        return {
+            "ok": True, "mode": "qbittorrent", "name": name, "save_path": save_input.strip(),
+            "destination_remote": remote_input, "destination_path": destination_path_,
+            "category": category_, "tags": tags_, "mapping_applied": mapping_applied,
+        }
+
+    return await run_in_threadpool(_submit)
 
 
 class BatchAction(BaseModel):
@@ -714,7 +752,8 @@ def stats(_user: str = Depends(require_auth)):
 
 @app.get("/api/settings")
 def get_settings(_user: str = Depends(require_auth)):
-    return providers.load_settings()
+    # TG token 只回显掩码；前端原样回传即表示未修改（providers.save_settings 还原）
+    return providers._mask_tokens(providers.load_settings())
 
 
 class SettingsBody(BaseModel):
@@ -954,7 +993,7 @@ class RcloneRenameBody(RclonePathBody):
 def rclone_file_rename(body: RcloneRenameBody, _user: str = Depends(require_auth)):
     if not providers._rclone.available():
         raise HTTPException(status_code=503, detail="rclone 未接入")
-    ok, job, detail = providers._rclone.rename_remote(body.name, body.path, body.new_name, body.is_dir)
+    ok, job, detail = providers._rclone.rename_remote_entry(body.name, body.path, body.new_name, body.is_dir)
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
     return {"ok": True, "job": job}
@@ -1026,7 +1065,10 @@ async def rclone_upload(
                 if total > providers._RCLONE_UPLOAD_LIMIT:
                     raise HTTPException(status_code=413, detail="文件不能超过 2 GB")
                 out.write(chunk)
-        ok, job, detail = providers._rclone.upload_file(name, str(stage), filename, path, total)
+        # upload_file 内部是阻塞 HTTP（超时 10s），放线程池避免卡住事件循环
+        def _submit():
+            return providers._rclone.upload_file(name, str(stage), filename, path, total)
+        ok, job, detail = await run_in_threadpool(_submit)
         if not ok:
             raise HTTPException(status_code=400, detail=detail)
         return {"ok": True, "job": job}
@@ -1126,6 +1168,10 @@ def _media_safe(p: Path) -> Path:
     base = _media_base().resolve()
     fp = (base / p).resolve()
     if fp != base and not str(fp).startswith(str(base) + os.sep):
+        raise HTTPException(status_code=400, detail="bad path")
+    # 回收站目录只允许通过 /api/media/trash/* 流程访问，禁止经 stream/subtitle/
+    # thumb 等端点直接读取已删除的文件
+    if ".aurora-trash" in fp.relative_to(base).parts:
         raise HTTPException(status_code=400, detail="bad path")
     return fp
 
@@ -1302,7 +1348,17 @@ def media_delete(body: media_path_body, _user: str = Depends(require_auth)):
     trash_dir.mkdir(mode=0o700, exist_ok=True)
     target = trash_dir / trash_id
     fp.rename(target)
-    providers.trash_add(trash_id, body.path, fp.name, target.stat().st_size)
+    try:
+        providers.trash_add(trash_id, body.path, fp.name, target.stat().st_size)
+    except OSError:
+        # 元数据写失败（磁盘满/权限）时把文件放回原位，否则会出现 UI 永远
+        # 看不见、也无法恢复或清理的"幽灵回收站"文件
+        try:
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            target.rename(fp)
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail="回收站元数据写入失败，文件未删除，请检查磁盘后重试")
     providers._log("media.trash", body.path)
     return {"ok": True, "trash_id": trash_id}
 
@@ -1455,29 +1511,66 @@ def media_rmdir(body: media_path_body, _user: str = Depends(require_auth)):
     return {"ok": True}
 
 
-_THUMB_DIR = Path("/tmp/aurora_thumbs")
-_THUMB_DIR.mkdir(exist_ok=True)
+_THUMB_DIR = Path(providers._DATA_DIR) / "thumbs"   # 跟随 AURORA_DATA_DIR，不用共享 /tmp
+_THUMB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+_THUMB_GEN_LOCK = threading.Lock()   # 串行化生成，避免同一视频并发起多个 ffmpeg
+_THUMB_LAST_PRUNE = 0.0
+_THUMB_MAX_AGE = 7 * 86400
+
+
+def _prune_thumbs() -> None:
+    """缩略图按 mtime 生成键，旧文件不会复用也不会自愈——定期清理防止目录无限增长。"""
+    global _THUMB_LAST_PRUNE
+    now = time.time()
+    if now - _THUMB_LAST_PRUNE < 3600:
+        return
+    _THUMB_LAST_PRUNE = now
+    try:
+        for p in _THUMB_DIR.glob("*.jpg"):
+            try:
+                if p.stat().st_mtime < now - _THUMB_MAX_AGE:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 @app.get("/api/media/thumb")
 def media_thumb(path: str, _user: str = Depends(require_auth)):
     import hashlib
     import subprocess
+    _prune_thumbs()
     fp = _media_safe(Path(path))
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="not found")
-    key = hashlib.md5(path.encode()).hexdigest()
+    try:
+        st = fp.stat()
+    except OSError:
+        raise HTTPException(status_code=404, detail="not found")
+    # 键包含 mtime/size：同名文件被替换后不会永远命中旧缩略图
+    key = hashlib.md5(f"{path}\0{st.st_mtime_ns}\0{st.st_size}".encode()).hexdigest()
     out = _THUMB_DIR / f"{key}.jpg"
     if not out.exists():
-        ext = fp.suffix.lower()
-        args = ["ffmpeg", "-y"]
-        if ext not in _IMG_EXT:
-            args += ["-ss", "0.5"]
-        args += ["-i", str(fp), "-vf", "scale=480:-2", "-frames:v", "1", "-q:v", "5", str(out)]
-        try:
-            subprocess.run(args, capture_output=True, timeout=25)
-        except Exception:
-            pass
+        with _THUMB_GEN_LOCK:
+            if not out.exists():   # 等锁期间可能已被其他请求生成
+                ext = fp.suffix.lower()
+                args = ["ffmpeg", "-y"]
+                if ext not in _IMG_EXT:
+                    args += ["-ss", "0.5"]
+                args += ["-i", str(fp), "-vf", "scale=480:-2", "-frames:v", "1", "-q:v", "5", str(out)]
+                try:
+                    result = subprocess.run(args, capture_output=True, timeout=25)
+                    ok = result.returncode == 0
+                    if not ok:
+                        providers._LOGGER.warning(
+                            "thumbnail failed for %s: %s", path,
+                            (result.stderr or b"")[-200:])
+                except Exception as exc:
+                    ok = False
+                    providers._LOGGER.warning("thumbnail failed for %s: %s", path, exc)
+                if not ok:
+                    out.unlink(missing_ok=True)   # 失败不留半截文件充当缓存
     if out.exists():
         return FileResponse(out, media_type="image/jpeg")
     raise HTTPException(status_code=404, detail="no thumb")
@@ -1581,5 +1674,6 @@ if STATIC_DIR.exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=os.environ.get("AURORA_HOST", "0.0.0.0"),
+    # 管理界面默认只听回环；需要对外时必须显式设置 AURORA_HOST 并自行做好反代/鉴权
+    uvicorn.run(app, host=os.environ.get("AURORA_HOST", "127.0.0.1"),
                 port=int(os.environ.get("AURORA_PORT", "8787")))

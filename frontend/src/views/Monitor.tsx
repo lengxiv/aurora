@@ -17,7 +17,7 @@ function load<T>(k: string, fallback: T): T {
 }
 
 export default function MonitorView() {
-  const { data, source, sources } = useMetrics(2000)
+  const { data, source, sources } = useMetrics()
   const [fullscreen, setFullscreen] = useState(false)
   const [st, setSt] = useState<{ alerts?: { disk?: boolean; diskWarn?: number } } | null>(null)
   useEffect(() => { fetchSettings().then(setSt) }, [])
@@ -50,7 +50,7 @@ export default function MonitorView() {
           <div className="grad-bar h-full" style={{ width: `${Math.min(100, (data.disk.capGb > 0 ? (data.disk.usedGb / data.disk.capGb) * 100 : 0))}%` }} />
         </div>
         <div className="mt-3 flex items-center gap-2 text-xs text-dim">
-          <Activity size={13} /> 可用 <span className="num text-teal-300">{fmtGb(data.disk.capGb - data.disk.usedGb)}</span>
+          <Activity size={13} /> 可用 <span className="num text-teal-300">{fmtGb(Math.max(0, data.disk.capGb - data.disk.usedGb))}</span>
         </div>
       </div>
     ) },

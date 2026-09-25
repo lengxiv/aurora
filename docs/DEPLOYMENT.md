@@ -15,7 +15,7 @@ qBittorrent、Jellyfin 和 rclone 是可选适配器；不安装它们也不影�
 ## 0. 前置条件
 
 1. 把域名的 A/AAAA 记录指向新服务器。
-2. 防火墙或云安全组放行 TCP 22、80、443；不要放行 8787、8080、8096、5572。
+2. 防火墙或云安全组放行 TCP 22、80、443；做种需要再放行 TCP/UDP 39876（BT 对等端口，见第 8 节）。不要放行 8787、8080、8096、5572。
 3. 确认 80 端口在申请证书时可以从公网访问。
 
 ## 1. 安装基础依赖
@@ -114,10 +114,10 @@ journalctl -u aurora -n 50 --no-pager
 
 ## 7. 安装 Nginx 和 HTTPS
 
-下面以 `p.lengxi.cc` 为例。把域名和邮箱替换成实际值；证书申请前必须先完成 DNS 解析。
+下面以 `aurora.example.com` 为例。把域名和邮箱替换成实际值；证书申请前必须先完成 DNS 解析。
 
 ```bash
-export AURORA_DOMAIN=p.lengxi.cc
+export AURORA_DOMAIN=aurora.example.com
 export AURORA_EMAIL=your-real-email@example.com
 systemctl stop nginx
 certbot certonly --standalone --agree-tos --no-eff-email --email "$AURORA_EMAIL" -d "$AURORA_DOMAIN"
@@ -141,6 +141,9 @@ systemctl enable --now docker
 docker compose version
 cd /opt/aurora
 install -d -m 755 qbit/config qbit/downloads jellyfin/config jellyfin/cache
+# 容器以 PUID/PGID=1000 运行：目录属主必须是 1000:1000，
+# 否则 root:root 755 的下载目录对容器只读，种子能添加但落盘失败
+chown -R 1000:1000 qbit jellyfin
 docker compose config
 docker compose up -d
 docker compose ps
@@ -148,7 +151,7 @@ docker compose ps
 
 Docker 软件源中如果没有 `docker-compose-plugin`，请按 Docker 官方 Debian 安装说明安装 Compose plugin 后再执行上述命令。
 
-qBittorrent 容器默认管理端口只绑定到 127.0.0.1，BT 对等端口为 6881。容器的 PUID/PGID 应与下载目录的实际所有者一致；否则 Aurora 可能能够读取 API，但无法移动或删除文件。
+qBittorrent 容器管理端口只绑定到 127.0.0.1。BT 对等端口固定为 39876（compose 已映射），但 qBittorrent 的会话监听端口保存在其配置文件里、没有对应的环境变量：首次启动后在 WebUI 的「设置 → 连接」把「传入连接的端口」改为 39876（或直接编辑 `/opt/aurora/qbit/config/qBittorrent/qBittorrent.conf` 的 `Session\\Port=39876` 后重启容器），否则 compose 映射的 39876 无人监听、入站 peer 不通。容器的 PUID/PGID 应与下载目录的实际所有者一致；否则 Aurora 可能能够读取 API，但无法移动或删除文件。
 
 使用 Compose 下载目录作为本地媒体目录时，把 `AURORA_LOCAL_MOUNT` 改为 `/opt/aurora/qbit/downloads`，并确认 systemd 服务允许访问该目录。完成 qBittorrent/Jellyfin 初始配置后，把对应账号、密码和 Token 写入 `/etc/aurora.env`，然后执行：
 
@@ -193,6 +196,7 @@ rclone RC 只监听 127.0.0.1，不要将 5572 直接暴露到公网，也不要
 
 ```bash
 install -d -m 750 /opt/aurora/qbit/config /opt/aurora/qbit/downloads /opt/aurora/jellyfin/config
+chown -R 1000:1000 /opt/aurora/qbit /opt/aurora/jellyfin
 install -m 644 /opt/aurora/deploy/systemd/aurora-backup.service.example /etc/systemd/system/aurora-backup.service
 install -m 644 /opt/aurora/deploy/systemd/aurora-backup.timer.example /etc/systemd/system/aurora-backup.timer
 systemctl daemon-reload

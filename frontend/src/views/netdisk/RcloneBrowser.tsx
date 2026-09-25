@@ -91,11 +91,15 @@ export default function RcloneBrowser({ remotes }: Props) {
     }
   }, [remotes, remote])
 
+  const loadSeq = useRef(0)
   const load = useCallback(async () => {
     if (!remote) return
+    const seq = ++loadSeq.current
     setLoading(true)
     setError('')
     const data = await fetchRcloneFiles(remote, path)
+    // 快速切换网盘/目录时，后返回的旧请求不得覆盖新目录的列表
+    if (seq !== loadSeq.current) return
     if (data) {
       setItems(data.items || [])
       setSelected(new Set())
@@ -174,9 +178,10 @@ export default function RcloneBrowser({ remotes }: Props) {
     })
   }
 
+  const [runBusy, setRunBusy] = useState(false)
   const closeDialog = () => setDialog(null)
 
-  const runDialog = async () => {
+  const runDialogInner = async () => {
     if (!dialog) return
     if (dialog.kind === 'mkdir') {
       const target = joinPath(path, dialog.value.trim())
@@ -207,6 +212,17 @@ export default function RcloneBrowser({ remotes }: Props) {
     const label = dialog.kind === 'download' ? '下载' : dialog.kind === 'copy' ? '复制' : '移动'
     toast(success === results.length ? `${label}任务已提交` : `${label}已提交 ${success}/${results.length} 个`, success ? 'ok' : 'bad')
     if (success) closeDialog()
+  }
+
+  // 复制/移动/下载是逐条建任务的批量操作，无 busy 态时双击会重复提交
+  const runDialog = async () => {
+    if (runBusy) return
+    setRunBusy(true)
+    try {
+      await runDialogInner()
+    } finally {
+      setRunBusy(false)
+    }
   }
 
   const deleteEntries = async (entries: RcloneEntry[]) => {
@@ -400,7 +416,7 @@ export default function RcloneBrowser({ remotes }: Props) {
             <label className="block text-xs text-dim">{dialog.kind === 'download' ? '本地目标目录（相对下载目录）' : '目标目录'}<input value={dialog.targetPath} onChange={(event) => setDialog({ ...dialog, targetPath: event.target.value })} placeholder={dialog.kind === 'download' ? '留空表示下载目录根目录' : '留空表示根目录'} className="mt-1.5 w-full rounded-lg border border-line bg-white/4 px-3 py-2.5 text-sm text-fg placeholder:text-dim/60 focus:border-aurora-2/50 focus:outline-none" /></label>
             <div className="text-[11px] leading-relaxed text-dim/70">{dialog.entries.length === 1 ? dialog.entries[0].name : `已选择 ${dialog.entries.length} 项`} · 任务将在后台执行，可在传输任务中查看进度。</div>
           </div>}
-          <div className="mt-5 flex justify-end gap-2"><button onClick={closeDialog} className="rounded-lg border border-line bg-white/4 px-3.5 py-2 text-xs text-dim hover:text-fg">取消</button><button onClick={runDialog} className="rounded-lg grad-bar px-3.5 py-2 text-xs font-medium text-ink">提交</button></div>
+          <div className="mt-5 flex justify-end gap-2"><button onClick={closeDialog} className="rounded-lg border border-line bg-white/4 px-3.5 py-2 text-xs text-dim hover:text-fg">取消</button><button onClick={runDialog} disabled={runBusy} className="rounded-lg grad-bar px-3.5 py-2 text-xs font-medium text-ink disabled:opacity-50">{runBusy ? '提交中…' : '提交'}</button></div>
         </div>
       </div>}
     </section>

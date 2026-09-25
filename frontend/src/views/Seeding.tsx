@@ -4,11 +4,11 @@ import { useMetrics, fetchTorrentPeers, type TorrentPeers } from '../lib/api'
 import { StatCard, Tag, fmtGb, fmtRate, pct, fmtBytes, SourceBadge, STATE_ZH, EmptyState, flagFor, countryZh } from '../components/ui'
 
 const stateTone: Record<string, 'ok' | 'warn' | 'bad' | 'muted'> = {
-  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
+  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn', unknown: 'bad',
 }
 
 export default function SeedingView() {
-  const { data, sources } = useMetrics()
+  const { data, source, sources } = useMetrics()
   const [selHash, setSelHash] = useState<string | null>(null)
   const [peers, setPeers] = useState<TorrentPeers | null>(null)
 
@@ -45,6 +45,11 @@ export default function SeedingView() {
 
   return (
     <div className="min-w-0 px-4 py-6 md:px-10 md:py-8">
+      {source === 'mock' && (
+        <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-2.5 text-xs text-amber-200">
+          后端未连接，当前显示空态演示。请检查 Aurora 服务是否运行。
+        </div>
+      )}
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.3em] text-dim">上传 / 对等方</div>

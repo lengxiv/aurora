@@ -6,7 +6,7 @@ import { useToast } from '../toast'
 
 const statusTone: Record<MountStatus, 'ok' | 'warn' | 'bad'> = { online: 'ok', degraded: 'warn', offline: 'bad' }
 const stateTone: Record<Torrent['state'], 'ok' | 'warn' | 'bad' | 'muted'> = {
-  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn',
+  downloading: 'ok', stalled: 'warn', seeding: 'warn', queued: 'muted', error: 'bad', done: 'muted', paused: 'warn', unknown: 'bad',
 }
 const destinationStatus: Record<string, string> = { waiting: '等待下载完成', uploading: '上传中', done: '已上传', error: '上传失败', orphaned: '任务已不存在' }
 
@@ -20,7 +20,7 @@ function RowBtn({ children, onClick, title, danger }: { children: ReactNode; onC
 }
 
 export default function ConsoleView() {
-  const { data, sources } = useMetrics()
+  const { data, source, sources } = useMetrics()
   const toast = useToast()
   const [open, setOpen] = useState(false)
   const [addMode, setAddMode] = useState<'magnet' | 'file'>('magnet')
@@ -239,39 +239,42 @@ export default function ConsoleView() {
     setBusy(false)
   }
 
+  const detailHashRef = useRef('')   // 竞态守卫：await 返回后校验，防止旧任务的响应覆盖新任务的详情面板
+  const closeDetail = useCallback(() => { detailHashRef.current = ''; setDetailHash('') }, [])
+
+  const applyDetail = (next: TorrentDetail, peers: TorrentPeers | null) => {
+    setDetail(next)
+    setDetailPeers(peers)
+    setDetailSelectedFiles(new Set(next.files.filter((item) => item.priority > 0).map((item) => item.index)))
+    setDetailCategory(next.category || '')
+    setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
+    setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
+    setDetailDownloadLimit(Math.round((next.download_limit || 0) / 1024))
+    setDetailUploadLimit(Math.round((next.upload_limit || 0) / 1024))
+  }
+
   const openDetail = async (hash: string) => {
+    detailHashRef.current = hash
     setDetailHash(hash)
     setDetail(null)
     setDetailPeers(null)
     setDetailBusy(true)
     setDeleteFiles(false)
     const [next, peers] = await Promise.all([fetchTorrentDetail(hash), fetchTorrentPeers(hash)])
-    if (next) {
-      setDetail(next)
-      setDetailPeers(peers)
-      setDetailSelectedFiles(new Set(next.files.filter((item) => item.priority > 0).map((item) => item.index)))
-      setDetailCategory(next.category || '')
-      setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
-      setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
-      setDetailDownloadLimit(Math.round((next.download_limit || 0) / 1024))
-      setDetailUploadLimit(Math.round((next.upload_limit || 0) / 1024))
-    } else toast('读取任务详情失败', 'bad')
+    // 请求期间用户可能已切换到其他任务：过期响应必须丢弃，
+    // 否则面板显示 A 任务的名字、操作却作用于 B 任务
+    if (detailHashRef.current !== hash) return
+    if (next) applyDetail(next, peers)
+    else toast('读取任务详情失败', 'bad')
     setDetailBusy(false)
   }
 
   const refreshDetail = async () => {
-    if (!detailHash) return
-    const [next, peers] = await Promise.all([fetchTorrentDetail(detailHash), fetchTorrentPeers(detailHash)])
-    if (next) {
-      setDetail(next)
-      setDetailPeers(peers)
-      setDetailSelectedFiles(new Set(next.files.filter((item) => item.priority > 0).map((item) => item.index)))
-      setDetailCategory(next.category || '')
-      setDetailTags(next.tags.filter((item) => !item.startsWith('aurora-')).join(', '))
-      setDetailLocation(next.save_path.replace(/^\/downloads\/?/, ''))
-      setDetailDownloadLimit(Math.round((next.download_limit || 0) / 1024))
-      setDetailUploadLimit(Math.round((next.upload_limit || 0) / 1024))
-    }
+    const hash = detailHashRef.current
+    if (!hash) return
+    const [next, peers] = await Promise.all([fetchTorrentDetail(hash), fetchTorrentPeers(hash)])
+    if (detailHashRef.current !== hash) return
+    if (next) applyDetail(next, peers)
   }
 
   const runDetailAction = async (action: string, label: string, options: { limitKib?: number; location?: string; deleteFiles?: boolean; fileIds?: number[]; allFileIds?: number[]; priority?: number } = {}) => {
@@ -281,7 +284,7 @@ export default function ConsoleView() {
     const r = await torrentAdvancedAction(detailHash, action, options)
     setDetailActionBusy(false)
     toast(r.ok ? `${label}成功` : `${label}失败：${r.detail}`, r.ok ? 'ok' : 'bad')
-    if (r.ok && action === 'remove') setDetailHash('')
+    if (r.ok && action === 'remove') closeDetail()
     else if (r.ok) await refreshDetail()
   }
 
@@ -394,6 +397,11 @@ export default function ConsoleView() {
 
   return (
     <div className="min-w-0 px-4 py-6 md:px-10 md:py-8">
+      {source === 'mock' && (
+        <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-2.5 text-xs text-amber-200">
+          后端未连接，当前显示空态演示。请检查 Aurora 服务是否运行，而不是去排查 rclone / qBittorrent。
+        </div>
+      )}
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.3em] text-dim">控制台</div>
@@ -461,13 +469,13 @@ export default function ConsoleView() {
         <section className="panel flex flex-col px-6 py-5">
           <h2 className="text-sm font-medium text-fg">中转磁盘</h2>
           <div className="my-auto flex flex-col items-center py-4">
-            <div className="num grad-txt text-4xl font-semibold">{pct(data.disk.usedGb / data.disk.capGb)}</div>
-            <div className="mt-1 text-xs text-dim">使用率 · {fmtGb(data.disk.usedGb)} / {fmtGb(data.disk.capGb)}</div>
-            <div className="mt-4 w-40"><Bar p={data.disk.usedGb / data.disk.capGb} /></div>
+        <div className="num grad-txt text-4xl font-semibold">{data.disk.capGb > 0 ? pct(data.disk.usedGb / data.disk.capGb) : '—'}</div>
+        <div className="mt-1 text-xs text-dim">使用率 · {fmtGb(data.disk.usedGb)} / {fmtGb(data.disk.capGb)}</div>
+        <div className="mt-4 w-40"><Bar p={data.disk.capGb > 0 ? data.disk.usedGb / data.disk.capGb : 0} /></div>
           </div>
           <div className="grid grid-cols-2 gap-2 text-center">
             <div className="rounded-lg bg-white/4 py-2"><div className="num text-sm text-fg">{fmtBytes(data.disk.rw)}/s</div><div className="text-[11px] text-dim">读写</div></div>
-            <div className="rounded-lg bg-white/4 py-2"><div className="num text-sm text-fg">{fmtGb(data.disk.capGb - data.disk.usedGb)}</div><div className="text-[11px] text-dim">可用</div></div>
+            <div className="rounded-lg bg-white/4 py-2"><div className="num text-sm text-fg">{fmtGb(Math.max(0, data.disk.capGb - data.disk.usedGb))}</div><div className="text-[11px] text-dim">可用</div></div>
           </div>
         </section>
       </div>
@@ -764,7 +772,7 @@ export default function ConsoleView() {
       )}
 
       {detailHash && (
-        <div className="fixed inset-0 z-[60] overflow-y-auto bg-black/65 p-4 backdrop-blur-sm" onClick={() => !detailActionBusy && setDetailHash('')}>
+        <div className="fixed inset-0 z-[60] overflow-y-auto bg-black/65 p-4 backdrop-blur-sm" onClick={() => !detailActionBusy && closeDetail()}>
           <div className="ml-auto min-h-full w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
             <div className="panel my-2 min-h-[calc(100vh-1rem)] px-5 py-5 sm:px-6">
               <div className="flex items-start justify-between gap-3 border-b border-line pb-4">
@@ -774,10 +782,12 @@ export default function ConsoleView() {
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
                   <button type="button" onClick={() => void refreshDetail()} disabled={detailBusy || detailActionBusy} title="刷新详情" aria-label="刷新详情" className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white/4 text-dim hover:text-fg disabled:opacity-40"><RefreshCw size={14} className={detailBusy ? 'animate-spin' : ''} /></button>
-                  <button type="button" onClick={() => setDetailHash('')} disabled={detailActionBusy} title="关闭" aria-label="关闭" className="grid h-8 w-8 place-items-center rounded-md text-dim hover:bg-white/6 hover:text-fg disabled:opacity-40"><X size={16} /></button>
+                  <button type="button" onClick={closeDetail} disabled={detailActionBusy} title="关闭" aria-label="关闭" className="grid h-8 w-8 place-items-center rounded-md text-dim hover:bg-white/6 hover:text-fg disabled:opacity-40"><X size={16} /></button>
                 </div>
               </div>
-              {detailBusy || !detail ? <div className="py-16 text-center text-sm text-dim">正在读取任务详情…</div> : (
+              {detailBusy ? <div className="py-16 text-center text-sm text-dim">正在读取任务详情…</div>
+              : !detail ? <div className="py-16 text-center text-sm text-dim">读取失败，请点击右上角刷新重试</div>
+              : (
                 <div className="mt-4 space-y-4">
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                     {[
