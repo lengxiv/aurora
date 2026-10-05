@@ -8,6 +8,7 @@ import SettingsView from './views/Settings'
 import NetdiskView from './views/Netdisk'
 import RssView from './views/Rss'
 import Login from './views/Login'
+import UpdateBanner from './UpdateBanner'
 import { useAuth } from './auth'
 import CommandPalette from './CommandPalette'
 import Alerts from './Alerts'
@@ -29,6 +30,7 @@ function Shell() {
     <MetricsProvider><div className="aurora-bg relative min-h-screen">
       <CommandPalette onLogout={logout} />
       <Alerts />
+      <UpdateBanner />
       <div className="mx-auto flex min-h-screen max-w-[1400px] flex-col md:flex-row">
         {/* mobile top nav */}
         <header className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-line bg-ink-2/85 px-3 py-2.5 backdrop-blur md:hidden">
