@@ -626,8 +626,15 @@ class MediaOrganizeTests(unittest.TestCase):
             _last_details_ok = True
             _UP_STATES = providers.QbittorrentProvider._UP_STATES
 
+            def __init__(self):
+                self.actions = []
+
             def available(self):
                 return True
+
+            def advanced_action(self, hash_, action, **kwargs):
+                self.actions.append((hash_, action, kwargs))
+                return True, ""
 
             def torrent_details(self):
                 return [{
@@ -693,6 +700,22 @@ class MediaOrganizeTests(unittest.TestCase):
         statuses = [item["status"] for item in data2["items"]]
         self.assertEqual(statuses, ["already_done"])
         self.assertEqual(self.refreshed, [1])   # 没有新增整理就不再次刷库
+
+    def test_move_mode_relocates_and_pauses_torrent(self):
+        # move 会把内容搬出下载目录：任务必须自动暂停，否则停在"文件丢失"
+        providers.save_media_organize_settings({
+            "enabled": True, "interval": 300, "jellyfin_refresh": False,
+            "rules": [{"id": "org-mv", "name": "电影搬移", "category": "movies",
+                       "enabled": True, "target_dir": "library/movies",
+                       "mode": "move", "use_subfolder": True, "min_size_mb": 0}],
+        })
+        ok, data, detail = providers.apply_media_organize(confirm=True)
+        self.assertTrue(ok, detail)
+        self.assertEqual(data["organized"], 1)
+        target = self.media / "library" / "movies" / "Some.Movie.2024" / "movie.mkv"
+        self.assertTrue(target.exists())
+        self.assertFalse((self.content / "movie.mkv").exists())
+        self.assertEqual(self.qbit.actions, [("f" * 40, "pause", {})])
 
     def test_target_conflict_is_reported_not_overwritten(self):
         (self.media / "library" / "movies" / "Some.Movie.2024").mkdir(parents=True)
@@ -834,6 +857,91 @@ class TgProxyTests(unittest.TestCase):
             ok, detail = providers._tg_send("tok", "chat", "hello")
         self.assertFalse(ok)
         self.assertIn("AURORA_TG_PROXY", detail)
+
+
+    def test_trash_failure_returns_error_not_raise(self):
+        # 盘掉线/磁盘满时 makedirs 失败：必须返回错误而非 NameError 穿透成 500
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            content = Path(td) / "release"
+            content.mkdir()
+            (content / "f.txt").write_text("x")
+            os.environ["AURORA_LOCAL_MOUNT"] = td
+            with patch("os.makedirs", side_effect=OSError(28, "no space left on device")):
+                trash_id, error = providers._policy_trash_content(str(content))
+            self.assertEqual(trash_id, "")
+            self.assertIn("失败", error)
+            self.assertTrue(content.exists())   # 源文件未被移动
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+    def test_prune_deletes_stale_torrent_files(self):
+        old_undo_file = providers._POLICY_UNDO_FILE
+        old_undo_dir = providers._POLICY_UNDO_DIR
+        with tempfile.TemporaryDirectory() as td:
+            providers._POLICY_UNDO_FILE = str(Path(td) / "undo.json")
+            providers._POLICY_UNDO_DIR = str(Path(td) / "undo-dir")
+            os.makedirs(providers._POLICY_UNDO_DIR)
+            stale = Path(providers._POLICY_UNDO_DIR) / "old.torrent"
+            fresh = Path(providers._POLICY_UNDO_DIR) / "new.torrent"
+            stale.write_bytes(b"x")
+            fresh.write_bytes(b"y")
+            expired = int(time.time()) - providers._POLICY_UNDO_RETENTION - 60
+            providers._save_policy_undo([
+                {"id": "old", "time": expired, "action": "remove", "torrent_file": str(stale)},
+                {"id": "new", "time": int(time.time()), "action": "remove", "torrent_file": str(fresh)},
+            ])
+            providers._policy_undo_add({"id": "x", "time": int(time.time()), "action": "remove",
+                                        "torrent_file": str(fresh)})
+            self.assertFalse(stale.exists())   # 过期条目的留档文件被同步删除
+            self.assertTrue(fresh.exists())
+            self.assertEqual([e["id"] for e in providers._load_policy_undo()], ["new", "x"])
+        providers._POLICY_UNDO_FILE = old_undo_file
+        providers._POLICY_UNDO_DIR = old_undo_dir
+
+    def test_undo_can_retry_when_readd_fails(self):
+        # 文件已回原位（trash_id 已消耗）但重加任务失败：条目必须保留且可重试
+        old_undo_file = providers._POLICY_UNDO_FILE
+        old_undo_dir = providers._POLICY_UNDO_DIR
+        old_qbit = providers._qbit
+        with tempfile.TemporaryDirectory() as td:
+            providers._POLICY_UNDO_FILE = str(Path(td) / "undo.json")
+            providers._POLICY_UNDO_DIR = str(Path(td) / "undo-dir")
+            torrent_file = Path(td) / "keep.torrent"
+            torrent_file.write_bytes(b"d8:announce4:test")
+            providers._save_policy_undo([{
+                "id": "e1", "time": int(time.time()), "action": "remove",
+                "hash": "a" * 40, "name": "n", "save_path": "/downloads",
+                "category": "", "tags": [], "trash_id": "",
+                "torrent_file": str(torrent_file),
+            }])
+
+            class FakeQbit:
+                def __init__(self):
+                    self.calls = 0
+
+                def add_file(self, filename, content, save_path="", tag="", category="", tags=None):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return False, "qBittorrent 暂时不可用"
+                    return True, ""
+
+                def advanced_action(self, hash_, action, **kwargs):
+                    return True, ""
+
+            fake = FakeQbit()
+            providers._qbit = fake
+            ok, _detail = providers.policy_undo_execute("e1")
+            self.assertFalse(ok)   # 第一次重加失败
+            ok2, detail2 = providers.policy_undo_execute("e1")
+            self.assertTrue(ok2, detail2)   # 条目仍在，重试直接走重加
+            self.assertFalse(torrent_file.exists())
+            self.assertEqual(providers._load_policy_undo(), [])
+        providers._POLICY_UNDO_FILE = old_undo_file
+        providers._POLICY_UNDO_DIR = old_undo_dir
+        providers._qbit = old_qbit
 
 
 class TorrentDestinationTests(unittest.TestCase):
@@ -1916,6 +2024,40 @@ class HttpLayerTests(unittest.TestCase):
     def test_rss_endpoints_require_auth(self):
         self.assertEqual(self.client.get("/api/rss/overview").status_code, 401)
         self.assertEqual(self.client.post("/api/rss/rules/save", json={"name": "x"}).status_code, 401)
+
+    def test_rss_overview_echoes_destination_binding(self):
+        # 规则上的 aurora-remote-* 标记必须反查成网盘目标回显，
+        # 否则前端编辑保存会静默丢掉转存绑定
+        marker = "aurora-remote-0123456789abcdef"
+        old_dest_file = providers._TORRENT_DEST_FILE
+        old_qbit = providers._qbit
+        providers._atomic_json(providers._TORRENT_DEST_FILE, {
+            marker: {"remote": "gdrive", "path": "/media", "status": "waiting",
+                     "detail": "", "hash": "", "name": "", "local_path": "",
+                     "transfer_id": "", "created": int(time.time()), "finished": 0},
+        })
+
+        class FakeQbit:
+            def available(self):
+                return True
+
+            def rss_overview(self):
+                return True, {"feeds": [], "rules": {
+                    "r1": {"name": "r1", "enabled": True, "tags": [marker],
+                           "affected_feeds": [], "category": "tv"},
+                }}, ""
+
+        providers._qbit = FakeQbit()
+        try:
+            self._login()
+            r = self.client.get("/api/rss/overview")
+            self.assertEqual(r.status_code, 200, r.text)
+            rule = r.json()["rules"]["r1"]
+            self.assertEqual(rule["destination_remote"], "gdrive")
+            self.assertEqual(rule["destination_path"], "/media")
+        finally:
+            providers._qbit = old_qbit
+            providers._TORRENT_DEST_FILE = old_dest_file
 
     def test_update_check_endpoint_uses_cache_not_network(self):
         # 端到端：登录后经 HTTP 调用，GitHub 结果被 mock，不依赖外网

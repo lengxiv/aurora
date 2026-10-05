@@ -2599,10 +2599,25 @@ def _save_policy_undo(entries: list[dict]) -> None:
     _atomic_json(_POLICY_UNDO_FILE, entries)
 
 
+def _policy_undo_discard_file(entry: dict) -> None:
+    f = str(entry.get("torrent_file") or "")
+    if f and os.path.isfile(f):
+        try:
+            os.unlink(f)
+        except OSError:
+            _LOGGER.warning("policy undo torrent file delete failed: %s", f)
+
+
 def _prune_policy_undo(entries: list[dict]) -> list[dict]:
+    # 被裁掉的条目（过期或超出上限）必须同步删除留档 .torrent：
+    # 里面含 tracker announce URL（私有站 passkey），不能超过保留期滞留磁盘
     cutoff = time.time() - _POLICY_UNDO_RETENTION
-    kept = [e for e in entries if e.get("time", 0) >= cutoff]
-    return kept[-_POLICY_UNDO_LIMIT:]
+    kept = [e for e in entries if e.get("time", 0) >= cutoff][-_POLICY_UNDO_LIMIT:]
+    kept_ids = {e.get("id") for e in kept}
+    for e in entries:
+        if e.get("id") not in kept_ids:
+            _policy_undo_discard_file(e)
+    return kept
 
 
 def _policy_undo_add(entry: dict) -> None:
@@ -2648,10 +2663,11 @@ def _policy_trash_content(content_path: str) -> tuple[str, str]:
     src = os.path.realpath(content_path)
     rel = os.path.relpath(src, base)
     trash_id = secrets.token_hex(12)
+    # target 必须在 try 外赋值：makedirs 失败（盘掉线/磁盘满）时 except 分支
+    # 还要靠它回滚，未绑定会抛 NameError 把整个策略应用打成 500
+    target = os.path.join(base, ".aurora-trash", trash_id)
     try:
-        trash_dir = os.path.join(base, ".aurora-trash")
-        os.makedirs(trash_dir, mode=0o700, exist_ok=True)
-        target = os.path.join(trash_dir, trash_id)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
         shutil.move(src, target)
         size = 0
         try:
@@ -2716,6 +2732,11 @@ def policy_undo_execute(entry_id: str) -> tuple[bool, str]:
                 ok, error = _policy_restore_trash(trash_id)
                 if not ok:
                     return False, f"文件未恢复，撤销中止：{error}"
+                # 文件已回原位：立即清空条目内的 trash_id 并落盘。
+                # 否则 add_file 失败后的重试会卡在"回收站条目已不存在"，
+                # 永远走不到重加任务那一步
+                entry["trash_id"] = ""
+                _save_policy_undo(entries)
             torrent_file = str(entry.get("torrent_file") or "")
             content = b""
             if torrent_file and os.path.isfile(torrent_file):
@@ -3517,6 +3538,13 @@ def apply_media_organize(confirm: bool = False, dry_run: bool = False) -> tuple[
             results.append({**item, "status": "would_organize"})
             continue
         ok_move, error = _org_transfer(item["source"], item["target_path"], item["mode"])
+        if ok_move and item["mode"] == "move":
+            # move 已把内容搬出下载目录，任务继续做种只会停在"文件丢失"：
+            # 主动暂停并留痕（不删除，去留交给用户决定）
+            paused, pause_error = _qbit.advanced_action(item["hash"], "pause")
+            note = "文件已移出下载目录，任务已自动暂停" if paused \
+                else f"文件已移出下载目录，自动暂停任务失败：{pause_error}"
+            error = f"{error}；{note}" if error else note
         _org_history_add({
             "time": int(time.time()), "hash": item["hash"], "name": item["name"],
             "rule_name": item["rule_name"], "mode": item["mode"], "target": item["target"],

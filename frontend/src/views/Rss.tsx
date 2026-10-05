@@ -70,7 +70,9 @@ export default function RssView() {
 
   const startNewRule = () => { setDraft({ ...EMPTY_DRAFT }); setDraftTags('') }
   const startEditRule = (rule: RssRule) => {
-    setDraft({ ...rule, destination_remote: '', destination_path: '' })
+    // 回显现有网盘绑定：否则保存后 aurora-remote-* 标记会被剥掉，
+    // 规则的自动转存网盘功能就静默失效了
+    setDraft({ ...rule, destination_remote: rule.destination_remote || '', destination_path: rule.destination_path || '' })
     setDraftTags(rule.tags.filter((t) => !t.startsWith('aurora-remote-')).join(','))
   }
   const saveDraft = async () => {
@@ -171,6 +173,7 @@ export default function RssView() {
                         <span className="truncate">{rule.name}</span>
                         {!rule.enabled && <span className="shrink-0 text-[10px] text-dim">已停用</span>}
                         {rule.use_regex && <span className="shrink-0 rounded-full bg-white/6 px-2 py-0.5 text-[10px] text-dim">正则</span>}
+                        {rule.destination_remote && <span className="num shrink-0 rounded-full bg-teal-400/10 px-2 py-0.5 text-[10px] text-teal-300" title="完成后自动转存到该网盘目标">→ {rule.destination_remote}{rule.destination_path ? `:${rule.destination_path}` : ''}</span>}
                       </div>
                       <div className="num truncate text-[11px] text-dim">
                         包含：{rule.must_contain || '—'}{rule.category ? ` · 分类 ${rule.category}` : ''}{rule.save_path ? ` · ${rule.save_path}` : ''} · 订阅 {rule.affected_feeds.length} 个

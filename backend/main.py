@@ -1295,6 +1295,13 @@ def rss_overview(_user: str = Depends(require_auth)):
     ok, data, detail = providers._qbit.rss_overview()
     if not ok:
         raise HTTPException(status_code=502, detail=detail)
+    # 回显规则当前绑定的网盘转存目标（经 aurora-remote-* 标记反查）：
+    # 编辑规则时前端要能回显，否则保存会静默丢掉转存绑定
+    for rule in (data.get("rules") or {}).values():
+        dest = providers.torrent_destination_for_tags(",".join(rule.get("tags") or []))
+        if dest:
+            rule["destination_remote"] = dest.get("remote", "")
+            rule["destination_path"] = dest.get("path", "")
     return data
 
 
@@ -1379,7 +1386,6 @@ def _rss_rule_from_body(body: RssRuleBody) -> dict:
     for key in ("must_contain", "must_not_contain"):
         value = str(rule.get(key) or "")
         if value and rule.get("use_regex"):
-            parts = value if "|" not in value or "{{" in value else value
             try:
                 re.compile(value)
             except re.error as exc:

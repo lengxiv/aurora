@@ -748,6 +748,9 @@ export interface RssRule {
   category: string
   tags: string[]
   last_match: number
+  /** 当前绑定的网盘转存目标（经 aurora-remote-* 标记反查），编辑时回显用 */
+  destination_remote?: string
+  destination_path?: string
 }
 
 export interface RssArticle {
