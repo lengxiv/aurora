@@ -2140,9 +2140,9 @@ if (STATIC_DIR / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
 
 def _spa_index() -> FileResponse:
-    # index.html 必须禁缓存：更新部署后浏览器缓存的旧 HTML 会引用已被
-    # emptyOutDir 清掉的旧哈希资源，典型症状就是发版后页面白屏
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    # index.html 的禁缓存由安全响应头中间件统一下发（非 /assets 路径均为
+    # Cache-Control: no-store），这里不重复设置；改缓存策略请改中间件
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 if (STATIC_DIR / "index.html").is_file():

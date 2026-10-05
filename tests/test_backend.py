@@ -682,6 +682,25 @@ class MediaOrganizeTests(unittest.TestCase):
         self.assertFalse(item["exists"])
         self.assertEqual(item["target"], "library/movies/Some.Movie.2024")
 
+    def test_mkdir_race_returns_conflict_without_deleting_target(self):
+        # 复现并发竞态：目标在 exists 检查之后、mkdir 之前被并发方创建。
+        # mkdir 撞车必须返回冲突且绝不 rmtree——那会删掉并发方刚整理好的成果
+        target = self.media / "library" / "movies" / "Some.Movie.2024"
+        target.mkdir(parents=True)
+        (target / "already-organized.mkv").write_text("precious")
+        real_exists = os.path.exists
+
+        def exists_lies(path, *args, **kwargs):
+            if os.path.abspath(str(path)) == os.path.abspath(str(target)):
+                return False   # 检查时谎称目标不存在，模拟时间窗
+            return real_exists(path, *args, **kwargs)
+
+        with patch("os.path.exists", side_effect=exists_lies):
+            ok, error = providers._org_transfer(str(self.content), str(target), "hardlink")
+        self.assertFalse(ok)
+        self.assertIn("不覆盖", error)
+        self.assertTrue((target / "already-organized.mkv").exists())   # 并发方成果完好
+
     def test_hardlink_apply_then_skip_on_second_run(self):
         self._patch_jelly()
         ok, data, detail = providers.apply_media_organize(confirm=True)

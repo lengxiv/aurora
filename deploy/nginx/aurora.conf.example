@@ -82,15 +82,10 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # 哈希命名的构建产物可长期缓存（文件名变即内容变）；
-    # index.html 由后端下发 Cache-Control: no-cache，切勿在此对 / 加 immutable
-    location /assets/ {
-        proxy_pass http://127.0.0.1:8787;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
+    # 静态资源缓存策略由后端统一下发（安全响应头中间件）：
+    # /assets/* → public, max-age=31536000, immutable；其余（含 index.html）→ no-store。
+    # 不要在 nginx 层重复配置 Cache-Control：add_header 会产生冲突头，
+    # 且 location 内出现 add_header 会使 server 级的 HSTS 对该路径失效
 
     location / {
         proxy_pass http://127.0.0.1:8787;

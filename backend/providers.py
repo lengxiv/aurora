@@ -3461,12 +3461,13 @@ def preview_media_organize() -> tuple[bool, dict, str]:
                   "rule_count": len(rules), "items": items}, ""
 
 
-def _hardlink_tree(src: str, dst: str) -> None:
-    os.mkdir(dst)
+def _link_tree_into(src: str, dst: str) -> None:
+    """把目录内容逐项硬链接进 dst（dst 必须已存在，由调用方独占创建）。"""
     for entry in os.scandir(src):
         s, d = entry.path, os.path.join(dst, entry.name)
         if entry.is_dir(follow_symlinks=False):
-            _hardlink_tree(s, d)
+            os.mkdir(d)
+            _link_tree_into(s, d)
         else:
             os.link(s, d)
 
@@ -3490,28 +3491,55 @@ def _org_transfer(source: str, target_path: str, mode: str) -> tuple[bool, str]:
     try:
         if mode == "move" and os.stat(src).st_dev != os.stat(_media_base_dir()).st_dev:
             return False, "源与媒体目录跨磁盘，move 不可用，请改用硬链接或拷贝"
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        partial = mode in ("hardlink", "copy")   # move 是原子 rename，失败不清理目标
-        try:
-            if os.path.isdir(src):
-                if mode == "hardlink":
-                    _hardlink_tree(src, target_path)
-                elif mode == "copy":
-                    shutil.copytree(src, target_path)
-                else:
-                    shutil.move(src, target_path)
-            else:
-                if mode == "hardlink":
-                    os.link(src, target_path)
-                elif mode == "copy":
-                    shutil.copy2(src, target_path)
-                else:
-                    shutil.move(src, target_path)
-        except OSError:
-            if partial and os.path.exists(target_path):
-                _org_cleanup(target_path)
-            raise
     except OSError as exc:
+        return False, f"整理失败：{exc}"
+
+    if mode == "move":
+        # 同盘 rename 原子完成，无半成品需要清理；检查后瞬间被占用的窗口
+        # 只会返回失败，不存在误删他人内容的问题
+        try:
+            shutil.move(src, target_path)
+        except OSError as exc:
+            return False, f"整理失败：{exc}"
+        return True, ""
+
+    # hardlink / copy：目标目录必须由本调用独占创建。mkdir 撞车（调度器与
+    # 手动整理并发、多条规则同目标）时返回冲突，绝不能 rmtree——那会把
+    # 并发方刚写完的整理成果一起删掉
+    is_dir_src = os.path.isdir(src)
+    try:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        os.mkdir(target_path)
+    except FileExistsError:
+        return False, "目标已有同名内容，不覆盖"
+    except OSError as exc:
+        return False, f"整理失败：{exc}"
+
+    try:
+        if is_dir_src:
+            if mode == "hardlink":
+                _link_tree_into(src, target_path)
+            else:
+                shutil.copytree(src, target_path)
+        else:
+            if mode == "hardlink":
+                os.link(src, target_path)
+            else:
+                shutil.copy2(src, target_path)
+    except FileExistsError:
+        # 目录是本调用建的，中途撞名说明有并发写者：清掉自己的半成品即可
+        if is_dir_src:
+            _org_cleanup(target_path)
+        return False, "目标已有同名内容，不覆盖"
+    except OSError as exc:
+        if is_dir_src:
+            _org_cleanup(target_path)
+        else:
+            # 单文件半截拷贝清掉；hardlink 失败时目标不存在，unlink 为空操作
+            try:
+                os.unlink(target_path)
+            except OSError:
+                pass
         return False, f"整理失败：{exc}"
     return True, ""
 
