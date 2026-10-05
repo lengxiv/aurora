@@ -780,6 +780,62 @@ class RssHelpersTests(unittest.TestCase):
         self.assertEqual(by_path["Top Feed"]["url"], "http://y")
 
 
+class TgProxyTests(unittest.TestCase):
+    """TG 通道代理：AURORA_TG_PROXY 只影响 Telegram 请求；超时给可行动提示。"""
+
+    def setUp(self):
+        self._old = os.environ.get("AURORA_TG_PROXY")
+        os.environ.pop("AURORA_TG_PROXY", None)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("AURORA_TG_PROXY", None)
+        else:
+            os.environ["AURORA_TG_PROXY"] = self._old
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {}
+
+    def test_explicit_proxy_is_applied(self):
+        os.environ["AURORA_TG_PROXY"] = "http://127.0.0.1:7890"
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            captured["url"] = url
+            return self._FakeResp()
+
+        with patch("requests.post", side_effect=fake_post):
+            ok, detail = providers._tg_send("tok", "chat", "hello")
+        self.assertTrue(ok, detail)
+        self.assertEqual(captured["proxies"],
+                         {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
+        self.assertIn("/bottok/sendMessage", captured["url"])
+
+    def test_default_keeps_trust_env_when_unset(self):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return self._FakeResp()
+
+        with patch("requests.post", side_effect=fake_post):
+            ok, _detail = providers._tg_send("tok", "chat", "hello")
+        self.assertTrue(ok)
+        self.assertIsNone(captured.get("proxies"))   # 交给 requests 的 trust_env 行为
+
+    def test_timeout_returns_actionable_hint(self):
+        import requests as _requests
+
+        with patch("requests.post", side_effect=_requests.exceptions.ConnectTimeout("boom")):
+            ok, detail = providers._tg_send("tok", "chat", "hello")
+        self.assertFalse(ok)
+        self.assertIn("AURORA_TG_PROXY", detail)
+
+
 class TorrentDestinationTests(unittest.TestCase):
     def test_completed_torrent_starts_and_finishes_remote_upload(self):
         old_dest_file = providers._TORRENT_DEST_FILE

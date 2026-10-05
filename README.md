@@ -150,6 +150,7 @@ cd frontend && npm run lint && npm run build
 | `AURORA_JELLYFIN` / `_TOKEN` | `:8096` | Jellyfin API 对接 |
 | `AURORA_RCLONE_RC` / `_AUTH` | `:5572/rclone` | rclone Remote Control 对接 |
 | `AURORA_TG_BOT_TOKEN` / `_CHAT_ID` | 空 | Telegram 通知回退通道 |
+| `AURORA_TG_PROXY` | 空 | TG 通道代理（服务器无法直连 api.telegram.org 时设置，仅 TG 走代理） |
 
 ## 数据源与适配器
 

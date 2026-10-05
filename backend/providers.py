@@ -3553,11 +3553,20 @@ def start_media_organizer_scheduler() -> None:
     threading.Thread(target=loop, daemon=True).start()
 
 
+def _tg_proxies() -> dict | None:
+    """TG 通道代理：api.telegram.org 在部分网络不可直连。AURORA_TG_PROXY
+    只代理 Telegram（rclone/qbit/Jellyfin 适配器流量不受影响）；未设置时
+    返回 None，保持 requests 默认行为（仍会读标准 HTTPS_PROXY 环境变量）。"""
+    p = os.environ.get("AURORA_TG_PROXY", "").strip()
+    return {"http": p, "https": p} if p else None
+
+
 def _tg_send(token: str, chat_id: str, text: str):
+    import requests
     try:
-        import requests
         r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat_id, "text": text}, timeout=8)
+                          json={"chat_id": chat_id, "text": text}, timeout=8,
+                          proxies=_tg_proxies())
         if r.status_code == 200:
             return True, ""
         try:
@@ -3565,6 +3574,9 @@ def _tg_send(token: str, chat_id: str, text: str):
         except Exception:
             desc = f"HTTP {r.status_code}"
         return False, desc
+    except requests.exceptions.Timeout:
+        return False, ("连接 api.telegram.org 超时：服务器网络可能无法直连 Telegram。"
+                       "请配置 AURORA_TG_PROXY（如 http://host.docker.internal:7890）后重试")
     except Exception as e:
         return False, str(e)
 

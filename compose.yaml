@@ -22,6 +22,8 @@ services:
       AURORA_QBIT_URL: ${AURORA_QBIT_URL:-http://qbittorrent:8080}
       AURORA_JELLYFIN: ${AURORA_JELLYFIN:-http://jellyfin:8096}
       AURORA_RCLONE_RC: ${AURORA_RCLONE_RC:-http://host.docker.internal:5572/rclone}
+      # 服务器无法直连 api.telegram.org 时取消注释（仅 TG 通知走代理，不影响适配器）
+      # AURORA_TG_PROXY: http://host.docker.internal:7890
     env_file:
       # 凭据等敏感配置放私有环境文件（AURORA_AUTH_PASS、qbit/Jellyfin 账号等）。
       # 文件不存在时 compose 会启动失败：请先 `cp .env.example /etc/aurora.env`
