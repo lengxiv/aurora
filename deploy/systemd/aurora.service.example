@@ -8,6 +8,11 @@ Type=simple
 WorkingDirectory=/opt/aurora/backend
 User=aurora
 Group=aurora
+Environment=AURORA_STATE_DIR=/var/lib/aurora
+Environment=AURORA_DATA_DIR=/var/lib/aurora/data
+Environment=AURORA_LOCAL_MOUNT=/srv/aurora/media
+Environment=AURORA_AUTH_FILE=/var/lib/aurora/.auth
+Environment=AURORA_SECRET_FILE=/var/lib/aurora/.secret
 EnvironmentFile=-/etc/aurora.env
 ExecStart=/opt/aurora/backend/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8787
 Restart=always

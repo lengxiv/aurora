@@ -3,7 +3,9 @@ import hmac
 import mimetypes
 import os
 import re
+import requests
 import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -22,9 +24,30 @@ STATIC_DIR = PROJECT_DIR / "static"
 AUTH_FILE = Path(os.environ.get("AURORA_AUTH_FILE", str(STATE_DIR / ".auth"))).expanduser()
 SECRET_FILE = Path(os.environ.get("AURORA_SECRET_FILE", str(STATE_DIR / ".secret"))).expanduser()
 
+
+def _read_version() -> str:
+    # 版本号单一来源是仓库根目录的 VERSION 文件；AURORA_VERSION 仅作
+    # 环境覆盖（如容器内不想拷贝 VERSION 时），没有文件时退回 0.0.0
+    env = os.environ.get("AURORA_VERSION", "").strip()
+    if env:
+        return env
+    for base in (PROJECT_DIR.parent, PROJECT_DIR):
+        marker = base / "VERSION"
+        try:
+            if marker.is_file():
+                value = marker.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+        except OSError:
+            continue
+    return "0.0.0"
+
+
+APP_VERSION = _read_version()
+
 app = FastAPI(
     title="Aurora Media Hub",
-    version="0.4.0",
+    version=APP_VERSION,
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -53,6 +76,8 @@ def _load_credentials() -> tuple[str, str]:
         if ":" in line:
             u, p = line.split(":", 1)
             user, pw = u, p
+    if pw and len(pw) < 12:
+        raise RuntimeError("AURORA_AUTH_PASS or .auth password must be at least 12 characters")
     if not pw:
         import stat
         pw = secrets.token_urlsafe(18)
@@ -289,7 +314,8 @@ def change_password(body: ChangePassword, _user: str = Depends(require_auth), si
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "ts": int(time.time())}
+    # 未鉴权端点：供监控探针与负载均衡使用；version 用于部署确认与自动更新检查
+    return {"status": "ok", "version": APP_VERSION, "ts": int(time.time())}
 
 
 @app.get("/openapi.json", include_in_schema=False)
@@ -307,6 +333,8 @@ def _startup():
     providers.start_torrent_destination_scheduler()
     # 做种策略默认关闭；开启后仅按设置页中保存的规则执行。
     providers.start_torrent_policy_scheduler()
+    # 下载完成自动整理（默认关闭）
+    providers.start_media_organizer_scheduler()
 
 
 @app.get("/api/metrics")
@@ -327,6 +355,11 @@ def _qbit_category(value: str) -> str:
     value = str(value or "").strip()
     if value and not providers.QbittorrentProvider._valid_label(value):
         raise HTTPException(status_code=400, detail="分类名称无效")
+    return value
+def _qbit_hash(value: str) -> str:
+    value = str(value or "").strip()
+    if not providers.QbittorrentProvider._valid_hash(value):
+        raise HTTPException(status_code=400, detail="任务 Hash 无效")
     return value
 
 
@@ -384,6 +417,76 @@ class AddMagnet(BaseModel):
 
 
 _MAX_TORRENT_FILE = 20 * 1024 * 1024
+def _request_body_limit(path: str) -> int | None:
+    if path == "/api/auth/login":
+        return 64 * 1024
+    if path == "/api/torrents/upload":
+        return _MAX_TORRENT_FILE + 4 * 1024 * 1024
+    if path == "/api/rclone/transfers/upload":
+        return providers._RCLONE_UPLOAD_LIMIT + 8 * 1024 * 1024
+    return None
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class RequestBodyLimitMiddleware:
+    """Reject oversized or anonymous upload bodies before FastAPI parses them."""
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    async def _reject(scope, receive, send, status: int, detail: str):
+        response = JSONResponse({"detail": detail}, status_code=status)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cache-Control"] = "no-store"
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") in ("GET", "HEAD", "OPTIONS"):
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        limit = _request_body_limit(path)
+        if limit is None:
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        if path != "/api/auth/login" and not _check_sid(request.cookies.get(_COOKIE)):
+            await self._reject(scope, receive, send, 401, "unauthorized")
+            return
+        headers = dict(scope.get("headers") or [])
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                await self._reject(scope, receive, send, 400, "invalid content length")
+                return
+            if content_length < 0 or content_length > limit:
+                await self._reject(scope, receive, send, 413, "request body too large")
+                return
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > limit:
+                    raise _RequestBodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLarge:
+            await self._reject(scope, receive, send, 413, "request body too large")
+
+
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
 @app.post("/api/torrents/add")
@@ -513,13 +616,23 @@ def batch_torrent(body: BatchAction, _user: str = Depends(require_auth)):
     else:
         normalized_path = ""
 
+    if len(body.ids) > 256:
+        raise HTTPException(status_code=400, detail="批量任务最多 256 个")
     ids = [str(item).strip() for item in body.ids if str(item).strip()]
     if qbit and body.category:
         details = providers._qbit.torrent_details()
         if not getattr(providers._qbit, "_last_details_ok", True):
             raise HTTPException(status_code=502, detail="读取 qBittorrent 任务失败")
-        category_ids = {str(item.get("hash") or "") for item in details if str(item.get("category") or "").strip() == body.category}
+        category_ids = {
+            str(item.get("hash") or "") for item in details
+            if str(item.get("category") or "").strip() == body.category
+            and providers.QbittorrentProvider._valid_hash(str(item.get("hash") or ""))
+        }
         ids = [item for item in (ids or sorted(category_ids)) if item in category_ids]
+    if len(ids) > 256:
+        raise HTTPException(status_code=400, detail="批量任务最多 256 个")
+    if qbit:
+        ids = [_qbit_hash(item) for item in ids]
     if not ids:
         raise HTTPException(status_code=400, detail="没有可操作的任务")
     done = failed = 0
@@ -565,6 +678,7 @@ class TorrentAdvancedAction(BaseModel):
 
 @app.get("/api/torrents/detail")
 def torrent_detail(hash: str, _user: str = Depends(require_auth)):
+    hash = _qbit_hash(hash)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入")
     ok, detail, error = providers._qbit.torrent_detail(hash)
@@ -575,6 +689,7 @@ def torrent_detail(hash: str, _user: str = Depends(require_auth)):
 
 @app.post("/api/torrents/advanced")
 def torrent_advanced(body: TorrentAdvancedAction, _user: str = Depends(require_auth)):
+    torrent_id = _qbit_hash(body.id)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入")
     location = ""
@@ -594,7 +709,7 @@ def torrent_advanced(body: TorrentAdvancedAction, _user: str = Depends(require_a
         if body.action == "set_file_selection" and (not body.all_file_ids or len(body.all_file_ids) > 4096):
             raise HTTPException(status_code=400, detail="文件选择参数无效")
     ok, detail = providers._qbit.advanced_action(
-        body.id, body.action, value=limit, delete_files=body.delete_files, location=location,
+        torrent_id, body.action, value=limit, delete_files=body.delete_files, location=location,
         file_ids=body.file_ids, all_file_ids=body.all_file_ids, priority=body.priority,
     )
     if not ok:
@@ -700,11 +815,12 @@ def delete_torrent_tags(body: TorrentTagsBody, _user: str = Depends(require_auth
 
 @app.post("/api/torrents/labels")
 def update_torrent_labels(body: TorrentLabelsBody, _user: str = Depends(require_auth)):
+    torrent_id = _qbit_hash(body.id)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入")
     category = None if body.category is None else _qbit_category(body.category)
     tags = None if body.tags is None else _qbit_tags(body.tags)
-    ok, detail, error = providers._qbit.update_labels(body.id, category, tags)
+    ok, detail, error = providers._qbit.update_labels(torrent_id, category, tags)
     if not ok:
         raise HTTPException(status_code=400, detail=error)
     return {"ok": True, "torrent": detail}
@@ -718,8 +834,10 @@ class TorrentAction(BaseModel):
 def torrent_action(action: str, body: TorrentAction, _user: str = Depends(require_auth)):
     if action not in ("remove", "pause", "resume"):
         raise HTTPException(status_code=400, detail="unknown action")
-    if providers._qbit.available() and providers._qbit.action(body.id, action):
-        return {"ok": True, "mode": "qbittorrent"}
+    if providers._qbit.available():
+        torrent_id = _qbit_hash(body.id)
+        ok = providers._qbit.action(torrent_id, action)
+        return {"ok": ok, "mode": "qbittorrent" if ok else ""}
     ok = providers.mutate(body.id, action)
     return {"ok": ok, "mode": "demo" if ok else ""}
 
@@ -736,7 +854,7 @@ def torrent_destination_retry(body: TorrentAction, _user: str = Depends(require_
 def torrent_peers(hash: str, _user: str = Depends(require_auth)):
     """某个种子的当前对等方（谁在从我们这里下载）。"""
     if providers._qbit.available():
-        return providers._qbit.peers(hash)
+        return providers._qbit.peers(_qbit_hash(hash))
     return {"peers": [], "connected": 0, "seeds": 0, "leechers": 0}
 
 
@@ -795,16 +913,34 @@ def preview_torrent_policies(_user: str = Depends(require_auth)):
 
 class TorrentPoliciesApplyBody(BaseModel):
     confirm: bool = False
+    dry_run: bool = False
 
 
 @app.post("/api/torrents/policies/apply")
 def apply_torrent_policies(body: TorrentPoliciesApplyBody, _user: str = Depends(require_auth)):
     if not body.confirm:
         raise HTTPException(status_code=400, detail="请明确确认后应用策略")
-    ok, data, detail = providers.apply_torrent_policies(confirm=True)
+    ok, data, detail = providers.apply_torrent_policies(confirm=True, dry_run=body.dry_run)
     if not ok:
         raise HTTPException(status_code=503, detail=detail)
     return {"ok": True, **data}
+
+
+@app.get("/api/torrents/policies/undo")
+def torrent_policy_undo_list(_user: str = Depends(require_auth)):
+    return {"items": providers.policy_undo_list()}
+
+
+class PolicyUndoBody(BaseModel):
+    id: str
+
+
+@app.post("/api/torrents/policies/undo")
+def torrent_policy_undo(body: PolicyUndoBody, _user: str = Depends(require_auth)):
+    ok, detail = providers.policy_undo_execute(body.id)
+    if not ok:
+        raise HTTPException(status_code=409, detail=detail)
+    return {"ok": True, "detail": detail}
 
 
 class QbitQueueBody(BaseModel):
@@ -1144,6 +1280,288 @@ def info(_user: str = Depends(require_auth)):
 
 
 # ---------------------------------------------------------------------------
+# RSS 自动订阅（qBittorrent 内置 RSS 引擎：抓取/匹配/自动下载由 qbit 完成，
+# Aurora 负责订阅源与规则的管理、匹配预览和审计日志）
+
+
+def _require_qbit():
+    if not providers._qbit.available():
+        raise HTTPException(status_code=503, detail="qBittorrent 未接入")
+
+
+@app.get("/api/rss/overview")
+def rss_overview(_user: str = Depends(require_auth)):
+    _require_qbit()
+    ok, data, detail = providers._qbit.rss_overview()
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    return data
+
+
+class RssFeedBody(BaseModel):
+    path: str
+    url: str = ""
+    new_path: str = ""
+
+
+def _rss_feed_done(ok: bool, detail: str, event: str, path: str):
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    providers._log(f"rss.{event}", path)
+    return {"ok": True}
+
+
+@app.post("/api/rss/feeds/add")
+def rss_feed_add(body: RssFeedBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    if not providers._valid_rss_path(body.path):
+        raise HTTPException(status_code=400, detail="订阅名称无效（不支持 / \\ 等字符）")
+    url = body.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="订阅 URL 必须是 http(s) 链接")
+    ok, detail = providers._qbit.rss_add_feed(body.path.strip(), url)
+    return _rss_feed_done(ok, detail, "feed.add", body.path)
+
+
+@app.post("/api/rss/feeds/remove")
+def rss_feed_remove(body: RssFeedBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    if not body.path.strip():
+        raise HTTPException(status_code=400, detail="订阅路径无效")
+    ok, detail = providers._qbit.rss_remove_item(body.path.strip())
+    return _rss_feed_done(ok, detail, "feed.remove", body.path)
+
+
+@app.post("/api/rss/feeds/rename")
+def rss_feed_rename(body: RssFeedBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    if not providers._valid_rss_path(body.new_path):
+        raise HTTPException(status_code=400, detail="新名称无效（不支持 / \\ 等字符）")
+    ok, detail = providers._qbit.rss_rename_item(body.path.strip(), body.new_path.strip())
+    return _rss_feed_done(ok, detail, "feed.rename", f"{body.path} -> {body.new_path}")
+
+
+@app.post("/api/rss/feeds/url")
+def rss_feed_url(body: RssFeedBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    url = body.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="订阅 URL 必须是 http(s) 链接")
+    ok, detail = providers._qbit.rss_set_feed_url(body.path.strip(), url)
+    return _rss_feed_done(ok, detail, "feed.url", body.path)
+
+
+@app.post("/api/rss/feeds/refresh")
+def rss_feed_refresh(body: RssFeedBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    ok, detail = providers._qbit.rss_refresh(body.path.strip())
+    return _rss_feed_done(ok, detail, "feed.refresh", body.path)
+
+
+class RssRuleBody(BaseModel):
+    name: str
+    enabled: bool = True
+    use_regex: bool = False
+    must_contain: str = ""
+    must_not_contain: str = ""
+    episode_filter: str = ""
+    affected_feeds: list[str] = []
+    save_path: str = ""
+    category: str = ""
+    tags: list[str] = []
+    destination_remote: str = ""
+    destination_path: str = ""
+
+
+def _rss_rule_from_body(body: RssRuleBody) -> dict:
+    rule = body.model_dump()
+    # 匹配表达式先做可编译性校验，坏正则会让 qbit 端规则永远静默不命中
+    for key in ("must_contain", "must_not_contain"):
+        value = str(rule.get(key) or "")
+        if value and rule.get("use_regex"):
+            parts = value if "|" not in value or "{{" in value else value
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise HTTPException(status_code=400, detail=f"{key} 正则无效：{exc}")
+    for feed in rule.get("affected_feeds") or []:
+        if not providers._valid_rss_path(feed):
+            raise HTTPException(status_code=400, detail=f"订阅路径无效：{feed}")
+    if rule.get("save_path"):
+        sp = str(rule["save_path"]).strip()
+        if not sp.startswith("/downloads") or ".." in sp or len(sp) > 512:
+            raise HTTPException(status_code=400, detail="保存目录必须是 /downloads 内的路径")
+    clean_tags = providers.QbittorrentProvider._clean_labels(rule.get("tags") or [])
+    if body.destination_remote.strip():
+        # 复用磁力转存的标记机制：带标记 tag 的任务完成后由既有调度器自动上传
+        marker, _path, error = providers.register_torrent_destination(
+            body.destination_remote.strip(), body.destination_path.strip())
+        if not marker:
+            raise HTTPException(status_code=400, detail=error or "网盘目标无效")
+        clean_tags.append(marker)
+    rule["tags"] = clean_tags
+    rule.pop("destination_remote", None)
+    rule.pop("destination_path", None)
+    return rule
+
+
+@app.post("/api/rss/rules/save")
+def rss_rule_save(body: RssRuleBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    if not providers._valid_rss_path(body.name):
+        raise HTTPException(status_code=400, detail="规则名称无效（不支持 / \\ 等字符）")
+    rule = _rss_rule_from_body(body)
+    ok, detail = providers._qbit.rss_save_rule(body.name.strip(), providers._rss_rule_def(rule))
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    providers._log("rss.rule.save",
+                   f"{body.name} · {'启用' if body.enabled else '停用'} · 分类 {body.category or '无'}")
+    return {"ok": True}
+
+
+@app.post("/api/rss/rules/remove")
+def rss_rule_remove(body: RssRuleBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    ok, detail = providers._qbit.rss_remove_rule(body.name.strip())
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    providers._log("rss.rule.remove", body.name)
+    return {"ok": True}
+
+
+@app.post("/api/rss/rules/rename")
+def rss_rule_rename(body: RssRuleBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    if not providers._valid_rss_path(body.new_path or ""):
+        raise HTTPException(status_code=400, detail="新规则名称无效")
+    ok, detail = providers._qbit.rss_rename_rule(body.name.strip(), body.new_path.strip())
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    providers._log("rss.rule.rename", f"{body.name} -> {body.new_path}")
+    return {"ok": True}
+
+
+class RssPreviewBody(BaseModel):
+    name: str
+
+
+@app.post("/api/rss/preview")
+def rss_preview(body: RssPreviewBody, _user: str = Depends(require_auth)):
+    _require_qbit()
+    # matchingArticles 只对已保存的规则生效：先保存（可保持停用）再预览
+    ok, items, detail = providers._qbit.rss_matching(body.name.strip())
+    if not ok:
+        raise HTTPException(status_code=502, detail=detail)
+    return {"items": items}
+
+# ---------------------------------------------------------------------------
+# online update check (GitHub Releases)
+
+
+def _parse_version(value: str) -> tuple:
+    """解析 SemVer 风格版本号用于比较。
+
+    返回 (major, minor, patch, is_stable, prerelease)。按 SemVer 规则，
+    预发布版本低于同号正式版：1.2.3-rc.1 < 1.2.3。预发布段之间按字符串
+    比较（rc.10 与 rc.9 的排序不精确），仅作尽力比较，正式发版不受影响。
+    主版本段必须是纯数字，否则整体按 0.0.0 处理（垃圾输入不会误报有更新）。
+    """
+    v = str(value or "").strip().lstrip("vV")
+    main, _, pre = v.partition("-")
+    parts = main.split(".")[:3]
+    if not parts or parts[0] == "" or not all(p.isdigit() for p in parts):
+        return (0, 0, 0, 1, "")
+    nums = [int(p) for p in parts]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2], 0 if pre else 1, pre)
+
+
+UPDATE_TTL = 30 * 60
+UPDATE_REPO_DEFAULT = "lengxiv/aurora"
+# 模块级缓存：未认证的 GitHub API 限额 60 次/小时/IP，缓存兜底避免设置页
+# 每次打开都打一次 Releases 接口
+_UPDATE_CACHE: dict = {}
+_UPDATE_LOCK = threading.Lock()
+
+
+def _github_repo() -> str:
+    repo = os.environ.get("AURORA_REPO", UPDATE_REPO_DEFAULT).strip().strip("/")
+    if repo.startswith(("http://", "https://")):
+        # 允许配置完整仓库 URL，取 path 部分作为 owner/repo
+        repo = re.sub(r"^https?://[^/]+/", "", repo).removesuffix(".git")
+    return repo
+
+
+def _github_latest_release(repo: str) -> dict:
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        r = requests.get(
+            url,
+            timeout=(4, 8),
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "aurora-media-hub",
+            },
+        )
+    except requests.Timeout:
+        raise RuntimeError("GitHub 请求超时")
+    except requests.RequestException as e:
+        raise RuntimeError(f"GitHub 不可达：{e.__class__.__name__}")
+    if r.status_code == 404:
+        raise LookupError("仓库不存在、不可见，或还没有发布任何 Release")
+    if r.status_code in (403, 429):
+        raise RuntimeError("GitHub API 限流或被拒绝，请稍后再试")
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub 返回 HTTP {r.status_code}")
+    data = r.json()
+    tag = str(data.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("Release 响应缺少 tag_name")
+    return {
+        "tag": tag,
+        "latest": tag.lstrip("vV"),
+        "url": str(data.get("html_url") or f"https://github.com/{repo}/releases"),
+        "published_at": str(data.get("published_at") or ""),
+    }
+
+
+@app.get("/api/update/check")
+def update_check(force: int = 0, _user: str = Depends(require_auth)):
+    # 失败必须可区分：返回 ok=False 与原因，而不是抛 500，方便设置页展示
+    current = APP_VERSION
+    repo = _github_repo()
+    if not repo:
+        return {"ok": False, "current": current, "detail": "未配置 AURORA_REPO，无法在线检查更新"}
+    now = time.time()
+    with _UPDATE_LOCK:
+        cached = dict(_UPDATE_CACHE) if now - _UPDATE_CACHE.get("at", 0.0) < UPDATE_TTL else None
+    from_cache = cached is not None and not force
+    if force or not cached:
+        try:
+            release = _github_latest_release(repo)
+        except Exception as e:
+            return {"ok": False, "current": current, "detail": str(e) or "检查更新失败"}
+        with _UPDATE_LOCK:
+            _UPDATE_CACHE.clear()
+            _UPDATE_CACHE.update({"at": now, **release})
+        cached = {"at": now, **release}
+    latest = str(cached.get("latest") or "")
+    return {
+        "ok": True,
+        "repo": repo,
+        "current": current,
+        "latest": latest,
+        "tag": cached.get("tag", ""),
+        "url": cached.get("url", ""),
+        "published_at": cached.get("published_at", ""),
+        "checked_at": int(cached.get("at", 0)),
+        "cached": from_cache,
+        "update_available": _parse_version(latest) > _parse_version(current),
+    }
+
+
+# ---------------------------------------------------------------------------
 # local media browser
 
 _VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".mpg", ".mpeg", ".m4v"}
@@ -1375,7 +1793,8 @@ def media_trash_restore(body: media_path_body, _user: str = Depends(require_auth
         raise HTTPException(status_code=404, detail="回收站项目不存在")
     src = _media_base().resolve() / ".aurora-trash" / item["id"]
     dst = _media_safe(Path(item["path"]))
-    if not src.is_file():
+    # 策略清理入站的是整个种子目录，回收站条目可能是目录
+    if not src.is_file() and not src.is_dir():
         raise HTTPException(status_code=404, detail="回收站文件不存在")
     if dst.exists():
         raise HTTPException(status_code=409, detail="原路径已有同名文件")
@@ -1392,11 +1811,75 @@ def media_trash_purge(body: media_path_body, _user: str = Depends(require_auth))
     if not item:
         raise HTTPException(status_code=404, detail="回收站项目不存在")
     src = _media_base().resolve() / ".aurora-trash" / item["id"]
-    if src.exists():
+    if src.is_dir():
+        shutil.rmtree(src)
+    elif src.exists():
         src.unlink()
     providers.trash_remove(item["id"])
     providers._log("media.purge", item["path"])
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# 下载完成自动整理
+
+
+@app.get("/api/media/organize")
+def media_organize_get(_user: str = Depends(require_auth)):
+    return providers.media_organize_settings()
+
+
+class MediaOrganizeRuleBody(BaseModel):
+    id: str = ""
+    name: str = ""
+    category: str = ""
+    enabled: bool = True
+    target_dir: str = ""
+    mode: str = "hardlink"
+    use_subfolder: bool = True
+    min_size_mb: int = 0
+
+
+class MediaOrganizeBody(BaseModel):
+    enabled: bool = False
+    interval: int = 300
+    jellyfin_refresh: bool = True
+    rules: list[MediaOrganizeRuleBody] = []
+
+
+@app.post("/api/media/organize")
+def media_organize_save(body: MediaOrganizeBody, _user: str = Depends(require_auth)):
+    saved = providers.save_media_organize_settings(body.model_dump())
+    return {"ok": True, **saved}
+
+
+@app.get("/api/media/organize/preview")
+def media_organize_preview(_user: str = Depends(require_auth)):
+    ok, data, detail = providers.preview_media_organize()
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
+    return data
+
+
+class MediaOrganizeApplyBody(BaseModel):
+    confirm: bool = False
+    dry_run: bool = False
+
+
+@app.post("/api/media/organize/apply")
+def media_organize_apply(body: MediaOrganizeApplyBody, _user: str = Depends(require_auth)):
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="请明确确认后执行整理")
+    ok, data, detail = providers.apply_media_organize(confirm=True, dry_run=body.dry_run)
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
+    return {"ok": True, **data}
+
+
+@app.get("/api/media/organize/history")
+def media_organize_history(_user: str = Depends(require_auth)):
+    items = providers.media_organize_settings()["history"]
+    return {"items": list(reversed(items))[-50:]}
 
 
 @app.post("/api/media/rename")
@@ -1447,6 +1930,7 @@ class media_move_seed_body(BaseModel):
 @app.post("/api/media/move_seed")
 def media_move_seed(body: media_move_seed_body, _user: str = Depends(require_auth)):
     """整种子联动移动：qbit setLocation 搬文件并更新路径，保持做种。dir 为宿主相对目录。"""
+    torrent_id = _qbit_hash(body.hash)
     if not providers._qbit.available():
         raise HTTPException(status_code=503, detail="qBittorrent 未接入")
     base = _media_base().resolve()
@@ -1455,7 +1939,7 @@ def media_move_seed(body: media_move_seed_body, _user: str = Depends(require_aut
         raise HTTPException(status_code=400, detail="bad target")
     rel = target.relative_to(base).as_posix()
     loc = "/downloads" + (("/" + rel) if rel else "")
-    if not providers._qbit.move_seed(body.hash, loc):
+    if not providers._qbit.move_seed(torrent_id, loc):
         raise HTTPException(status_code=502, detail="qBittorrent 移动种子失败")
     return {"ok": True, "new": rel}
 
@@ -1646,14 +2130,10 @@ def jf_stream(item_id: str, request: Request, _user: str = Depends(require_auth)
             up.close()
 
     return StreamingResponse(gen(), status_code=up.status_code, headers=hdr)
-
-
-# ---------------------------------------------------------------------------
-# SPA
-
-if STATIC_DIR.exists():
+if (STATIC_DIR / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
 
+if (STATIC_DIR / "index.html").is_file():
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str, request: Request, sid: str | None = Cookie(default=None, alias=_COOKIE)):
         # always allow the login screen + its assets

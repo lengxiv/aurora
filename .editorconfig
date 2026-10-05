@@ -1,0 +1,21 @@
+# EditorConfig: https://editorconfig.org
+# 统一缩进与换行，避免跨编辑器产生无意义 diff
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{ts,tsx,js,jsx,json,yml,yaml,css,html,svg}]
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[Makefile]
+indent_style = tab

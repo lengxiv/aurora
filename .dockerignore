@@ -1,0 +1,39 @@
+# 构建上下文只保留镜像需要的源码；其余一律排除，加速构建并避免敏感文件进入镜像层
+
+# 版本控制与 CI
+.git
+.github
+.gitignore
+
+# 运行数据与本地环境（绝不进入镜像）
+.env
+.env.*
+!.env.example
+backend/data/
+backend/.venv/
+backend/.auth
+backend/.secret
+qbit/
+jellyfin/
+
+# 构建产物（镜像内由多阶段构建重新生成）
+backend/static/
+frontend/node_modules/
+frontend/dist/
+
+# Python 缓存
+**/__pycache__/
+**/*.pyc
+
+# 文档与宿主机部署脚本（镜像内不需要）
+docs/
+deploy/
+scripts/
+tests/
+*.md
+TODO.md
+
+# 容器定义自身
+Dockerfile
+.dockerignore
+compose.yaml

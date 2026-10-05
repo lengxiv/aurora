@@ -1,0 +1,79 @@
+name: Release
+
+# 发布流程：更新 VERSION + CHANGELOG → 打 tag vX.Y.Z → push tag。
+# 本流水线校验 tag 与 VERSION 一致，构建并推送镜像到 GHCR，创建 GitHub Release。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag 必须与 VERSION 文件一致
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          f="$(tr -d ' \t\r\n' < VERSION)"
+          echo "tag=${v} VERSION=${f}"
+          [ "$v" = "$f" ] || { echo "::error::tag v${v} 与 VERSION(${f}) 不一致，请先更新 VERSION"; exit 1; }
+
+  image:
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # 发布 0.4.0 会得到 0.4.0 与 0.4 两个标签；刻意不打 latest，
+          # latest 由部署方自行选择跟随哪个版本，避免隐式漂移
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=Aurora Media Hub
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [verify-tag, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 提取 CHANGELOG 中对应日期段落作为发布说明
+        id: notes
+        run: |
+          # CHANGELOG 采用 "## YYYY-MM-DD" 分节；取第一节的正文
+          body="$(awk '/^## [0-9]{4}-[0-9]{2}-[0-9]{2}/{if (found) exit; found=1; next} found{print}' CHANGELOG.md)"
+          if [ -z "$body" ]; then body="See commit history for details."; fi
+          {
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          generate_release_notes: true

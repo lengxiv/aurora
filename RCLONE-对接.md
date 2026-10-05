@@ -1,6 +1,6 @@
 # Aurora · rclone 网盘对接指南
 
-> 2026-08-14 启用。rclone v1.75.0 + systemd `rclone-rcd.service`（:5572，回环，POST rc API）。
+> 2026-08-14 启用。rclone v1.75.0 + systemd `rclone-rc.service`（:5572，回环，POST rc API）。
 > Aurora 后端 `RcloneProvider` 已适配：探测/调用走 POST，`--rc-serve` 无效已去掉。
 > rclone 在线但**未配置 remote 时自动回退本地盘**；配置 remote 后自动切换，前端零改动。
 
@@ -9,7 +9,7 @@
 | 项 | 值 |
 |----|----|
 | rclone | `/usr/bin/rclone` v1.75.0 |
-| rc 服务 | `rclone-rcd.service`（enabled，开机自启） |
+| rc 服务 | `rclone-rc.service`（enabled，开机自启） |
 | rc 端点 | `http://127.0.0.1:5572/rclone`（仅回环） |
 | 认证 | Basic Auth（账号和密码由部署环境管理） |
 | 可视化配置入口 | **https://<your-domain>/rclone/**（如启用公网入口，必须经过 HTTPS 和访问控制） |
@@ -102,17 +102,18 @@ rclone config
 | 现象 | 原因/处理 |
 |------|-----------|
 | `GET /core/version` 返回 404 | rclone rc API 只接受 **POST**（Aurora 已改 POST，此现象只影响手动 curl） |
-| 配置了 remote 但 Aurora 仍显示「本地」 | 检查 WebUI 里 remote 是否保存成功；看 `journalctl -u rclone-rcd` |
+| 配置了 remote 但 Aurora 仍显示「本地」 | 检查 WebGUI 里 remote 是否保存成功；看 `journalctl -u rclone-rc` |
 | 挂载容量显示 `—` | rclone rc 无容量协议，属预期；容量看 WebUI 或 `rclone about <remote>:` |
 | 想隐藏某 remote | WebUI Configs 里 Delete，或编辑 `~/.config/rclone/rclone.conf` |
 
 ## 运维
 
 ```bash
-systemctl status rclone-rcd    # rc 服务状态
-journalctl -u rclone-rcd -n 50 # 日志
-systemctl restart rclone-rcd   # 改配置后无需重启（配置动态读），仅服务异常时用
+systemctl status rclone-rc    # rc 服务状态
+journalctl -u rclone-rc -n 50 # 日志
+systemctl restart rclone-rc   # 改配置后重启服务
 ```
 
-- rclone.conf 含网盘 token，注意权限（`chmod 600 /root/.config/rclone/rclone.conf`）
-- rc 服务仅监听回环 + no-auth，公网不可达；若未来要公网暴露必须加 `--rc-user/--rc-pass` 并同步改 Aurora 认证逻辑
+- rclone.conf 含网盘 token，注意权限（`chmod 600 /var/lib/aurora/rclone/rclone.conf`）。
+- `/rclone/` 由 Nginx Basic Auth 保护，且 rclone RC 自身也启用 `--rc-user/--rc-pass`；两边凭据必须一致，htpasswd 文件权限建议为 600。
+- systemd 示例使用 `--rc-baseurl /rclone/ --rc-web-gui --rc-web-gui-no-open-browser`，Aurora 的 `AURORA_RCLONE_RC` 应填写 `http://127.0.0.1:5572/rclone`。

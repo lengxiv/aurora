@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
-import { Search, LayoutGrid, MonitorPlay, Activity, Settings as SettingsIcon, LogOut, RefreshCw, CornerDownLeft, Upload } from 'lucide-react'
+import { Search, LayoutGrid, MonitorPlay, Activity, Settings as SettingsIcon, LogOut, RefreshCw, CornerDownLeft, Upload, Rss, Cloud } from 'lucide-react'
 
 interface Cmd {
   id: string
@@ -35,6 +35,8 @@ export default function CommandPalette({ onLogout }: { onLogout: () => void }) {
   const cmds = useMemo<Cmd[]>(() => [
     { id: 'home', label: '资源管理台', sub: '挂载 / 磁力 / 磁盘', icon: LayoutGrid, run: () => nav('/') },
     { id: 'seeding', label: '做种监控', sub: '分享率 / 上传 / 对等方', icon: Upload, run: () => nav('/seeding') },
+    { id: 'rss', label: 'RSS 订阅', sub: '订阅源 / 自动下载规则', icon: Rss, run: () => nav('/rss') },
+    { id: 'netdisk', label: '网盘', sub: 'remote / 传输', icon: Cloud, run: () => nav('/netdisk') },
     { id: 'player', label: '媒资库', sub: '浏览 / 播放', icon: MonitorPlay, run: () => nav('/player') },
     { id: 'monitor', label: '实时监控大屏', sub: '带宽 / 队列 / 日志', icon: Activity, run: () => nav('/monitor') },
     { id: 'settings', label: '设置', sub: '服务 / 数据源', icon: SettingsIcon, run: () => nav('/settings') },

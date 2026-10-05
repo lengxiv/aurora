@@ -1,11 +1,12 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
-import { Gauge, MonitorPlay, Activity, Loader, LogOut, Settings as SettingsIcon, Command, Upload, Cloud } from 'lucide-react'
+import { Gauge, MonitorPlay, Activity, Loader, LogOut, Settings as SettingsIcon, Command, Upload, Cloud, Rss } from 'lucide-react'
 import ConsoleView from './views/Console'
 import PlayerView from './views/Player'
 import MonitorView from './views/Monitor'
 import SeedingView from './views/Seeding'
 import SettingsView from './views/Settings'
 import NetdiskView from './views/Netdisk'
+import RssView from './views/Rss'
 import Login from './views/Login'
 import { useAuth } from './auth'
 import CommandPalette from './CommandPalette'
@@ -15,6 +16,7 @@ import { MetricsProvider } from './lib/api'
 const NAV = [
   { to: '/', label: '管理台', icon: Gauge, end: true },
   { to: '/seeding', label: '做种监控', icon: Upload, end: false },
+  { to: '/rss', label: 'RSS 订阅', icon: Rss, end: false },
   { to: '/netdisk', label: '网盘', icon: Cloud, end: false },
   { to: '/player', label: '媒资库', icon: MonitorPlay, end: false },
   { to: '/monitor', label: '实时监控', icon: Activity, end: false },
@@ -96,6 +98,7 @@ function Shell() {
           <Routes>
             <Route path="/" element={<ConsoleView />} />
             <Route path="/seeding" element={<SeedingView />} />
+            <Route path="/rss" element={<RssView />} />
             <Route path="/netdisk" element={<NetdiskView />} />
             <Route path="/player" element={<PlayerView />} />
             <Route path="/monitor" element={<MonitorView />} />

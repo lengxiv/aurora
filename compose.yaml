@@ -1,10 +1,47 @@
 services:
+  # Aurora 应用本体：FastAPI 托管前端构建产物，健康检查内置在镜像里。
+  # 生产建议直接拉发版镜像（docker compose pull aurora）；
+  # 本地 `docker compose build aurora` 从源码构建。
+  aurora:
+    build: .
+    # 发版流水线会推送 semver 标签；本地构建会被打成同名镜像，
+    # 建议用 AURORA_IMAGE_TAG 钉住版本（如 0.4.0），不要在生产跟 :latest 漂移
+    image: ghcr.io/lengxiv/aurora:${AURORA_IMAGE_TAG:-latest}
+    container_name: aurora
+    restart: unless-stopped
+    ports:
+      # 与 systemd 部署一致只绑回环，公网流量经 Nginx 反代进入
+      - "127.0.0.1:8787:8787"
+    environment:
+      # 在线检查更新用的仓库（设置页「检查更新」）
+      AURORA_REPO: ${AURORA_REPO:-lengxiv/aurora}
+      AURORA_LOCAL_MOUNT: /srv/aurora/media
+      # 容器网络内用服务名互访；rclone 跑在宿主机时经 host-gateway 访问。
+      # 注意 environment 优先级高于 env_file：要覆盖这里的默认值，
+      # 请在 compose 同目录 .env 中设置同名变量，或直接修改本段
+      AURORA_QBIT_URL: ${AURORA_QBIT_URL:-http://qbittorrent:8080}
+      AURORA_JELLYFIN: ${AURORA_JELLYFIN:-http://jellyfin:8096}
+      AURORA_RCLONE_RC: ${AURORA_RCLONE_RC:-http://host.docker.internal:5572/rclone}
+    env_file:
+      # 凭据等敏感配置放私有环境文件（AURORA_AUTH_PASS、qbit/Jellyfin 账号等）。
+      # 文件不存在时 compose 会启动失败：请先 `cp .env.example /etc/aurora.env`
+      # 或用 AURORA_ENV_FILE 指向其他路径
+      - ${AURORA_ENV_FILE:-/etc/aurora.env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 运行状态/会话密钥/活动日志必须持久化；宿主机目录属主应为 1000:1000
+      - ${AURORA_ROOT:-/opt/aurora}/aurora-state:/var/lib/aurora
+      # 媒资库直接挂 qBittorrent 下载目录（与 compose 内 qbit 服务共享）
+      - ${AURORA_ROOT:-/opt/aurora}/qbit/downloads:/srv/aurora/media
+
   qbittorrent:
     # 可复现部署建议钉住具体版本（如 5.x.y 或 5.x.y-lsNNN）：
     # 在部署机执行 `docker exec qbittorrent appVersion` 或查
     # hub.docker.com/r/linuxserver/qbittorrent/tags 确认当前版本后再固定，
     # 避免跟随 :latest 漂移破坏 API 兼容（qbit 5.x 曾移除 pause/resume 接口）。
-    image: linuxserver/qbittorrent:latest
+    # 通过 .env 设置 QBIT_TAG 即可钉版本，无需改动本文件
+    image: linuxserver/qbittorrent:${QBIT_TAG:-latest}
     container_name: qbittorrent
     restart: unless-stopped
     environment:
@@ -24,7 +61,7 @@ services:
       - ${AURORA_ROOT:-/opt/aurora}/qbit/downloads:/downloads
 
   jellyfin:
-    image: jellyfin/jellyfin:latest
+    image: jellyfin/jellyfin:${JELLYFIN_TAG:-latest}
     container_name: jellyfin
     restart: unless-stopped
     environment:

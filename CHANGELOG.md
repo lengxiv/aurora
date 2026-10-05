@@ -2,6 +2,31 @@
 
 这里记录面向用户的功能变更、重要修复、验证结果和部署提交。功能现状请查看 [`FEATURES.md`](FEATURES.md)。
 
+## 2026-10-05（第二批 · 闭环批次）
+
+### RSS 自动订阅 / 下载完成自动整理 / 策略清理可撤销
+
+- RSS 自动订阅：新增 `/rss` 视图与 `/api/rss/*` 端点，基于 qBittorrent 内置 RSS 引擎（Aurora 不重复实现抓取与匹配）。订阅源管理与手动刷新；规则支持包含/排除关键字或正则（保存前做正则可编译性校验）、集数过滤、作用订阅源多选、命中自动分类与保存目录（限 `/downloads` 内）、完成后自动转存网盘（复用 `aurora-remote-*` 转存标记与既有调度器）；匹配预览按已保存规则执行。规则定义对 qBittorrent 4.1–4.5 与 5.x 双写兼容（`torrentParams` + 旧字段）。
+- 下载完成自动整理：设置页新增面板；按「分类 → 媒体库目录」规则处理完成任务，模式为硬链接（默认，推荐）/拷贝/移动；硬链接保持同 inode、源文件不动、做种不中断；移动模式在跨磁盘时拒绝并提示改用硬链接/拷贝，受保护任务（保护标签、转存未完成）不可移动；目标已存在一律跳过不覆盖；按 Hash 记录处理历史防重复；整理后可自动触发 Jellyfin `/Library/Refresh`；支持预览与预演。媒体库目录限媒体根内相对路径（拒绝绝对路径/`..`/回收站目录）。
+- 做种策略可撤销与预演：`/api/torrents/policies/apply` 支持 `dry_run`（完整判定、零副作用，预演中标注每项「可撤销/不可恢复」）；策略删除改为回收站式——先经 `/api/v2/torrents/export` 留档 `.torrent`（磁力任务无元数据，不留档无法恢复），内容整体移入 `.aurora-trash`（与媒资回收站共用，UI 可见可恢复），再移除任务本体；新增 `GET/POST /api/torrents/policies/undo`，一键撤销 = 文件回原位 + 留档重加任务（原路径被占用时拒绝覆盖并中止）；撤销记录保留 7 天、上限 50 条。回收站恢复/彻底删除端点支持目录条目（此前仅单文件）。
+- 修复 `_clean_org_target` 对绝对路径误放行的问题（`/abs/path` 被 strip 洗成相对路径，测试先行暴露）；`providers.py` 修复一处历史遗留的重复 `else` 语法错误（该错误曾导致整个后端无法启动）。
+
+### 验证
+
+- 后端 102 项测试通过（新增 13 项：预演零副作用、删除→回收站→撤销闭环、整理硬链接同 inode 验证、冲突不覆盖、规则格式双写、feeds 树拍平、路径校验等）。
+- 前端 `npm run lint` 零错误、生产构建通过；多阶段镜像构建、容器启动 `/api/health` 冒烟待 CI/部署机复验。
+
+## 2026-10-05
+
+### 容器化部署、版本管理与在线检查更新
+
+- 容器：新增多阶段 `Dockerfile`（Node 22 编译前端 → Python 3.11-slim 非 root 运行，UID/GID 1000，内置 HEALTHCHECK 探测 `/api/health`，OCI 标准 label），新增 `.dockerignore`；`compose.yaml` 新增 `aurora` 服务（状态卷 `aurora-state`、媒体卷、`env_file` 注入凭据、容器网络内经服务名互连 rclone/qBittorrent/Jellyfin），qBittorrent/Jellyfin 镜像改为可用 `QBIT_TAG`/`JELLYFIN_TAG` 钉版本；`docs/DEPLOYMENT.md` 新增第 13 节容器化部署（首次启动、全栈、更新回滚、排查）。
+- 版本：根目录新增 `VERSION` 作为版本号单一来源（当前 0.4.0）。后端启动时读取并暴露在 `/api/health` 与 `/api/info`（`AURORA_VERSION` 可覆盖）；前端由 Vite 构建时注入 `__APP_VERSION__`，设置页区分显示「后端版本 / 前端构建」，便于发现静态资源滞后；`frontend/package.json` 同步为 0.4.0，CI 校验两者一致。
+- 在线检查更新：新增 `GET /api/update/check`（需登录），对比 GitHub Releases 最新 tag 与当前版本（SemVer 比较，预发布低于同号正式版），服务端缓存 30 分钟兜底 API 限额，失败返回原因不抛 500；仓库可用 `AURORA_REPO` 覆盖（支持 owner/repo 或完整 URL）。设置页「服务」面板新增「检查更新」入口：自动检查 + 手动强制刷新，发现新版本显示发布说明链接。
+- CI/CD：`ci.yml` 新增版本一致性 job（VERSION vs package.json）与镜像构建 job（buildx 构建后起容器跑 `/api/health` 冒烟）；新增 `release.yml`——推送 `vX.Y.Z` 标签时校验 tag 与 VERSION 一致，构建 amd64/arm64 镜像推送 GHCR（`X.Y.Z` 与 `X.Y` 标签，不打 latest），并以 CHANGELOG 最新小节创建 GitHub Release。
+- 维护规则：新增 `CONTRIBUTING.md`（代码规范、Conventional Commits、SemVer 升级规则、发布 checklist、分支/PR、文档同步义务、安全红线、容器规范）与 `.editorconfig`；README/DEPLOYMENT/GITHUB 同步更新。
+- 部署注意：`/api/health` 现在返回 `version` 字段（供探针与自动更新检查使用）；容器内 uvicorn 开启 `--proxy-headers` 并信任内网网段，nginx 追加的 `X-Forwarded-For` 右起第一个非受信地址即真实客户端，登录失败限流仍按真实 IP 计数，客户端伪造的头不生效。
+
 ## 2026-09-25
 
 ### 安全审计修复（P0/P1）

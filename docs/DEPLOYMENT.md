@@ -12,6 +12,11 @@
 
 qBittorrent、Jellyfin 和 rclone 是可选适配器；不安装它们也不影响 Aurora 基础服务启动。
 
+Aurora 本体支持两种部署方式，选其一即可：
+
+- **方式 A：Docker Compose 容器化部署（推荐）** —— 应用本体跑在容器里，更新 = 拉新镜像重建容器。直接跳到 [第 13 节](#13-容器化部署docker-compose推荐)，完成后再回来做第 7 节（Nginx 和 HTTPS）。
+- **方式 B：systemd 裸机部署** —— 按 1–6 节在宿主机安装运行，更新流程见第 11 节。
+
 ## 0. 前置条件
 
 1. 把域名的 A/AAAA 记录指向新服务器。
@@ -169,15 +174,21 @@ install -d -o aurora -g aurora -m 700 /var/lib/aurora/.cache
 runuser -u aurora -- rclone config --config /var/lib/aurora/rclone/rclone.conf
 editor /etc/rclone-rc.env
 chmod 600 /etc/rclone-rc.env
-```
 
-在 `/etc/rclone-rc.env` 中填写一组只用于回环 RC 接口的账号：
+```
+在 `/etc/rclone-rc.env` 中填写只用于 RC 和 WebGUI 的账号，并在 Nginx 中创建同一组账号：
 
 ```dotenv
 RCLONE_RC_USER=change-me
-RCLONE_RC_PASS=change-me
+RCLONE_RC_PASS=change-me-with-at-least-12-chars
 ```
 
+```bash
+source /etc/rclone-rc.env
+apt install -y apache2-utils
+htpasswd -c /etc/nginx/.htpasswd-aurora-rclone "$RCLONE_RC_USER"
+chmod 600 /etc/nginx/.htpasswd-aurora-rclone
+```
 将相同的 `用户:密码` 写入 `/etc/aurora.env` 的 `AURORA_RCLONE_RC_AUTH`，然后安装服务：
 
 ```bash
@@ -188,7 +199,7 @@ systemctl restart aurora
 curl -fsS http://127.0.0.1:8787/api/sources
 ```
 
-rclone RC 只监听 127.0.0.1，不要将 5572 直接暴露到公网，也不要把 RC 密码写进 Git。
+rclone RC 只监听 127.0.0.1；公网 WebGUI 仅通过 HTTPS 的 `/rclone/` 暴露，并同时受 Nginx 与 rclone Basic Auth 保护。不要将 5572 直接暴露到公网，也不要把 RC 密码写进 Git。
 
 ## 10. 安装每日备份
 
@@ -220,7 +231,7 @@ systemctl restart aurora
 curl -fsS http://127.0.0.1:8787/api/health
 ```
 
-更新前先确认 Git 状态干净；不要把 `.env`、`.auth`、`.secret`、`backend/data`、`qbit` 或 `jellyfin` 加入 Git。
+更新前先确认 Git 状态干净；不要把 `.env`、`.auth`、`.secret`、`backend/data`、`qbit` 或 `jellyfin` 加入 Git。容器化部署的更新方式见第 13.4 节。
 
 ## 12. 常用排查
 
@@ -236,3 +247,86 @@ curl -fsS http://127.0.0.1:8787/api/health
 如果首页返回登录跳转但 API 健康检查正常，说明后端已经运行，应继续检查 Nginx、DNS 和证书，而不是直接公开 8787 端口。
 
 如果现网使用旧的 `rclone-rcd.service` 单元，也可以继续使用；更新备份脚本后它会同时归档 `rclone-rcd.service` 和文档中的 `rclone-rc.service`（存在才归档）。建议后续将 RC 密码放入 `/etc/rclone-rc.env`，不要直接写入 systemd `ExecStart` 命令行。
+
+## 13. 容器化部署（Docker Compose，推荐）
+
+应用本体以多阶段镜像交付：Node 阶段编译前端，Python 阶段以非 root 用户（UID/GID 1000）运行 FastAPI 并托管前端产物。镜像内置 HEALTHCHECK（探测 `/api/health`），状态持久化在卷里，更新只需换镜像重建容器。
+
+### 13.1 前置条件
+
+1. 安装 Docker 与 Compose plugin（同第 8 节）。
+2. 在仓库根目录创建 compose 的 `.env`（**这是给 compose 做变量插值的，与凭据环境文件是两个文件**）：
+
+```bash
+cd /opt/aurora
+cat > .env <<'EOF'
+AURORA_ROOT=/opt/aurora
+# 钉住镜像版本：跟随 Release 标签，不要用 latest
+AURORA_IMAGE_TAG=0.4.0
+QBIT_TAG=latest
+JELLYFIN_TAG=latest
+AURORA_ENV_FILE=/etc/aurora.env
+EOF
+chmod 600 .env
+```
+
+3. 准备凭据环境文件（第 4 节的 `/etc/aurora.env`，容器通过 `env_file` 读取 `AURORA_AUTH_PASS`、qBittorrent/Jellyfin 账号等敏感配置）。
+
+### 13.2 首次启动
+
+```bash
+cd /opt/aurora
+install -d -o 1000 -g 1000 -m 750 aurora-state
+install -d -m 755 qbit/config qbit/downloads
+chown -R 1000:1000 qbit          # 容器内 UID=1000，目录属主必须一致
+docker compose pull aurora       # 或 docker compose build aurora 从源码构建
+docker compose up -d aurora      # 只启动应用本体；需要 qbit/Jellyfin 再 up -d 全部
+docker compose ps
+curl -fsS http://127.0.0.1:8787/api/health   # 应返回 {"status":"ok","version":"0.4.0",...}
+```
+
+说明：
+
+- 容器只把 `127.0.0.1:8787` 映射到宿主机，与 systemd 部署一致，第 7 节的 Nginx 配置无需改动。
+- `AURORA_QBIT_URL`/`AURORA_JELLYFIN` 默认指向 compose 服务名（`http://qbittorrent:8080`、`http://jellyfin:8096`）；rclone 在宿主机时默认走 `host.docker.internal:5572`（compose 已配置 `host-gateway`）。要覆盖这些默认值，改 `.env` 或 compose 的 `environment` 段——`environment` 优先级高于 `env_file` 里的同名变量。
+- 首次启动会生成随机管理员密码，写入 `aurora-state/.auth`（容器内 `/var/lib/aurora/.auth`）。
+- 升级或重建容器不丢数据：状态在 `aurora-state/`，媒体在 `qbit/downloads/`。
+- 第 10 节的每日备份在容器模式下照常可用，但要给 `aurora-backup.service` 补两行，否则归档会缺 `.auth`/`.secret` 与运行数据：
+
+```ini
+[Service]
+Environment=AURORA_STATE_DIR=/opt/aurora/aurora-state
+Environment=AURORA_DATA_DIR=/opt/aurora/aurora-state/data
+```
+
+### 13.3 全栈一起部署
+
+```bash
+cd /opt/aurora
+docker compose up -d             # aurora + qBittorrent + Jellyfin
+```
+
+qBittorrent/Jellyfin 的初始化与端口注意事项同第 8 节（BT 对等端口 39876 仍需在 WebUI 设置）。
+
+### 13.4 更新与回滚
+
+```bash
+cd /opt/aurora
+# 更新 .env 里的 AURORA_IMAGE_TAG 到新版本号后：
+docker compose pull aurora
+docker compose up -d aurora
+docker compose logs --tail=50 aurora
+# 回滚 = 把 AURORA_IMAGE_TAG 改回旧版本号，重复上面三行
+```
+
+镜像版本随 GitHub Release 发布（`ghcr.io/lengxiv/aurora:X.Y.Z`）。应用内「设置 → 检查更新」可以对比当前版本与 GitHub 最新 Release；发现新版本后更新 `.env` 中的 `AURORA_IMAGE_TAG` 即可。systemd 部署同样可以使用该入口检查新版本，然后走第 11 节的 `git pull` 流程。
+
+### 13.5 容器排查
+
+```bash
+docker compose ps                     # 健康状态（healthy/unhealthy）
+docker compose logs --tail=100 aurora
+docker inspect --format '{{json .State.Health}}' aurora
+# 镜像内没有 curl，用 python 从容器内部探测
+docker compose exec aurora python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8787/api/health').read())"
+```

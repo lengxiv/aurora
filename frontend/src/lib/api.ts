@@ -240,6 +240,31 @@ export async function fetchInfo() {
   }
 }
 
+export interface UpdateStatus {
+  ok?: boolean
+  repo?: string
+  current?: string
+  latest?: string
+  update_available?: boolean
+  tag?: string
+  url?: string
+  published_at?: string
+  checked_at?: number
+  cached?: boolean
+  detail?: string
+}
+
+export async function checkUpdate(force = false): Promise<UpdateStatus> {
+  try {
+    const r = await fetch(`/api/update/check${force ? '?force=1' : ''}`, { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    if (!r.ok) return { ok: false, detail: `检查失败（HTTP ${r.status}）` }
+    return await r.json()
+  } catch {
+    return { ok: false, detail: '网络请求失败' }
+  }
+}
+
 export interface AuthSession {
   id: string
   created: number
@@ -525,6 +550,9 @@ export interface TorrentPolicyPreview {
   protected: boolean
   protection: string
   delete_files: boolean
+  status?: string
+  detail?: string
+  recoverable?: boolean
 }
 
 export async function fetchTorrentPolicies(): Promise<TorrentPolicies | null> {
@@ -556,15 +584,224 @@ export async function previewTorrentPolicies(): Promise<{ enabled: boolean; inte
   } catch { return null }
 }
 
-export async function applyTorrentPolicies() {
+export async function applyTorrentPolicies(dryRun = false) {
   try {
     const r = await fetch('/api/torrents/policies/apply', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ confirm: true }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ confirm: true, dry_run: dryRun }),
     })
-    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '' } }
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '', dryRun: false } }
     const { data: d, detail } = await responseDetail(r, '应用做种策略失败')
-    return { ok: r.ok && !!d?.ok, detail, applied: d?.applied as number | undefined, items: d?.items as TorrentPolicyPreview[] | undefined }
-  } catch { return { ok: false, detail: '网络请求失败', applied: undefined, items: undefined } }
+    return {
+      ok: r.ok && !!d?.ok,
+      detail,
+      dryRun: !!d?.dry_run,
+      applied: d?.applied as number | undefined,
+      items: d?.items as TorrentPolicyPreview[] | undefined,
+    }
+  } catch { return { ok: false, detail: '网络请求失败', dryRun: false, applied: undefined, items: undefined } }
+}
+
+export interface PolicyUndoItem {
+  id: string
+  time: number
+  action: string
+  name: string
+  rule_name: string
+  reason: string
+  category: string
+  trash_id: string
+  recoverable: boolean
+}
+
+export async function fetchPolicyUndo(): Promise<PolicyUndoItem[]> {
+  try {
+    const r = await fetch('/api/torrents/policies/undo', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return [] }
+    if (!r.ok) return []
+    return (await r.json()).items || []
+  } catch { return [] }
+}
+
+export async function undoPolicy(id: string) {
+  try {
+    const r = await fetch('/api/torrents/policies/undo', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ id }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    const { data: d, detail } = await responseDetail(r, '撤销失败')
+    return { ok: r.ok && !!d?.ok, detail: d?.detail || detail }
+  } catch { return { ok: false, detail: '网络请求失败' } }
+}
+
+export interface MediaOrgRule {
+  id: string
+  name: string
+  category: string
+  enabled: boolean
+  target_dir: string
+  mode: 'hardlink' | 'copy' | 'move'
+  use_subfolder: boolean
+  min_size_mb: number
+}
+
+export interface MediaOrgHistoryItem {
+  time: number
+  hash: string
+  name: string
+  rule_name: string
+  mode: string
+  target: string
+  status: string
+  detail: string
+}
+
+export interface MediaOrgSettings {
+  enabled: boolean
+  interval: number
+  jellyfin_refresh: boolean
+  rules: MediaOrgRule[]
+  history: MediaOrgHistoryItem[]
+}
+
+export async function fetchMediaOrganize(): Promise<MediaOrgSettings | null> {
+  try {
+    const r = await fetch('/api/media/organize', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return await r.json() as MediaOrgSettings
+  } catch { return null }
+}
+
+export async function saveMediaOrganize(value: { enabled: boolean; interval: number; jellyfin_refresh: boolean; rules: MediaOrgRule[] }) {
+  try {
+    const r = await fetch('/api/media/organize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify(value),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return (await r.json()) as MediaOrgSettings & { ok: boolean }
+  } catch { return null }
+}
+
+export interface MediaOrgPreviewItem {
+  hash: string
+  name: string
+  category: string
+  size: number
+  rule_id: string
+  rule_name: string
+  mode: string
+  target: string
+  exists: boolean
+  processed: boolean
+  skipped_reason: string
+  status?: string
+  detail?: string
+}
+
+export async function previewMediaOrganize(): Promise<{ items: MediaOrgPreviewItem[] } | null> {
+  try {
+    const r = await fetch('/api/media/organize/preview', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
+}
+
+export async function applyMediaOrganize(dryRun = false) {
+  try {
+    const r = await fetch('/api/media/organize/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ confirm: true, dry_run: dryRun }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '', organized: 0 } }
+    const { data: d, detail } = await responseDetail(r, '执行整理失败')
+    return {
+      ok: r.ok && !!d?.ok,
+      detail,
+      organized: d?.organized as number | undefined,
+      jellyfinRefreshed: d?.jellyfin_refreshed as boolean | undefined,
+      items: d?.items as MediaOrgPreviewItem[] | undefined,
+    }
+  } catch { return { ok: false, detail: '网络请求失败', organized: 0 } }
+}
+
+export interface RssFeed {
+  path: string
+  name: string
+  url: string
+  has_error: boolean
+  loading: boolean
+}
+
+export interface RssRule {
+  name: string
+  enabled: boolean
+  use_regex: boolean
+  must_contain: string
+  must_not_contain: string
+  episode_filter: string
+  affected_feeds: string[]
+  save_path: string
+  category: string
+  tags: string[]
+  last_match: number
+}
+
+export interface RssArticle {
+  title: string
+  feed: string
+  url: string
+}
+
+export async function fetchRssOverview(): Promise<{ feeds: RssFeed[]; rules: RssRule[] } | null> {
+  try {
+    const r = await fetch('/api/rss/overview', { credentials: 'include' })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
+}
+
+async function rssPost(body: Record<string, unknown>, path: string, failMsg: string): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify(body),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return { ok: false, detail: '登录已过期' } }
+    if (!r.ok) {
+      let detail = failMsg
+      try { detail = (await r.json()).detail || detail } catch { /* 保留默认文案 */ }
+      return { ok: false, detail }
+    }
+    return { ok: true, detail: '' }
+  } catch { return { ok: false, detail: '网络请求失败' } }
+}
+
+export const rssAddFeed = (p: { path: string; url: string }) => rssPost(p, '/api/rss/feeds/add', '添加订阅失败')
+export const rssRemoveFeed = (path: string) => rssPost({ path }, '/api/rss/feeds/remove', '删除订阅失败')
+export const rssRenameFeed = (path: string, new_path: string) => rssPost({ path, new_path }, '/api/rss/feeds/rename', '重命名失败')
+export const rssSetFeedUrl = (path: string, url: string) => rssPost({ path, url }, '/api/rss/feeds/url', '更新地址失败')
+export const rssRefreshFeed = (path: string) => rssPost({ path }, '/api/rss/feeds/refresh', '刷新失败')
+export const rssRemoveRule = (name: string) => rssPost({ name }, '/api/rss/rules/remove', '删除规则失败')
+
+export async function saveRssRule(rule: RssRule & { destination_remote?: string; destination_path?: string }) {
+  return rssPost(rule as unknown as Record<string, unknown>, '/api/rss/rules/save', '保存规则失败')
+}
+
+export async function previewRssMatches(name: string): Promise<RssArticle[] | null> {
+  try {
+    const r = await fetch('/api/rss/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ name }),
+    })
+    if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
+    if (!r.ok) return null
+    return (await r.json()).items || []
+  } catch { return null }
 }
 
 export async function batchAction(ids: string[], action: string, options: { category?: string; limitKib?: number; location?: string; destinationRemote?: string; destinationPath?: string } = {}) {

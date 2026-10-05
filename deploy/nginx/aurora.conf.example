@@ -6,7 +6,7 @@ limit_req_zone $binary_remote_addr zone=aurora_login:10m rate=10r/m;
 server {
     listen 80;
     server_name dashboard.example.com;
-    return 301 https://$host$request_uri;
+    return 301 https://$server_name$request_uri;
 }
 
 server {
@@ -18,14 +18,61 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/dashboard.example.com/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    # 后端允许 20MB 种子 / 2GB 网盘上传；nginx 默认 1MB 会让公网上传全部 413
-    client_max_body_size 2g;
-    # 2GB 上传不整段缓冲，边收边转发
-    proxy_request_buffering off;
-
+    # 默认禁止大请求；仅上传路由按需放宽。
+    client_max_body_size 64k;
+    proxy_request_buffering on;
     add_header Strict-Transport-Security "max-age=31536000" always;
 
-    location /api/auth/login {
+    location = /rclone {
+        return 308 /rclone/;
+    }
+
+    # rclone rcd 使用 /rclone/ 作为 base URL；Basic Auth 凭据由 rclone-rc.env
+    # 和本 location 的 htpasswd 同步维护。
+    location /rclone/ {
+        auth_basic "Aurora rclone";
+        auth_basic_user_file /etc/nginx/.htpasswd-aurora-rclone;
+        proxy_pass http://127.0.0.1:5572;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        client_max_body_size 2g;
+    }
+
+    location = /api/torrents/upload {
+        client_max_body_size 24m;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /api/rclone/transfers/upload {
+        client_max_body_size 2g;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /api/auth/login {
+        client_max_body_size 64k;
         limit_req zone=aurora_login burst=5 nodelay;
         proxy_pass http://127.0.0.1:8787;
         proxy_http_version 1.1;

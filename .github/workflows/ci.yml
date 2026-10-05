@@ -6,6 +6,21 @@ on:
   pull_request:
 
 jobs:
+  # 版本号单一来源是根目录 VERSION；package.json 必须保持一致，
+  # 发版时由 release 流水线按 tag 再校验一次
+  version-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: VERSION 与 frontend/package.json 版本一致
+        run: |
+          v="$(tr -d ' \t\r\n' < VERSION)"
+          pj="$(node -p "require('./frontend/package.json').version")"
+          echo "VERSION=${v} package.json=${pj}"
+          test -n "$v"
+          [ "$v" = "$pj" ] || { echo "::error::VERSION(${v}) 与 frontend/package.json(${pj}) 不一致"; exit 1; }
+          [ "$v" != "0.0.0" ] || { echo "::error::版本号不能是 0.0.0"; exit 1; }
+
   backend:
     runs-on: ubuntu-latest
     steps:
@@ -34,4 +49,33 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      - run: npm run lint
       - run: npm run build
+
+  # 容器镜像必须始终可构建：多阶段构建（前端编译 + 运行时打包）
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: aurora:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test (health endpoint)
+        run: |
+          docker run -d --name aurora-ci -p 127.0.0.1:8787:8787 aurora:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/api/health | grep -q '"status":"ok"'; then
+              echo "health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::容器健康检查未通过"
+          docker logs aurora-ci
+          exit 1

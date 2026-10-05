@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
 sys.path.insert(0, str(BACKEND))
@@ -465,6 +465,319 @@ class TorrentPolicyTests(unittest.TestCase):
         providers._SETTINGS_FILE = old_settings
         providers._POLICY_NOTIFY_FILE = old_notify
         providers._qbit = old_qbit
+
+
+class PolicyDryRunUndoTests(unittest.TestCase):
+    """做种策略：预演（dry_run）必须零副作用；删除走回收站留档且可撤销。"""
+
+    RULE = {
+        "id": "policy-remove", "name": "清理", "category": "movies", "enabled": True,
+        "action": "remove", "min_seed_minutes": 0, "max_seed_minutes": 90,
+        "max_inactive_minutes": -1, "max_ratio": -1,
+        "allow_delete": True, "delete_files": True,
+    }
+
+    def test_dry_run_reports_without_side_effects(self):
+        old_settings = providers._SETTINGS_FILE
+        old_notify = providers._POLICY_NOTIFY_FILE
+        old_qbit = providers._qbit
+        with tempfile.TemporaryDirectory() as td:
+            providers._SETTINGS_FILE = str(Path(td) / "settings.json")
+            providers._POLICY_NOTIFY_FILE = str(Path(td) / "policy-notify.json")
+
+            class FakeQbit:
+                _last_details_ok = True
+                _UP_STATES = providers.QbittorrentProvider._UP_STATES
+
+                def __init__(self):
+                    self.actions = []
+
+                def available(self):
+                    return True
+
+                def torrent_details(self):
+                    return [{
+                        "hash": "d" * 40, "name": "old-release", "state": "stalledUP",
+                        "category": "movies", "tags": "", "ratio": 2.0,
+                        "seeding_time": 7200, "inactive_seeding_time": 0,
+                        "save_path": "/downloads/movies",
+                        "content_path": "/downloads/movies/old-release",
+                    }]
+
+                def advanced_action(self, hash_, action, **kwargs):
+                    self.actions.append((hash_, action, kwargs))
+                    return True, ""
+
+            fake = FakeQbit()
+            providers._qbit = fake
+            providers.save_torrent_policies({"enabled": False, "interval": 300, "rules": [self.RULE]})
+            ok, data, detail = providers.apply_torrent_policies(confirm=True, dry_run=True)
+            self.assertTrue(ok, detail)
+            self.assertTrue(data["dry_run"])
+            self.assertEqual(len(data["items"]), 1)
+            self.assertEqual(data["items"][0]["status"], "would_remove")
+            # content_path 不在媒体目录内 → 预演即可判定该次删除不可恢复
+            self.assertFalse(data["items"][0]["recoverable"])
+            self.assertEqual(fake.actions, [])   # 预演不产生任何真实操作
+        providers._SETTINGS_FILE = old_settings
+        providers._POLICY_NOTIFY_FILE = old_notify
+        providers._qbit = old_qbit
+
+    def test_remove_goes_to_trash_and_undo_restores(self):
+        old_settings = providers._SETTINGS_FILE
+        old_notify = providers._POLICY_NOTIFY_FILE
+        old_undo_file = providers._POLICY_UNDO_FILE
+        old_undo_dir = providers._POLICY_UNDO_DIR
+        old_qbit = providers._qbit
+        old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "media"
+            content = media / "movies" / "old-release"
+            content.mkdir(parents=True)
+            (content / "file.txt").write_text("data")
+            os.environ["AURORA_LOCAL_MOUNT"] = str(media)
+            providers._SETTINGS_FILE = str(Path(td) / "settings.json")
+            providers._POLICY_NOTIFY_FILE = str(Path(td) / "policy-notify.json")
+            providers._POLICY_UNDO_FILE = str(Path(td) / "undo.json")
+            providers._POLICY_UNDO_DIR = str(Path(td) / "undo-dir")
+
+            class FakeQbit:
+                _last_details_ok = True
+                _UP_STATES = providers.QbittorrentProvider._UP_STATES
+
+                def __init__(self):
+                    self.actions = []
+                    self.added = []
+
+                def available(self):
+                    return True
+
+                def torrent_details(self):
+                    return [{
+                        "hash": "e" * 40, "name": "old-release", "state": "stalledUP",
+                        "category": "movies", "tags": "", "ratio": 2.0,
+                        "seeding_time": 7200, "inactive_seeding_time": 0,
+                        "save_path": "/downloads/movies",
+                        "content_path": "/downloads/movies/old-release",
+                    }]
+
+                def advanced_action(self, hash_, action, **kwargs):
+                    self.actions.append((hash_, action, kwargs))
+                    return True, ""
+
+                def export_torrent(self, hash_):
+                    return True, b"d8:announce4:test", ""
+
+                def add_file(self, filename, content, save_path="", tag="", category="", tags=None):
+                    self.added.append({"filename": filename, "save_path": save_path,
+                                       "category": category, "tags": list(tags or [])})
+                    return True, ""
+
+            fake = FakeQbit()
+            providers._qbit = fake
+            providers.save_torrent_policies({"enabled": False, "interval": 300, "rules": [self.RULE]})
+            ok, data, detail = providers.apply_torrent_policies(confirm=True)
+            self.assertTrue(ok, detail)
+            self.assertEqual(data["applied"], 1)
+            # 内容已进回收站，任务本体走"不连带删文件"的移除
+            self.assertEqual(fake.actions, [("e" * 40, "remove", {"delete_files": False})])
+            self.assertFalse(content.exists())
+            self.assertEqual(len(providers.trash_list()), 1)
+            undo_items = providers.policy_undo_list()
+            self.assertEqual(len(undo_items), 1)
+            self.assertTrue(undo_items[0]["recoverable"])
+            # 撤销：文件回原位 + 用留档重加任务（save_path/category 原样还原）
+            ok, detail = providers.policy_undo_execute(undo_items[0]["id"])
+            self.assertTrue(ok, detail)
+            self.assertTrue((content / "file.txt").exists())
+            self.assertEqual(providers.trash_list(), [])
+            self.assertEqual(len(fake.added), 1)
+            self.assertEqual(fake.added[0]["save_path"], "/downloads/movies")
+            self.assertEqual(fake.added[0]["category"], "movies")
+            self.assertEqual(len(providers.policy_undo_list()), 0)
+        providers._SETTINGS_FILE = old_settings
+        providers._POLICY_NOTIFY_FILE = old_notify
+        providers._POLICY_UNDO_FILE = old_undo_file
+        providers._POLICY_UNDO_DIR = old_undo_dir
+        providers._qbit = old_qbit
+        if old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = old_mount
+
+
+class MediaOrganizeTests(unittest.TestCase):
+    """下载完成自动整理：规则校验、硬链接、防重复、预演与 Jellyfin 刷新。"""
+
+    def setUp(self):
+        self._old_org = providers._MEDIA_ORG_FILE
+        self._old_qbit = providers._qbit
+        self._old_jelly = providers._jelly
+        self._old_mount = os.environ.get("AURORA_LOCAL_MOUNT")
+        self._tmp = tempfile.TemporaryDirectory()
+        providers._MEDIA_ORG_FILE = str(Path(self._tmp.name) / "organize.json")
+        self.media = Path(self._tmp.name) / "media"
+        self.content = self.media / "movies" / "Some.Movie.2024"
+        self.content.mkdir(parents=True)
+        (self.content / "movie.mkv").write_text("video-data")
+        os.environ["AURORA_LOCAL_MOUNT"] = str(self.media)
+
+        class FakeQbit:
+            _last_details_ok = True
+            _UP_STATES = providers.QbittorrentProvider._UP_STATES
+
+            def available(self):
+                return True
+
+            def torrent_details(self):
+                return [{
+                    "hash": "f" * 40, "name": "Some.Movie.2024", "state": "stalledUP",
+                    "category": "movies", "tags": "", "progress": 1.0, "size": 4096,
+                    "save_path": "/downloads/movies",
+                    "content_path": "/downloads/movies/Some.Movie.2024",
+                }]
+
+        self.qbit = FakeQbit()
+        providers._qbit = self.qbit
+        providers.save_media_organize_settings({
+            "enabled": True, "interval": 300, "jellyfin_refresh": True,
+            "rules": [{"id": "org-movies", "name": "电影入库", "category": "movies",
+                       "enabled": True, "target_dir": "library/movies",
+                       "mode": "hardlink", "use_subfolder": True, "min_size_mb": 0}],
+        })
+        self.refreshed = []
+
+    def tearDown(self):
+        providers._MEDIA_ORG_FILE = self._old_org
+        providers._qbit = self._old_qbit
+        providers._jelly = self._old_jelly
+        if self._old_mount is None:
+            os.environ.pop("AURORA_LOCAL_MOUNT", None)
+        else:
+            os.environ["AURORA_LOCAL_MOUNT"] = self._old_mount
+        self._tmp.cleanup()
+
+    def _patch_jelly(self):
+        class FakeJelly:
+            def refresh_library(self_inner):
+                self.refreshed.append(1)
+                return True, ""
+        providers._jelly = FakeJelly()
+
+    def test_preview_lists_completed_torrent_with_target(self):
+        self._patch_jelly()
+        ok, data, detail = providers.preview_media_organize()
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(data["items"]), 1)
+        item = data["items"][0]
+        self.assertEqual(item["rule_name"], "电影入库")
+        self.assertFalse(item["processed"])
+        self.assertFalse(item["exists"])
+        self.assertEqual(item["target"], "library/movies/Some.Movie.2024")
+
+    def test_hardlink_apply_then_skip_on_second_run(self):
+        self._patch_jelly()
+        ok, data, detail = providers.apply_media_organize(confirm=True)
+        self.assertTrue(ok, detail)
+        self.assertEqual(data["organized"], 1)
+        self.assertEqual(self.refreshed, [1])
+        target = self.media / "library" / "movies" / "Some.Movie.2024" / "movie.mkv"
+        self.assertTrue(target.exists())
+        # 硬链接：同一 inode，源文件保留（做种不中断）
+        self.assertEqual(target.stat().st_ino, (self.content / "movie.mkv").stat().st_ino)
+        self.assertTrue((self.content / "movie.mkv").exists())
+        # 第二轮：已整理的任务不再重复处理
+        ok2, data2, _ = providers.apply_media_organize(confirm=True)
+        self.assertTrue(ok2)
+        self.assertEqual(data2["organized"], 0)
+        statuses = [item["status"] for item in data2["items"]]
+        self.assertEqual(statuses, ["already_done"])
+        self.assertEqual(self.refreshed, [1])   # 没有新增整理就不再次刷库
+
+    def test_target_conflict_is_reported_not_overwritten(self):
+        (self.media / "library" / "movies" / "Some.Movie.2024").mkdir(parents=True)
+        (self.media / "library" / "movies" / "Some.Movie.2024" / "movie.mkv").write_text("existing")
+        self._patch_jelly()
+        ok, data, _ = providers.apply_media_organize(confirm=True)
+        self.assertTrue(ok)
+        statuses = [item["status"] for item in data["items"]]
+        self.assertEqual(statuses, ["conflict"])
+        self.assertEqual(data["organized"], 0)
+        self.assertEqual((self.media / "library" / "movies" / "Some.Movie.2024" / "movie.mkv").read_text(), "existing")
+
+    def test_unsafe_target_dir_is_rejected(self):
+        for bad in ("/abs/path", "../outside", "a/../..", ".aurora-trash/x", ""):
+            self.assertEqual(providers._clean_org_target(bad), "", bad)
+        self.assertEqual(providers._clean_org_target("library/movies"), "library/movies")
+
+    def test_dry_run_creates_nothing(self):
+        self._patch_jelly()
+        ok, data, _ = providers.apply_media_organize(confirm=True, dry_run=True)
+        self.assertTrue(ok)
+        self.assertTrue(data["dry_run"])
+        self.assertEqual(data["organized"], 0)
+        self.assertFalse((self.media / "library").exists())
+        self.assertEqual(self.refreshed, [])
+
+
+class RssHelpersTests(unittest.TestCase):
+    """RSS 订阅：路径校验、4.x/5.x 规则双写与读取兼容、feeds 树拍平。"""
+
+    def test_rss_path_validation(self):
+        self.assertTrue(providers._valid_rss_path("动漫订阅"))
+        self.assertTrue(providers._valid_rss_path("Shows\\TV RSS"))
+        self.assertTrue(providers._valid_rss_path("Movie (2024)"))
+        self.assertFalse(providers._valid_rss_path(""))
+        self.assertFalse(providers._valid_rss_path("a/b"))
+        self.assertFalse(providers._valid_rss_path("bad<name"))
+        self.assertFalse(providers._valid_rss_path("bad:name"))
+
+    def test_rule_def_dual_write(self):
+        d = providers._rss_rule_def({
+            "enabled": True, "use_regex": True,
+            "must_contain": "1080p", "must_not_contain": "CAM",
+            "episode_filter": "S01E01-",
+            "affected_feeds": ["Anime"], "save_path": "/downloads/anime",
+            "category": "anime", "tags": ["rss"],
+        })
+        # 5.x 只认 torrentParams，4.1-4.5 只认旧字段：必须双写
+        self.assertEqual(d["torrentParams"]["save_path"], "/downloads/anime")
+        self.assertEqual(d["savePath"], "/downloads/anime")
+        self.assertEqual(d["torrentParams"]["category"], "anime")
+        self.assertEqual(d["assignedCategory"], "anime")
+        self.assertEqual(d["torrentParams"]["tags"], ["rss"])
+        self.assertEqual(d["tags"], ["rss"])
+        self.assertTrue(d["useRegex"])
+        self.assertEqual(d["affectedFeeds"], ["Anime"])
+        self.assertFalse(d["torrentParams"]["stopped"])
+
+    def test_normalize_rss_rule_reads_both_shapes(self):
+        new_shape = providers._normalize_rss_rule("r1", {
+            "enabled": False, "useRegex": True, "mustContain": "x",
+            "mustNotContain": "y", "episodeFilter": "S01",
+            "torrentParams": {"save_path": "/downloads/a", "category": "c", "tags": ["t"]},
+            "affectedFeeds": ["F"], "lastMatch": 123,
+        })
+        self.assertEqual(new_shape["save_path"], "/downloads/a")
+        self.assertEqual(new_shape["category"], "c")
+        self.assertEqual(new_shape["tags"], ["t"])
+        self.assertEqual(new_shape["last_match"], 123)
+        self.assertEqual(new_shape["must_not_contain"], "y")
+        old_shape = providers._normalize_rss_rule("r2", {
+            "enabled": True, "mustContain": "y",
+            "savePath": "/downloads/b", "assignedCategory": "c2", "tags": ["t2"],
+        })
+        self.assertEqual(old_shape["save_path"], "/downloads/b")
+        self.assertEqual(old_shape["category"], "c2")
+        self.assertEqual(old_shape["tags"], ["t2"])
+
+    def test_flatten_rss_feeds(self):
+        tree = {"Folder": {"Feed A": {"url": "http://x", "hasError": True}},
+                "Top Feed": {"url": "http://y", "articles": []}}
+        feeds = providers._flatten_rss_feeds(tree, "")
+        by_path = {f["path"]: f for f in feeds}
+        self.assertEqual(by_path["Folder\\Feed A"]["has_error"], True)
+        self.assertEqual(by_path["Top Feed"]["url"], "http://y")
 
 
 class TorrentDestinationTests(unittest.TestCase):
@@ -1324,6 +1637,82 @@ class AtomicJsonTests(unittest.TestCase):
             self.assertEqual(leftovers, [])
 
 
+class VersionTests(unittest.TestCase):
+    def test_prerelease_is_lower_than_release(self):
+        # SemVer：1.2.3-rc.1 < 1.2.3
+        self.assertLess(main._parse_version("1.2.3-rc.1"), main._parse_version("1.2.3"))
+        self.assertLess(main._parse_version("v0.4.0-beta.2"), main._parse_version("0.4.0"))
+
+    def test_numeric_ordering_not_lexical(self):
+        self.assertLess(main._parse_version("0.9.1"), main._parse_version("0.10.0"))
+        self.assertLess(main._parse_version("v0.9.9"), main._parse_version("v0.10.0"))
+
+    def test_equal_versions_are_not_newer(self):
+        self.assertFalse(main._parse_version("v0.4.0") > main._parse_version("0.4.0"))
+
+    def test_garbage_falls_back_to_zero(self):
+        self.assertEqual(main._parse_version(""), main._parse_version("0.0.0"))
+        self.assertEqual(main._parse_version("not-a-version"), main._parse_version("0.0.0"))
+
+
+class UpdateCheckTests(unittest.TestCase):
+    """在线检查更新：缓存命中不重复请求 GitHub，失败可区分，仓库配置可覆盖。"""
+
+    def setUp(self):
+        main._UPDATE_CACHE.clear()
+        self._old_repo = os.environ.get("AURORA_REPO")
+        os.environ["AURORA_REPO"] = "example/aurora"
+
+    def tearDown(self):
+        main._UPDATE_CACHE.clear()
+        if self._old_repo is None:
+            os.environ.pop("AURORA_REPO", None)
+        else:
+            os.environ["AURORA_REPO"] = self._old_repo
+
+    def _release(self, tag):
+        return {"tag": tag, "latest": tag.lstrip("vV"),
+                "url": f"https://github.com/example/aurora/releases/tag/{tag}",
+                "published_at": "2026-10-01T00:00:00Z"}
+
+    def test_update_available_when_latest_is_newer(self):
+        with patch.object(main, "_github_latest_release", return_value=self._release("v99.0.0")) as m:
+            data = main.update_check(force=1, _user="t")
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["repo"], "example/aurora")
+        self.assertEqual(data["latest"], "99.0.0")
+        self.assertTrue(data["update_available"])
+        m.assert_called_once_with("example/aurora")
+
+    def test_cache_within_ttl_avoids_second_request(self):
+        with patch.object(main, "_github_latest_release", return_value=self._release("v0.4.0")) as m:
+            first = main.update_check(force=1, _user="t")
+            self.assertFalse(first["update_available"])
+            second = main.update_check(_user="t")   # 不 force：命中 30 分钟缓存
+        self.assertTrue(second["cached"])
+        self.assertFalse(second["update_available"])
+        m.assert_called_once()   # 第二次没有打 GitHub
+
+    def test_failure_is_reported_not_raised(self):
+        with patch.object(main, "_github_latest_release", side_effect=RuntimeError("GitHub API 限流或被拒绝，请稍后再试")):
+            data = main.update_check(force=1, _user="t")
+        self.assertFalse(data["ok"])
+        self.assertIn("限流", data["detail"])
+        self.assertEqual(data["current"], main.APP_VERSION)
+
+    def test_repo_accepts_full_url(self):
+        os.environ["AURORA_REPO"] = "https://github.com/example/aurora.git/"
+        self.assertEqual(main._github_repo(), "example/aurora")
+        os.environ["AURORA_REPO"] = "https://github.com/example/aurora"
+        self.assertEqual(main._github_repo(), "example/aurora")
+
+    def test_missing_repo_disables_check(self):
+        os.environ["AURORA_REPO"] = ""
+        data = main.update_check(force=1, _user="t")
+        self.assertFalse(data["ok"])
+        self.assertIn("AURORA_REPO", data["detail"])
+
+
 class HttpLayerTests(unittest.TestCase):
     """HTTP 层测试（TestClient）：认证依赖、登录限流、CSRF 中间件、
     会话撤销端点、改密全链路、回收站冲突——此前全部零覆盖。"""
@@ -1345,6 +1734,9 @@ class HttpLayerTests(unittest.TestCase):
         main._FAILS.clear()
 
     def setUp(self):
+        # 用例按字母序执行：改密用例会把模块级 _AUTH_PASS 改掉，若不恢复，
+        # 后面所有需要登录的用例全部 401（真实踩过的顺序污染）
+        main._AUTH_PASS = self.PASSWORD
         main._FAILS.clear()
         self.client.cookies.clear()
 
@@ -1452,6 +1844,38 @@ class HttpLayerTests(unittest.TestCase):
         r = self.client.get("/docs")
         # static 未构建时 FastAPI 兜底 404；构建后 SPA 兜底把未登录访问重定向到 /login
         self.assertIn(r.status_code, (404, 307))
+
+    def test_health_exposes_version(self):
+        r = self.client.get("/api/health")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["version"])
+        self.assertEqual(body["version"], main.APP_VERSION)
+
+    def test_update_check_requires_auth(self):
+        r = self.client.get("/api/update/check")
+        self.assertEqual(r.status_code, 401)
+
+    def test_rss_endpoints_require_auth(self):
+        self.assertEqual(self.client.get("/api/rss/overview").status_code, 401)
+        self.assertEqual(self.client.post("/api/rss/rules/save", json={"name": "x"}).status_code, 401)
+
+    def test_update_check_endpoint_uses_cache_not_network(self):
+        # 端到端：登录后经 HTTP 调用，GitHub 结果被 mock，不依赖外网
+        main._UPDATE_CACHE.clear()
+        payload = {"tag": "v0.4.0", "latest": "0.4.0",
+                   "url": "https://github.com/example/aurora/releases/tag/v0.4.0",
+                   "published_at": "2026-10-01T00:00:00Z"}
+        self._login()
+        with patch.object(main, "_github_latest_release", return_value=payload):
+            r = self.client.get("/api/update/check")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["current"], main.APP_VERSION)
+        self.assertFalse(body["update_available"])
+        main._UPDATE_CACHE.clear()
 
 
 if __name__ == "__main__":

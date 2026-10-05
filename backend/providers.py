@@ -7,11 +7,13 @@ it, and the matching section flips to real readings with no frontend change.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -447,7 +449,7 @@ class RcloneProvider:
     driver = "rclone"
 
     def __init__(self):
-        self.base = os.environ.get("AURORA_RCLONE_RC", "http://127.0.0.1:5572").rstrip("/")
+        self.base = os.environ.get("AURORA_RCLONE_RC", "http://127.0.0.1:5572/rclone").rstrip("/")
         # rc 启用 Basic Auth 时提供凭据（用户:密码，纯回环仍建议开，公网反代必须开）
         self.auth = os.environ.get("AURORA_RCLONE_RC_AUTH", "")
         # 探测失败退避：metrics 每 2s 轮询，rclone 掉线时若每次都打满探测超时，
@@ -497,11 +499,13 @@ class RcloneProvider:
             job.setdefault("status_failures", 0)
             self._transfer_jobs[job_id] = job
 
-    def _persist_transfer_jobs_locked(self) -> None:
+    def _persist_transfer_jobs_locked(self) -> bool:
         try:
             _atomic_json(_RCLONE_TRANSFER_FILE, list(self._transfer_jobs.values()))
+            return True
         except Exception as exc:
             _LOGGER.warning("rclone transfer journal write failed: %s", exc)
+            return False
 
     def available(self) -> bool:
         # rclone rcd 的 rc API 只接受 POST（--rc-serve 仅 serve 命令支持）
@@ -676,15 +680,34 @@ class RcloneProvider:
             "created": int(time.time()),
             "finished": 0,
             "cleanup": cleanup,
-            # Upload staging files are retained on failure so a retry can use
-            # the same bytes. Successful/canceled jobs clear this flag below.
             "retryable": True,
             "status_failures": 0,
             "request": {"endpoint": endpoint, "payload": request_payload},
         }
+        persisted = False
         with self._transfer_lock:
             self._transfer_jobs[job["id"]] = job
-            self._persist_transfer_jobs_locked()
+            persisted = self._persist_transfer_jobs_locked()
+            if not persisted:
+                self._transfer_jobs.pop(job["id"], None)
+        if not persisted:
+            stopped = False
+            try:
+                self._req(
+                    "/job/stop", timeout=5.0, method="POST",
+                    data=json.dumps({"jobid": int(remote_job)}),
+                    headers={"Content-Type": "application/json"},
+                )
+                stopped = True
+            except Exception as exc:
+                _LOGGER.warning("unable to stop unjournaled rclone job %s: %s", remote_job, exc)
+            if stopped and cleanup:
+                try:
+                    if os.path.isfile(cleanup):
+                        os.unlink(cleanup)
+                except OSError:
+                    pass
+            raise RuntimeError("传输任务状态保存失败，请检查 Aurora 数据目录权限或磁盘空间")
         return self._public_transfer(job)
 
     @staticmethod
@@ -1733,6 +1756,21 @@ class QbittorrentProvider:
             except Exception as exc:
                 return False, str(exc)
 
+    def export_torrent(self, hash_: str) -> tuple[bool, bytes, str]:
+        """导出 .torrent 原始文件。做种策略删除任务前留档，撤销时用它重加任务
+        （磁力添加的任务在 qbit 侧没有元数据，不留档就永远无法恢复）。"""
+        if not self._valid_hash(hash_):
+            return False, b"", "种子 Hash 无效"
+        with self._session_lock:
+            try:
+                r = self._ensure().get(f"{self.base}/api/v2/torrents/export",
+                                       params={"hash": hash_}, timeout=10)
+                if r.status_code != 200 or not r.content:
+                    return False, b"", f"导出种子失败（HTTP {r.status_code}）"
+                return True, r.content, ""
+            except Exception as exc:
+                return False, b"", str(exc)
+
     def torrent_details(self) -> list[dict]:
         with self._session_lock:
             try:
@@ -1781,6 +1819,8 @@ class QbittorrentProvider:
 
     def peers(self, hash_):
         """当前连到这个种子的对等方（谁在从我们这里下载）。"""
+        if not self._valid_hash(hash_):
+            return {"peers": [], "connected": 0, "seeds": 0, "leechers": 0}
         with self._session_lock:
             try:
                 s = self._ensure()
@@ -1796,10 +1836,10 @@ class QbittorrentProvider:
                 "country": p.get("country", ""),
                 "country_code": p.get("country_code", ""),
                 "progress": round(p.get("progress", 0), 3),
-                "up_speed": p.get("up_speed", 0),       # 从我们这里拉取 B/s
-                "down_speed": p.get("down_speed", 0),   # 给我们的 B/s
-                "uploaded": p.get("uploaded", 0),       # 累计从我们这里拉取的 B
-                "downloaded": p.get("downloaded", 0),   # 累计给我们的 B
+                "up_speed": p.get("up_speed", 0),
+                "down_speed": p.get("down_speed", 0),
+                "uploaded": p.get("uploaded", 0),
+                "downloaded": p.get("downloaded", 0),
             })
         out.sort(key=lambda x: x["uploaded"], reverse=True)
         return {
@@ -1860,8 +1900,9 @@ class QbittorrentProvider:
                 return r.status_code in (200, 201)
             except Exception:
                 return False
-
     def action(self, hash_, action):
+        if not self._valid_hash(hash_):
+            return False
         with self._session_lock:
             try:
                 # qBittorrent 5.x removed pause/resume -> use stop/start
@@ -1925,7 +1966,7 @@ class QbittorrentProvider:
             if t.get("state") not in self._UP_STATES:
                 continue
             h = t.get("hash", "")
-            if not h:
+            if not self._valid_hash(h):
                 continue
             with self._session_lock:
                 try:
@@ -1943,6 +1984,8 @@ class QbittorrentProvider:
 
     def move_seed(self, hash_: str, location: str) -> bool:
         """整种子移动到容器内目录（qbit 自己搬文件并更新路径，保持做种）。"""
+        if not self._valid_hash(hash_):
+            return False
         with self._session_lock:
             try:
                 s = self._ensure()
@@ -1951,6 +1994,149 @@ class QbittorrentProvider:
                 return r.status_code == 200
             except Exception:
                 return False
+
+    # ---- RSS 自动订阅：Aurora 只做管理与预览，抓取/匹配/自动下载由 qbit 完成 ----
+
+    def rss_overview(self) -> tuple[bool, dict, str]:
+        with self._session_lock:
+            try:
+                s = self._ensure()
+                feeds_r = s.get(f"{self.base}/api/v2/rss/items", timeout=8)
+                rules_r = s.get(f"{self.base}/api/v2/rss/rules", timeout=8)
+                if feeds_r.status_code != 200 or rules_r.status_code != 200:
+                    return False, {}, f"qBittorrent RSS HTTP {feeds_r.status_code}/{rules_r.status_code}"
+                feeds = _flatten_rss_feeds(feeds_r.json() or {}, "")
+                rules = {name: _normalize_rss_rule(name, raw or {})
+                         for name, raw in (rules_r.json() or {}).items()}
+                return True, {"feeds": feeds, "rules": dict(sorted(rules.items()))}, ""
+            except Exception as exc:
+                return False, {}, str(exc)
+
+    def _rss_post(self, endpoint: str, data: dict) -> tuple[bool, str]:
+        with self._session_lock:
+            try:
+                r = self._ensure().post(f"{self.base}/api/v2/rss/{endpoint}", data=data, timeout=10)
+                if r.status_code == 200:
+                    return True, ""
+                return False, f"qBittorrent RSS HTTP {r.status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
+    def rss_add_feed(self, path: str, url: str) -> tuple[bool, str]:
+        return self._rss_post("addFeed", {"path": path, "url": url})
+
+    def rss_remove_item(self, path: str) -> tuple[bool, str]:
+        return self._rss_post("removeItem", {"path": path})
+
+    def rss_rename_item(self, path: str, new_path: str) -> tuple[bool, str]:
+        return self._rss_post("moveItem", {"itemPath": path, "destPath": new_path})
+
+    def rss_set_feed_url(self, path: str, url: str) -> tuple[bool, str]:
+        return self._rss_post("setFeedURL", {"path": path, "url": url})
+
+    def rss_refresh(self, item_path: str) -> tuple[bool, str]:
+        return self._rss_post("refreshItem", {"itemPath": item_path})
+
+    def rss_save_rule(self, name: str, rule_def: dict) -> tuple[bool, str]:
+        return self._rss_post("setRule", {"ruleName": name, "ruleDef": json.dumps(rule_def)})
+
+    def rss_remove_rule(self, name: str) -> tuple[bool, str]:
+        return self._rss_post("removeRule", {"ruleName": name})
+
+    def rss_rename_rule(self, name: str, new_name: str) -> tuple[bool, str]:
+        return self._rss_post("renameRule", {"ruleName": name, "newRuleName": new_name})
+
+    def rss_matching(self, name: str) -> tuple[bool, list, str]:
+        """规则当前命中的文章（须先保存规则；与规则是否启用无关）。"""
+        with self._session_lock:
+            try:
+                r = self._ensure().post(f"{self.base}/api/v2/rss/matchingArticles",
+                                        data={"ruleName": name}, timeout=10)
+                if r.status_code != 200:
+                    return False, [], f"匹配预览失败（HTTP {r.status_code}）"
+                items = []
+                for feed, articles in (r.json() or {}).items():
+                    for a in articles or []:
+                        items.append({
+                            "title": str(a.get("title") or ""),
+                            "feed": str(feed),
+                            "url": str(a.get("torrentURL") or a.get("url") or ""),
+                        })
+                items.sort(key=lambda x: x["title"])
+                return True, items, ""
+            except Exception as exc:
+                return False, [], str(exc)
+
+_RSS_SEGMENT_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff \-.()（）]*$", re.UNICODE)
+
+
+def _valid_rss_path(value: str) -> bool:
+    """qBittorrent RSS 用 \\ 作路径分隔符（Folder\\Feed）；逐段校验。"""
+    v = str(value or "").strip()
+    if not v or len(v) > 256:
+        return False
+    return all(_RSS_SEGMENT_RE.match(seg) for seg in v.split("\\") if seg != "")
+
+
+def _flatten_rss_feeds(node: dict, prefix: str) -> list[dict]:
+    """把 rss/items 的嵌套结构拍平成带 path 的订阅源列表。"""
+    out = []
+    for key, value in (node or {}).items():
+        if not isinstance(value, dict):
+            continue
+        path = f"{prefix}\\{key}" if prefix else key
+        if "url" in value or "articles" in value:
+            out.append({
+                "path": path,
+                "name": key,
+                "url": str(value.get("url") or ""),
+                "has_error": bool(value.get("hasError")),
+                "loading": bool(value.get("isLoading")),
+            })
+        else:
+            out.extend(_flatten_rss_feeds(value, path))
+    return out
+
+
+def _rss_rule_def(rule: dict) -> dict:
+    """构造 qbit RSS 规则定义，双写新旧字段：
+    5.x 只认 torrentParams（旧字段已移除），4.1-4.5 只认旧字段，
+    双方都会忽略自己不认识的键，一个定义两个大版本都能落库。"""
+    save_path = str(rule.get("save_path") or "")
+    category = str(rule.get("category") or "")
+    tags = [str(t) for t in (rule.get("tags") or [])]
+    return {
+        "enabled": bool(rule.get("enabled", True)),
+        "useRegex": bool(rule.get("use_regex")),
+        "mustContain": str(rule.get("must_contain") or ""),
+        "mustNotContain": str(rule.get("must_not_contain") or ""),
+        "episodeFilter": str(rule.get("episode_filter") or ""),
+        "affectedFeeds": [str(f) for f in (rule.get("affected_feeds") or [])],
+        "torrentParams": {"save_path": save_path, "category": category, "tags": tags, "stopped": False},
+        "savePath": save_path,
+        "assignedCategory": category,
+        "category": category,
+        "addPaused": False,
+        "tags": tags,
+    }
+
+
+def _normalize_rss_rule(name: str, raw: dict) -> dict:
+    params = raw.get("torrentParams") or {}
+    return {
+        "name": str(name),
+        "enabled": bool(raw.get("enabled", True)),
+        "use_regex": bool(raw.get("useRegex")),
+        "must_contain": str(raw.get("mustContain") or ""),
+        "must_not_contain": str(raw.get("mustNotContain") or ""),
+        "episode_filter": str(raw.get("episodeFilter") or ""),
+        "affected_feeds": [str(f) for f in (raw.get("affectedFeeds") or [])],
+        "save_path": str(params.get("save_path") or raw.get("savePath") or ""),
+        "category": str(params.get("category") or raw.get("assignedCategory") or raw.get("category") or ""),
+        "tags": [str(t) for t in (params.get("tags") or raw.get("tags") or [])],
+        "last_match": int(raw.get("lastMatch") or 0),
+    }
+
 
 class JellyfinProvider:
     name = "jellyfin"
@@ -1987,6 +2173,18 @@ class JellyfinProvider:
                 "status": "live" if s.get("PlayState", {}).get("IsPaused") is False else "buffering",
             })
         return out
+
+    def refresh_library(self) -> tuple[bool, str]:
+        """触发 Jellyfin 全库扫描（媒体整理完成后调用）。"""
+        if not self.token:
+            return False, "未配置 Jellyfin Token"
+        try:
+            # /Library/Refresh 返回 204 No Content，decode=False 避免空 body 解析失败
+            _http(f"{self.base}/Library/Refresh",
+                  {"X-Emby-Token": self.token}, timeout=6.0, method="POST", decode=False)
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
 
     def library(self):
         """海报墙：电影 + 剧集条目（含海报、年份、本地路径）。"""
@@ -2100,14 +2298,17 @@ def _load_torrent_destinations() -> dict[str, dict]:
     return parsed
 
 
-def _save_torrent_destinations(data: dict[str, dict]) -> None:
+def _save_torrent_destinations(data: dict[str, dict]) -> bool:
     global _DEST_CACHE_STAMP
     try:
         _atomic_json(_TORRENT_DEST_FILE, data)
-    except Exception:
-        pass
-    # 写入后强制下一次 load 重新读盘（含写失败场景，避免缓存与磁盘分叉）
+    except Exception as exc:
+        _LOGGER.warning("torrent destination state write failed: %s", exc)
+        _DEST_CACHE_STAMP = object()
+        return False
+    # 写入后强制下一次 load 重新读盘，避免缓存与磁盘分叉
     _DEST_CACHE_STAMP = object()
+    return True
 
 
 def _tag_list(tags: str) -> list[str]:
@@ -2157,9 +2358,10 @@ def register_torrent_destination(remote: str, path: str = "") -> tuple[str, str,
         "finished": 0,
     }
     with _TORRENT_DEST_LOCK:
-        data = _load_torrent_destinations()
+        data = dict(_load_torrent_destinations())
         data[marker] = entry
-        _save_torrent_destinations(data)
+        if not _save_torrent_destinations(data):
+            return "", "", "转存任务状态保存失败，请检查 Aurora 数据目录权限或磁盘空间"
     return marker, path, ""
 
 
@@ -2167,11 +2369,10 @@ def discard_torrent_destination(marker: str) -> None:
     if not marker:
         return
     with _TORRENT_DEST_LOCK:
-        data = _load_torrent_destinations()
+        data = dict(_load_torrent_destinations())
         if marker in data:
             data.pop(marker, None)
             _save_torrent_destinations(data)
-
 
 def retry_torrent_destination(marker: str) -> tuple[bool, str]:
     """Put a failed torrent-to-remote transfer back in the scheduler queue."""
@@ -2179,17 +2380,18 @@ def retry_torrent_destination(marker: str) -> tuple[bool, str]:
     if not re.fullmatch(r"aurora-remote-[0-9a-f]{16}", marker):
         return False, "转存任务编号无效"
     with _TORRENT_DEST_LOCK:
-        data = _load_torrent_destinations()
+        data = dict(_load_torrent_destinations())
         entry = data.get(marker)
         if not entry:
             return False, "转存任务不存在"
         if entry.get("status") != "error":
             return False, "当前任务不需要重试"
-        entry["status"] = "waiting"
-        entry["detail"] = ""
-        entry["transfer_id"] = ""
-        entry["finished"] = 0
-        _save_torrent_destinations(data)
+        updated = dict(entry)
+        updated.update({"status": "waiting", "detail": "", "transfer_id": "", "finished": 0})
+        data[marker] = updated
+        if not _save_torrent_destinations(data):
+            return False, "转存任务状态保存失败，请检查 Aurora 数据目录权限或磁盘空间"
+        entry = updated
     _log("torrent.remote.retry", entry.get("name") or marker)
     return True, ""
 
@@ -2337,10 +2539,10 @@ def _process_torrent_destinations() -> None:
             # 写回前重读最新状态、只按本轮处理过的 marker 合并：处理过程在锁外
             # 做了秒级网络调用，期间 register/discard/retry 可能已写入别的条目，
             # 把整份旧快照覆盖回去会静默抹掉它们（丢单且 UI 无任何报错）。
-            current = _load_torrent_destinations()
+            current = {key: dict(value) for key, value in _load_torrent_destinations().items()}
             for marker in touched:
                 if marker in destinations:
-                    current[marker] = destinations[marker]
+                    current[marker] = dict(destinations[marker])
                 else:
                     current.pop(marker, None)   # 本轮因保留期到期被移除的孤儿
             _save_torrent_destinations(current)
@@ -2372,11 +2574,191 @@ def start_torrent_destination_scheduler() -> None:
 _STATS_FILE = os.path.join(_DATA_DIR, "stats.json")
 _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _NOTIFY_FILE = os.path.join(_DATA_DIR, "torrent_notify.json")
+# ---------------------------------------------------------------------------
+# 做种策略撤销（回收站式清理）：删除前导出 .torrent 留档、内容整体移入媒体
+# 回收站；撤销 = 文件回原位 + 用留档重加任务。日志保留 7 天、上限 50 条。
+
+
+_POLICY_UNDO_FILE = os.path.join(_DATA_DIR, "torrent_policy_undo.json")
+_POLICY_UNDO_DIR = os.path.join(_DATA_DIR, "policy_undo")
+_POLICY_UNDO_LOCK = threading.RLock()
+_POLICY_UNDO_RETENTION = 7 * 24 * 60 * 60
+_POLICY_UNDO_LIMIT = 50
+
+
+def _load_policy_undo() -> list[dict]:
+    try:
+        with open(_POLICY_UNDO_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_policy_undo(entries: list[dict]) -> None:
+    _atomic_json(_POLICY_UNDO_FILE, entries)
+
+
+def _prune_policy_undo(entries: list[dict]) -> list[dict]:
+    cutoff = time.time() - _POLICY_UNDO_RETENTION
+    kept = [e for e in entries if e.get("time", 0) >= cutoff]
+    return kept[-_POLICY_UNDO_LIMIT:]
+
+
+def _policy_undo_add(entry: dict) -> None:
+    with _POLICY_UNDO_LOCK:
+        entries = _prune_policy_undo(_load_policy_undo())
+        entries.append(entry)
+        _save_policy_undo(entries)
+
+
+def policy_undo_list() -> list[dict]:
+    with _POLICY_UNDO_LOCK:
+        entries = _prune_policy_undo(_load_policy_undo())
+        _save_policy_undo(entries)
+        return [{
+            "id": e.get("id"), "time": e.get("time"), "action": e.get("action"),
+            "name": e.get("name"), "rule_name": e.get("rule_name"),
+            "reason": e.get("reason"), "category": e.get("category"),
+            "trash_id": e.get("trash_id"),
+            "recoverable": bool(e.get("torrent_file")) or e.get("action") == "pause",
+        } for e in reversed(entries)]
+
+
+def _media_base_dir() -> str:
+    return os.path.realpath(os.path.expanduser(
+        os.environ.get("AURORA_LOCAL_MOUNT", "/opt/aurora/qbit/downloads")
+    ))
+
+
+def _content_trashable(content_path: str) -> bool:
+    base = _media_base_dir()
+    src = os.path.realpath(str(content_path or ""))
+    return bool(src) and src != base and src.startswith(base + os.sep) and os.path.exists(src)
+
+
+def _policy_trash_content(content_path: str) -> tuple[str, str]:
+    """把种子内容整体移入媒体回收站（.aurora-trash），返回 (trash_id, error)。
+
+    与 UI 单文件删除共用 trash.json：回收站里看得到，也能从媒资库恢复。
+    """
+    if not _content_trashable(content_path):
+        return "", "内容不在媒体目录内，无法进入回收站"
+    base = _media_base_dir()
+    src = os.path.realpath(content_path)
+    rel = os.path.relpath(src, base)
+    trash_id = secrets.token_hex(12)
+    try:
+        trash_dir = os.path.join(base, ".aurora-trash")
+        os.makedirs(trash_dir, mode=0o700, exist_ok=True)
+        target = os.path.join(trash_dir, trash_id)
+        shutil.move(src, target)
+        size = 0
+        try:
+            if os.path.isdir(target):
+                for root, _dirs, files in os.walk(target):
+                    for name in files:
+                        size += os.path.getsize(os.path.join(root, name))
+            else:
+                size = os.path.getsize(target)
+        except OSError:
+            pass
+        trash_add(trash_id, rel.replace(os.sep, "/"), os.path.basename(src) or rel, size)
+    except OSError as exc:
+        # 元数据写失败时文件必须回原位，否则产生幽灵文件（同 media_delete 的约定）
+        try:
+            shutil.move(target, src)
+        except OSError:
+            _LOGGER.warning("policy trash rollback failed for %s", src)
+        return "", f"移入回收站失败：{exc}"
+    _log("torrent.policy.trash", rel)
+    return trash_id, ""
+
+
+def _policy_restore_trash(trash_id: str) -> tuple[bool, str]:
+    """把回收站条目移回原位；原路径被占用时拒绝（绝不覆盖）。"""
+    item = trash_get(trash_id)
+    if not item:
+        return False, "回收站条目不存在"
+    base = _media_base_dir()
+    src = os.path.join(base, ".aurora-trash", trash_id)
+    if not os.path.exists(src):
+        trash_remove(trash_id)
+        return False, "回收站文件已不存在"
+    dst = os.path.realpath(os.path.join(base, str(item.get("path") or "").replace("/", os.sep)))
+    if dst != base and not dst.startswith(base + os.sep):
+        return False, "恢复路径无效"
+    if os.path.exists(dst):
+        return False, "原路径已有同名文件，撤销中止"
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+    except OSError as exc:
+        return False, f"恢复失败：{exc}"
+    trash_remove(trash_id)
+    _log("torrent.policy.undo_trash", str(item.get("path") or ""))
+    return True, ""
+
+
+def policy_undo_execute(entry_id: str) -> tuple[bool, str]:
+    with _POLICY_UNDO_LOCK:
+        entries = _load_policy_undo()
+        index = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), -1)
+        if index < 0:
+            return False, "撤销记录不存在或已过期"
+        entry = entries[index]
+        if entry.get("action") == "pause":
+            ok, error = _qbit.advanced_action(str(entry.get("hash") or ""), "resume")
+            detail = "任务已恢复做种"
+        else:
+            trash_id = str(entry.get("trash_id") or "")
+            if trash_id:
+                ok, error = _policy_restore_trash(trash_id)
+                if not ok:
+                    return False, f"文件未恢复，撤销中止：{error}"
+            torrent_file = str(entry.get("torrent_file") or "")
+            content = b""
+            if torrent_file and os.path.isfile(torrent_file):
+                try:
+                    with open(torrent_file, "rb") as f:
+                        content = f.read()
+                except OSError as exc:
+                    return False, f"读取留档种子失败：{exc}"
+            if content:
+                ok, error = _qbit.add_file(
+                    f"{entry.get('name') or 'undo'}.torrent", content,
+                    save_path=str(entry.get("save_path") or ""),
+                    category=str(entry.get("category") or ""),
+                    tags=[str(t) for t in (entry.get("tags") or [])],
+                )
+                detail = "文件已回原位，任务已重新添加"
+            elif trash_id:
+                ok, detail, error = True, "文件已回原位；留档种子缺失，请校验后手动重加", ""
+            else:
+                ok, detail, error = False, "", "没有可用的留档种子，无法撤销"
+        if not ok:
+            return False, error or "撤销失败"
+        torrent_file = str(entry.get("torrent_file") or "")
+        if torrent_file and os.path.isfile(torrent_file):
+            try:
+                os.unlink(torrent_file)
+            except OSError:
+                pass
+        entries.pop(index)
+        _save_policy_undo(entries)
+        _log("torrent.policy.undo", f"{entry.get('name') or entry_id} · {detail}")
+        return True, detail
+
+
 _POLICY_NOTIFY_FILE = os.path.join(_DATA_DIR, "torrent_policy_notify.json")
 _disk_warned = False
 
 
 _POLICY_ACTIONS = {"pause", "notify", "remove"}
+def _strict_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value if isinstance(value, bool) else False
 
 
 def _normalize_policy(raw: dict, index: int = 0) -> dict | None:
@@ -2414,14 +2796,14 @@ def _normalize_policy(raw: dict, index: int = 0) -> dict | None:
         "name": name,
         "category": category,
         "hash": hash_filter,
-        "enabled": bool(raw.get("enabled", True)),
+        "enabled": _strict_bool(raw.get("enabled"), True),
         "action": action,
         "min_seed_minutes": integer("min_seed_minutes", 0, 525600, 0),
         "max_seed_minutes": integer("max_seed_minutes", -1, 525600),
         "max_inactive_minutes": integer("max_inactive_minutes", -1, 525600),
         "max_ratio": ratio("max_ratio", -1.0),
-        "allow_delete": bool(raw.get("allow_delete", False)),
-        "delete_files": bool(raw.get("delete_files", False)),
+        "allow_delete": _strict_bool(raw.get("allow_delete")),
+        "delete_files": _strict_bool(raw.get("delete_files")),
         "destination_remote": str(raw.get("destination_remote") or "").strip()[:64],
         "destination_path": str(raw.get("destination_path") or "").strip()[:2048],
     }
@@ -2442,7 +2824,7 @@ def _normalize_policies(raw: dict | None) -> dict:
         interval = min(86400, max(60, int(raw.get("interval", 300))))
     except (TypeError, ValueError):
         interval = 300
-    return {"enabled": bool(raw.get("enabled", False)), "interval": interval, "rules": rules}
+    return {"enabled": _strict_bool(raw.get("enabled")), "interval": interval, "rules": rules}
 
 
 def _clean_category_mapping_path(value: str) -> str:
@@ -2703,6 +3085,10 @@ def preview_torrent_policies() -> tuple[bool, dict, str]:
                 "name": str(torrent.get("name") or ""),
                 "category": str(torrent.get("category") or ""),
                 "tags": _tag_list(torrent.get("tags", "")),
+                "save_path": str(torrent.get("save_path") or ""),
+                # 宿主机映射路径：回收站搬移与可恢复判定都基于它
+                "content_path": _torrent_host_path(torrent) or str(torrent.get("content_path") or ""),
+                "size": max(0, int(torrent.get("size") or 0)),
                 "ratio": float(torrent.get("ratio") or 0),
                 "seeding_minutes": max(0, int(torrent.get("seeding_time") or 0) // 60),
                 "rule_id": rule["id"],
@@ -2717,7 +3103,8 @@ def preview_torrent_policies() -> tuple[bool, dict, str]:
     return True, {"enabled": settings["enabled"], "interval": settings["interval"], "items": items}, ""
 
 
-def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tuple[bool, dict, str]:
+def apply_torrent_policies(confirm: bool = False, automatic: bool = False,
+                           dry_run: bool = False) -> tuple[bool, dict, str]:
     if not confirm and not automatic:
         return False, {}, "请先确认应用策略"
     ok, preview, detail = preview_torrent_policies()
@@ -2725,6 +3112,37 @@ def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tu
         return False, {}, detail
     settings = torrent_policies()
     by_id = {rule["id"]: rule for rule in settings["rules"]}
+    if dry_run:
+        # 预演：完整走一遍判定分支但不产生任何副作用（不动任务、不发通知）
+        items = []
+        for item in preview["items"]:
+            rule = by_id.get(item["rule_id"], {})
+            action = item["action"]
+            if item["protected"] and action == "remove":
+                items.append({**item, "status": "protected"})
+                continue
+            if automatic and action == "remove" and not rule.get("allow_delete"):
+                items.append({**item, "status": "skipped"})
+                continue
+            if action == "notify":
+                key = f"{datetime.now().strftime('%Y-%m-%d')}:{item['rule_id']}:{item['hash']}:{item['reason']}"
+                status = "already_notified" if _load_policy_notifications().get(key) else "would_notify"
+                items.append({**item, "status": status})
+                continue
+            if action == "pause":
+                items.append({**item, "status": "would_pause"})
+                continue
+            if action == "transfer":
+                if torrent_destination_for_tags(item.get("tags", [])):
+                    items.append({**item, "status": "protected", "protection": "已有网盘转存记录"})
+                elif not str(rule.get("destination_remote") or "").strip():
+                    items.append({**item, "status": "would_error", "detail": "策略未配置目标网盘"})
+                else:
+                    items.append({**item, "status": "would_transfer"})
+                continue
+            items.append({**item, "status": "would_remove",
+                          "recoverable": _content_trashable(item.get("content_path", ""))})
+        return True, {"items": items, "applied": 0, "dry_run": True}, ""
     results = []
     notifications = _load_policy_notifications()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -2773,7 +3191,56 @@ def apply_torrent_policies(confirm: bool = False, automatic: bool = False) -> tu
                 _log("torrent.policy.transfer", f"{item['name']} -> {remote}:{_path or '/'}")
         else:
             delete_files = bool(rule.get("delete_files")) and bool(rule.get("allow_delete"))
-            changed, error = _qbit.advanced_action(item["hash"], "remove", delete_files=delete_files)
+            undo_id = uuid.uuid4().hex[:12]
+            torrent_file = ""
+            trash_id = ""
+            # 任何 remove 都先导出 .torrent 留档：磁力任务没有元数据，
+            # 不留档就永远无法撤销重加
+            ok_export, torrent_data, export_error = _qbit.export_torrent(item["hash"])
+            if not ok_export:
+                results.append({**item, "status": "error",
+                                "detail": export_error or "导出种子留档失败，已跳过删除"})
+                continue
+            os.makedirs(_POLICY_UNDO_DIR, exist_ok=True)
+            torrent_file = os.path.join(_POLICY_UNDO_DIR, f"{undo_id}.torrent")
+            with open(torrent_file, "wb") as fh:
+                fh.write(torrent_data)
+            try:
+                os.chmod(torrent_file, 0o600)
+            except OSError:
+                pass
+            delete_via_qbit = False
+            if delete_files:
+                # 回收站式清理：内容整体移入 .aurora-trash（与媒资库回收站共用），
+                # 再移除任务本体且不连带删文件；失败路径都会回滚
+                trash_id, _trash_error = _policy_trash_content(item.get("content_path", ""))
+                # trash_id 为空 = 内容不在媒体目录内（自定义保存路径），
+                # 回退旧行为由 qbit 连带删除，撤销只能重加任务
+                delete_via_qbit = not trash_id
+            changed, error = _qbit.advanced_action(item["hash"], "remove", delete_files=delete_via_qbit)
+            if not changed:
+                if trash_id:
+                    _policy_restore_trash(trash_id)
+                try:
+                    os.unlink(torrent_file)
+                except OSError:
+                    pass
+                results.append({**item, "status": "error", "detail": error or "移除任务失败"})
+                continue
+            _policy_undo_add({
+                "id": undo_id,
+                "time": int(time.time()),
+                "action": "remove",
+                "hash": item["hash"],
+                "name": item["name"],
+                "save_path": item.get("save_path") or "",
+                "category": item.get("category") or "",
+                "tags": item.get("tags") or [],
+                "rule_name": rule.get("name") or "",
+                "reason": item.get("reason") or "",
+                "trash_id": trash_id,
+                "torrent_file": torrent_file,
+            })
         status = "applied" if changed else "error"
         _log("torrent.policy.apply", f"{item['name']} · {action} · {item['reason']}" + (f" · {error}" if error else ""))
         results.append({**item, "status": status, "detail": error})
@@ -2803,6 +3270,285 @@ def start_torrent_policy_scheduler() -> None:
                 except Exception as exc:
                     _log("torrent.policy.error", str(exc))
             time.sleep(max(60, min(3600, int(settings.get("interval", 300)))))
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 下载完成自动整理：完成的任务按分类规则硬链接/拷贝/移动到媒体库目录，
+# 可选触发 Jellyfin 全库扫描。硬链接优先——同盘瞬时完成且不打断做种；
+# move 是破坏性动作，仅跨盘保护通过且任务不受保护时执行。
+
+
+_MEDIA_ORG_FILE = os.path.join(_DATA_DIR, "media_organize.json")
+_MEDIA_ORG_LOCK = threading.RLock()
+_MEDIA_ORG_HISTORY_LIMIT = 200
+_ORG_SCHED_STARTED = False
+_ORG_MODES = ("hardlink", "copy", "move")
+
+
+def _safe_org_name(name: str) -> str:
+    v = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    v = v.replace("..", "_").strip()
+    return (v or "untitled")[:150]
+
+
+def _clean_org_target(value) -> str:
+    """媒体库目录必须是媒体目录内的安全相对路径（禁止绝对路径 / .. / 回收站）。"""
+    raw = str(value or "").strip()
+    if not raw or raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
+        return ""
+    parts = [p for p in raw.replace("\\", "/").split("/") if p not in ("", ".")]
+    if any(p in ("..", ".aurora-trash") for p in parts) or len("/".join(parts)) > 400:
+        return ""
+    return "/".join(parts)
+
+
+def _org_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_org_rules(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    rules, seen = [], set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("id") or uuid.uuid4().hex[:12])
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,40}", rid) or rid in seen:
+            rid = uuid.uuid4().hex[:12]
+        seen.add(rid)
+        target = _clean_org_target(item.get("target_dir"))
+        if not target:
+            continue
+        mode = str(item.get("mode") or "hardlink")
+        if mode not in _ORG_MODES:
+            mode = "hardlink"
+        rules.append({
+            "id": rid,
+            "name": str(item.get("name") or f"规则 {index + 1}")[:60],
+            "category": str(item.get("category") or "").strip()[:64],
+            "enabled": _strict_bool(item.get("enabled"), True),
+            "target_dir": target,
+            "mode": mode,
+            "use_subfolder": _strict_bool(item.get("use_subfolder"), True),
+            "min_size_mb": _org_int(item.get("min_size_mb"), 0, 0, 1024 * 1024),
+        })
+    return rules
+
+
+def media_organize_settings() -> dict:
+    try:
+        with open(_MEDIA_ORG_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        "enabled": _strict_bool(data.get("enabled"), False),
+        "interval": _org_int(data.get("interval"), 300, 60, 86400),
+        "jellyfin_refresh": _strict_bool(data.get("jellyfin_refresh"), True),
+        "rules": _normalize_org_rules(data.get("rules")),
+        "history": [h for h in (data.get("history") or []) if isinstance(h, dict)][-_MEDIA_ORG_HISTORY_LIMIT:],
+    }
+
+
+def save_media_organize_settings(value: dict) -> dict:
+    if not isinstance(value, dict):
+        value = {}
+    current = media_organize_settings()
+    with _MEDIA_ORG_LOCK:
+        merged = {
+            "enabled": _strict_bool(value.get("enabled"), current["enabled"]),
+            "interval": _org_int(value.get("interval"), current["interval"], 60, 86400),
+            "jellyfin_refresh": _strict_bool(value.get("jellyfin_refresh"), current["jellyfin_refresh"]),
+            "rules": _normalize_org_rules(value.get("rules") if value.get("rules") is not None else current["rules"]),
+            "history": current["history"],
+        }
+        _atomic_json(_MEDIA_ORG_FILE, merged)
+    _log("media.organize.settings", f"{len(merged['rules'])} 条规则 · {'已启用' if merged['enabled'] else '未启用'}")
+    return merged
+
+
+def _org_history_add(entry: dict) -> None:
+    with _MEDIA_ORG_LOCK:
+        data = media_organize_settings()
+        history = [*data["history"], entry][-_MEDIA_ORG_HISTORY_LIMIT:]
+        _atomic_json(_MEDIA_ORG_FILE, {**data, "history": history})
+
+
+def _org_target(rule: dict, torrent: dict) -> tuple[str, str]:
+    """返回 (目标完整路径, 用于展示的相对路径)。"""
+    base = _media_base_dir()
+    name = _safe_org_name(torrent.get("name") or "")
+    rel = rule["target_dir"] if rule.get("use_subfolder", True) else rule["target_dir"]
+    if rule.get("use_subfolder", True):
+        rel = f"{rule['target_dir']}/{name}"
+    return os.path.join(base, rel.replace("/", os.sep)), rel
+
+
+def preview_media_organize() -> tuple[bool, dict, str]:
+    if not _qbit.available():
+        return False, {}, "qBittorrent 未接入"
+    details = _qbit.torrent_details()
+    if not getattr(_qbit, "_last_details_ok", True):
+        return False, {}, "qBittorrent 任务读取失败"
+    settings = media_organize_settings()
+    rules = [r for r in settings["rules"] if r["enabled"]]
+    done_hashes = {h.get("hash") for h in settings["history"] if h.get("status") == "done"}
+    items = []
+    for torrent in details:
+        if float(torrent.get("progress") or 0) < 0.999999:
+            continue
+        if str(torrent.get("state") or "") not in QbittorrentProvider._UP_STATES:
+            continue
+        rule = next((r for r in rules
+                     if r["category"] in ("", "*") or r["category"] == str(torrent.get("category") or "").strip()), None)
+        if not rule:
+            continue
+        host = _torrent_host_path(torrent)
+        size = max(0, int(torrent.get("size") or 0))
+        target_path, target_rel = _org_target(rule, torrent)
+        skipped = ""
+        if not host or not os.path.exists(host):
+            skipped = "内容不在媒体目录内"
+        elif rule["min_size_mb"] and size < rule["min_size_mb"] * 1024 * 1024:
+            skipped = f"小于规则最小 {rule['min_size_mb']} MB"
+        elif rule["mode"] == "move" and _policy_protection(torrent):
+            skipped = f"移动模式受保护：{_policy_protection(torrent)}"
+        items.append({
+            "hash": str(torrent.get("hash") or ""),
+            "name": str(torrent.get("name") or ""),
+            "category": str(torrent.get("category") or ""),
+            "size": size,
+            "rule_id": rule["id"],
+            "rule_name": rule["name"],
+            "mode": rule["mode"],
+            "source": host,
+            "target": target_rel,
+            "target_path": target_path,
+            "exists": os.path.exists(target_path),
+            "processed": str(torrent.get("hash") or "") in done_hashes,
+            "skipped_reason": skipped,
+        })
+    return True, {"enabled": settings["enabled"], "jellyfin_refresh": settings["jellyfin_refresh"],
+                  "rule_count": len(rules), "items": items}, ""
+
+
+def _hardlink_tree(src: str, dst: str) -> None:
+    os.mkdir(dst)
+    for entry in os.scandir(src):
+        s, d = entry.path, os.path.join(dst, entry.name)
+        if entry.is_dir(follow_symlinks=False):
+            _hardlink_tree(s, d)
+        else:
+            os.link(s, d)
+
+
+def _org_cleanup(dst: str) -> None:
+    try:
+        if os.path.isdir(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        elif os.path.exists(dst):
+            os.unlink(dst)
+    except OSError:
+        pass
+
+
+def _org_transfer(source: str, target_path: str, mode: str) -> tuple[bool, str]:
+    src = os.path.realpath(source)
+    if os.path.exists(target_path):
+        return False, "目标已有同名内容，不覆盖"
+    if not os.path.exists(src):
+        return False, "源内容不存在"
+    try:
+        if mode == "move" and os.stat(src).st_dev != os.stat(_media_base_dir()).st_dev:
+            return False, "源与媒体目录跨磁盘，move 不可用，请改用硬链接或拷贝"
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        partial = mode in ("hardlink", "copy")   # move 是原子 rename，失败不清理目标
+        try:
+            if os.path.isdir(src):
+                if mode == "hardlink":
+                    _hardlink_tree(src, target_path)
+                elif mode == "copy":
+                    shutil.copytree(src, target_path)
+                else:
+                    shutil.move(src, target_path)
+            else:
+                if mode == "hardlink":
+                    os.link(src, target_path)
+                elif mode == "copy":
+                    shutil.copy2(src, target_path)
+                else:
+                    shutil.move(src, target_path)
+        except OSError:
+            if partial and os.path.exists(target_path):
+                _org_cleanup(target_path)
+            raise
+    except OSError as exc:
+        return False, f"整理失败：{exc}"
+    return True, ""
+
+
+def apply_media_organize(confirm: bool = False, dry_run: bool = False) -> tuple[bool, dict, str]:
+    if not confirm:
+        return False, {}, "请先确认执行整理"
+    ok, preview, detail = preview_media_organize()
+    if not ok:
+        return False, {}, detail
+    results = []
+    organized = 0
+    for item in preview["items"]:
+        if item["processed"]:
+            results.append({**item, "status": "already_done"})
+            continue
+        if item["skipped_reason"]:
+            results.append({**item, "status": "skipped", "detail": item["skipped_reason"]})
+            continue
+        if item["exists"]:
+            results.append({**item, "status": "conflict", "detail": "目标已有同名内容"})
+            continue
+        if dry_run:
+            results.append({**item, "status": "would_organize"})
+            continue
+        ok_move, error = _org_transfer(item["source"], item["target_path"], item["mode"])
+        _org_history_add({
+            "time": int(time.time()), "hash": item["hash"], "name": item["name"],
+            "rule_name": item["rule_name"], "mode": item["mode"], "target": item["target"],
+            "status": "done" if ok_move else "error", "detail": error,
+        })
+        organized += 1 if ok_move else 0
+        results.append({**item, "status": "done" if ok_move else "error", "detail": error})
+    refreshed = False
+    refresh_detail = ""
+    if not dry_run and organized and media_organize_settings()["jellyfin_refresh"]:
+        refreshed, refresh_detail = _jelly.refresh_library()
+        _log("media.organize.jellyfin", "已触发 Jellyfin 全库扫描" if refreshed else f"Jellyfin 刷新失败：{refresh_detail}")
+    _log("media.organize.apply", f"整理 {organized} 项" + (f" · Jellyfin {'已刷新' if refreshed else '未刷新'}" if not dry_run else " · 预演"))
+    return True, {"items": results, "organized": organized, "dry_run": dry_run,
+                  "jellyfin_refreshed": refreshed, "jellyfin_detail": refresh_detail}, ""
+
+
+def start_media_organizer_scheduler() -> None:
+    global _ORG_SCHED_STARTED
+    if _ORG_SCHED_STARTED:
+        return
+    _ORG_SCHED_STARTED = True
+
+    def loop():
+        while True:
+            settings = media_organize_settings()
+            if settings["enabled"] and settings["rules"]:
+                try:
+                    apply_media_organize(confirm=True)
+                except Exception as exc:
+                    _log("media.organize.error", str(exc))
+            time.sleep(max(60, min(3600, settings["interval"])))
 
     threading.Thread(target=loop, daemon=True).start()
 
