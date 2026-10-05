@@ -1532,6 +1532,12 @@ def _github_latest_release(repo: str) -> dict:
     }
 
 
+def _deploy_mode() -> str:
+    """部署方式探测：容器内存在 /.dockerenv（Docker 自动创建）。
+    用于升级命令横幅给出与当前部署匹配的操作步骤。"""
+    return "docker" if Path("/.dockerenv").exists() else "systemd"
+
+
 @app.get("/api/update/check")
 def update_check(force: int = 0, _user: str = Depends(require_auth)):
     # 失败必须可区分：返回 ok=False 与原因，而不是抛 500，方便设置页展示
@@ -1563,6 +1569,7 @@ def update_check(force: int = 0, _user: str = Depends(require_auth)):
         "published_at": cached.get("published_at", ""),
         "checked_at": int(cached.get("at", 0)),
         "cached": from_cache,
+        "deploy": _deploy_mode(),
         "update_available": _parse_version(latest) > _parse_version(current),
     }
 

@@ -251,6 +251,8 @@ export interface UpdateStatus {
   published_at?: string
   checked_at?: number
   cached?: boolean
+  /** 部署方式探测（/.dockerenv）：升级命令横幅据此匹配操作步骤 */
+  deploy?: 'docker' | 'systemd'
   detail?: string
 }
 

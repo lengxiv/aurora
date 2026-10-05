@@ -1865,6 +1865,7 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertEqual(data["repo"], "example/aurora")
         self.assertEqual(data["latest"], "99.0.0")
         self.assertTrue(data["update_available"])
+        self.assertIn(data["deploy"], ("docker", "systemd"))   # 升级命令横幅需要部署方式
         m.assert_called_once_with("example/aurora")
 
     def test_cache_within_ttl_avoids_second_request(self):
