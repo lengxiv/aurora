@@ -764,7 +764,13 @@ export async function fetchRssOverview(): Promise<{ feeds: RssFeed[]; rules: Rss
     const r = await fetch('/api/rss/overview', { credentials: 'include' })
     if (r.status === 401) { window.dispatchEvent(new Event('aurora:unauth')); return null }
     if (!r.ok) return null
-    return await r.json()
+    const data = await r.json()
+    // 后端的 rules 是以规则名为键的对象；转成数组供视图遍历。
+    // 直接把对象当数组 map 会在 qbit 接入后整页崩溃（白屏）
+    return {
+      feeds: Array.isArray(data?.feeds) ? data.feeds : [],
+      rules: Object.values(data?.rules ?? {}),
+    }
   } catch { return null }
 }
 

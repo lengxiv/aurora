@@ -2139,12 +2139,18 @@ def jf_stream(item_id: str, request: Request, _user: str = Depends(require_auth)
 if (STATIC_DIR / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
 
+def _spa_index() -> FileResponse:
+    # index.html 必须禁缓存：更新部署后浏览器缓存的旧 HTML 会引用已被
+    # emptyOutDir 清掉的旧哈希资源，典型症状就是发版后页面白屏
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+
 if (STATIC_DIR / "index.html").is_file():
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str, request: Request, sid: str | None = Cookie(default=None, alias=_COOKIE)):
         # always allow the login screen + its assets
         if full_path in ("login", "login/") or full_path.startswith("login/"):
-            return FileResponse(STATIC_DIR / "index.html")
+            return _spa_index()
         if full_path:
             # path traversal guard: resolve and require the result to stay inside STATIC_DIR
             base = STATIC_DIR.resolve()
@@ -2154,7 +2160,7 @@ if (STATIC_DIR / "index.html").is_file():
         # everything else requires auth; unauthenticated deep-links go to /login
         if not _check_sid(sid):
             return RedirectResponse("/login")
-        return FileResponse(STATIC_DIR / "index.html")
+        return _spa_index()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,11 @@
 
 这里记录面向用户的功能变更、重要修复、验证结果和部署提交。功能现状请查看 [`FEATURES.md`](FEATURES.md)。
 
+## 2026-10-05（v0.5.1 修复）
+
+- **修复 RSS 订阅页在 qBittorrent 接入后整页白屏**：`/api/rss/overview` 的 `rules` 是以规则名为键的对象，前端误按数组遍历——qbit 未接入时（空态）不触发，接上真实数据即 `rules.map is not a function` 崩溃。已在 API 客户端归一化为数组，并搭建假 qBittorrent 服务在真实浏览器中带数据回归验证（订阅源/规则/匹配预览正常渲染、零控制台错误）。
+- 加固：nginx 示例为哈希命名的 `/assets/` 增加 `immutable` 长缓存（index.html 由既有安全中间件下发 no-store，始终校验最新版本）。
+
 ## 2026-10-05（第二批 · 闭环批次）
 
 ### RSS 自动订阅 / 下载完成自动整理 / 策略清理可撤销
